@@ -3,12 +3,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
+use eframe::egui::ThemePreference;
 use serde::{Deserialize, Serialize};
 
 use crate::fonts::DEFAULT_FONT_WEIGHT;
 use crate::model::{LineEnding, ReceiveMode, SendMode, TextEncoding};
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 2;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 3;
 pub const BUFFER_LIMIT_OPTIONS_MIB: [usize; 4] = [5, 20, 100, 500];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +30,7 @@ pub struct UiPreferences {
     pub line_ending: LineEnding,
     pub repeat_interval_ms: u64,
     pub buffer_limit_mib: usize,
+    pub theme_preference: ThemePreference,
 }
 
 impl Default for UiPreferences {
@@ -49,6 +51,7 @@ impl Default for UiPreferences {
             line_ending: LineEnding::CrLf,
             repeat_interval_ms: 1_000,
             buffer_limit_mib: 20,
+            theme_preference: ThemePreference::System,
         }
     }
 }
@@ -209,6 +212,7 @@ mod tests {
         assert_eq!(loaded.ui_font_family, "Microsoft YaHei UI");
         assert_eq!(loaded.ui_font_weight, 500);
         assert!(loaded.timestamps);
+        assert_eq!(loaded.theme_preference, ThemePreference::System);
 
         let json = fs::read_to_string(&test_path).unwrap();
         assert!(!json.contains("port_name"));
@@ -243,6 +247,29 @@ mod tests {
         let json = serde_json::to_string(&preferences).unwrap();
         let loaded: UiPreferences = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.receive_mode, ReceiveMode::Terminal);
+    }
+
+    #[test]
+    fn theme_preference_round_trips_through_preferences() {
+        for theme_preference in [
+            ThemePreference::System,
+            ThemePreference::Light,
+            ThemePreference::Dark,
+        ] {
+            let preferences = UiPreferences {
+                theme_preference,
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&preferences).unwrap();
+            let loaded: UiPreferences = serde_json::from_str(&json).unwrap();
+            assert_eq!(loaded.theme_preference, theme_preference);
+        }
+    }
+
+    #[test]
+    fn legacy_preferences_default_to_system_theme() {
+        let loaded: UiPreferences = serde_json::from_str(r#"{"schema_version":2}"#).unwrap();
+        assert_eq!(loaded.theme_preference, ThemePreference::System);
     }
 
     #[test]

@@ -121,6 +121,9 @@ impl EscomApp {
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         let mut preferences = settings::load();
         preferences.sanitize();
+        creation_context
+            .egui_ctx
+            .set_theme(preferences.theme_preference);
         let font_catalog = FontCatalog::load();
         let applied_fonts = font_catalog.apply(
             &creation_context.egui_ctx,
@@ -1180,54 +1183,67 @@ impl EscomApp {
 
     fn show_status_panel(&mut self, root_ui: &mut egui::Ui) {
         let context = root_ui.ctx().clone();
+        let mut theme_preference = self.preferences.theme_preference;
+        let mut theme_changed = false;
         egui::Panel::bottom("status_panel")
             .resizable(false)
             .exact_size(30.0)
             .show(root_ui, |ui| {
                 ui.spacing_mut().interact_size.y = CONNECTION_CONTROL_HEIGHT;
-                ui.horizontal(|ui| {
-                    let (status, color) = match &self.connection {
-                        ConnectionState::Disconnected => ("未连接".to_owned(), Color32::GRAY),
-                        ConnectionState::Connecting => ("正在连接".to_owned(), Color32::YELLOW),
-                        ConnectionState::Connected(port) => {
-                            (format!("已连接 {port}"), Color32::from_rgb(40, 170, 90))
-                        }
-                    };
-                    ui.label(RichText::new("●").color(color));
-                    ui.label(status);
-                    toolbar_separator(ui);
-                    ui.label(format!("RX {} B", self.worker.stats.rx_bytes()));
-                    ui.label(format!("TX {} B", self.worker.stats.tx_bytes()));
-
-                    let (bytes_len, dropped) = self.store_status();
-                    toolbar_separator(ui);
-                    ui.label(format!("缓存 {}", human_bytes(bytes_len as u64)));
-                    if dropped > 0 {
-                        ui.label(
-                            RichText::new(format!("已淘汰 {}", human_bytes(dropped)))
-                                .color(Color32::YELLOW),
-                        );
-                    }
-                    if self.format_in_progress {
-                        ui.label("正在整理显示...");
-                    }
-
-                    if let Some(notice) = &self.notice
-                        && Instant::now() < notice.expires_at
-                    {
-                        toolbar_separator(ui);
-                        let color = if notice.error {
-                            ui.visuals().error_fg_color
-                        } else {
-                            ui.visuals().text_color()
+                egui::containers::Sides::new().shrink_left().show(
+                    ui,
+                    |ui| {
+                        let (status, color) = match &self.connection {
+                            ConnectionState::Disconnected => ("未连接".to_owned(), Color32::GRAY),
+                            ConnectionState::Connecting => ("正在连接".to_owned(), Color32::YELLOW),
+                            ConnectionState::Connected(port) => {
+                                (format!("已连接 {port}"), Color32::from_rgb(40, 170, 90))
+                            }
                         };
-                        ui.label(RichText::new(&notice.message).color(color));
-                        context.request_repaint_after(
-                            notice.expires_at.saturating_duration_since(Instant::now()),
-                        );
-                    }
-                });
+                        ui.label(RichText::new("●").color(color));
+                        ui.label(status);
+                        toolbar_separator(ui);
+                        ui.label(format!("RX {} B", self.worker.stats.rx_bytes()));
+                        ui.label(format!("TX {} B", self.worker.stats.tx_bytes()));
+
+                        let (bytes_len, dropped) = self.store_status();
+                        toolbar_separator(ui);
+                        ui.label(format!("缓存 {}", human_bytes(bytes_len as u64)));
+                        if dropped > 0 {
+                            ui.label(
+                                RichText::new(format!("已淘汰 {}", human_bytes(dropped)))
+                                    .color(Color32::YELLOW),
+                            );
+                        }
+                        if self.format_in_progress {
+                            ui.label("正在整理显示...");
+                        }
+
+                        if let Some(notice) = &self.notice
+                            && Instant::now() < notice.expires_at
+                        {
+                            toolbar_separator(ui);
+                            let color = if notice.error {
+                                ui.visuals().error_fg_color
+                            } else {
+                                ui.visuals().text_color()
+                            };
+                            ui.label(RichText::new(&notice.message).color(color));
+                            context.request_repaint_after(
+                                notice.expires_at.saturating_duration_since(Instant::now()),
+                            );
+                        }
+                    },
+                    |ui| {
+                        theme_changed = show_theme_menu(ui, &mut theme_preference);
+                    },
+                );
             });
+        if theme_changed {
+            self.preferences.theme_preference = theme_preference;
+            context.set_theme(theme_preference);
+            self.mark_preferences_dirty();
+        }
         if self
             .notice
             .as_ref()
@@ -1873,6 +1889,54 @@ fn settings_row_label(ui: &mut egui::Ui, text: &str) {
             ui.label(text);
         },
     );
+}
+
+fn show_theme_menu(ui: &mut egui::Ui, theme_preference: &mut egui::ThemePreference) -> bool {
+    let current = *theme_preference;
+    let mut changed = false;
+    let response = ui
+        .menu_button(
+            RichText::new(theme_preference_icon(current)).size(17.0),
+            |ui| {
+                ui.set_min_width(132.0);
+                for (preference, label) in [
+                    (egui::ThemePreference::System, "跟随系统"),
+                    (egui::ThemePreference::Light, "亮色"),
+                    (egui::ThemePreference::Dark, "暗色"),
+                ] {
+                    if ui
+                        .selectable_value(theme_preference, preference, label)
+                        .changed()
+                    {
+                        changed = true;
+                        ui.close();
+                    }
+                }
+            },
+        )
+        .response;
+    let accessible_label = format!("主题：{}", theme_preference_label(current));
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, accessible_label.clone())
+    });
+    response.on_hover_text(accessible_label);
+    changed
+}
+
+fn theme_preference_icon(preference: egui::ThemePreference) -> &'static str {
+    match preference {
+        egui::ThemePreference::System => "💻",
+        egui::ThemePreference::Light => "☀",
+        egui::ThemePreference::Dark => "🌙",
+    }
+}
+
+fn theme_preference_label(preference: egui::ThemePreference) -> &'static str {
+    match preference {
+        egui::ThemePreference::System => "跟随系统",
+        egui::ThemePreference::Light => "亮色",
+        egui::ThemePreference::Dark => "暗色",
+    }
 }
 
 fn settings_controls<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
