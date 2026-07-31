@@ -36,6 +36,8 @@ const SETTINGS_LABEL_WIDTH: f32 = 76.0;
 const SETTINGS_CONTROLS_WIDTH: f32 = 476.0;
 const SETTINGS_WINDOW_WIDTH: f32 = 660.0;
 const SETTINGS_WINDOW_HEIGHT: f32 = 454.0;
+const SEND_EDITOR_LIGHT_ALPHA: u8 = 120;
+const SEND_EDITOR_DARK_ALPHA: u8 = 104;
 const TITLE_BAR_HEIGHT: f32 = 36.0;
 const TITLE_BAR_BUTTON_WIDTH: f32 = 46.0;
 const TITLE_BAR_CONTROLS_WIDTH: f32 = TITLE_BAR_BUTTON_WIDTH * 3.0;
@@ -1303,11 +1305,19 @@ impl EscomApp {
                     SendMode::Text => "输入要发送的文本",
                     SendMode::Hex => "例如：AA 01 FF 或 AA01FF",
                 };
+                let editor_alpha = if ui.visuals().dark_mode {
+                    SEND_EDITOR_DARK_ALPHA
+                } else {
+                    SEND_EDITOR_LIGHT_ALPHA
+                };
+                let editor_fill =
+                    self.surface_fill(ui.visuals().text_edit_bg_color(), editor_alpha);
                 let text_edit = egui::TextEdit::multiline(&mut self.send_input)
                     .font(FontId::new(
                         self.preferences.data_font_size,
                         data_font_family(),
                     ))
+                    .background_color(editor_fill)
                     .hint_text(hint)
                     .id(editor_id)
                     .desired_rows(4)
