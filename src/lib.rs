@@ -6,3 +6,4 @@ pub mod model;
 pub mod serial_worker;
 pub mod settings;
 pub mod store;
+pub mod window_chrome;
