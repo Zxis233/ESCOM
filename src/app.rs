@@ -1009,9 +1009,17 @@ impl EscomApp {
 
     fn show_send_panel(&mut self, root_ui: &mut egui::Ui) {
         let context = root_ui.ctx().clone();
+        let toolbar_gap = root_ui.spacing().item_spacing.y.round() as i8;
+        let panel_frame = egui::Frame::side_top_panel(root_ui.style()).inner_margin(egui::Margin {
+            left: 8,
+            right: 8,
+            top: toolbar_gap,
+            bottom: 2,
+        });
         egui::Panel::bottom("send_panel")
             .resizable(true)
             .size_range(150.0..=280.0)
+            .frame(panel_frame)
             .show(root_ui, |ui| {
                 let repeat_running = self.repeat.is_some();
                 let mut send_requested = false;
