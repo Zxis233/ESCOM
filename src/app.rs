@@ -13,6 +13,7 @@ use crate::fonts::{FontCatalog, data_font_family};
 use crate::formatting::{
     FormattedRow, display_text, encode_text, format_snapshot, parse_send_input, render_export,
 };
+use crate::icon;
 use crate::model::{
     HistoryItem, LineEnding, ReceiveMode, SendMode, SerialConfig, TextEncoding, data_bits_label,
     flow_control_label, parity_label, stop_bits_label,
@@ -30,6 +31,18 @@ const CONFIG_LABEL_WIDTH: f32 = 48.0;
 const CONFIG_COMBO_WIDTH: f32 = 100.0;
 const SETTINGS_LABEL_WIDTH: f32 = 60.0;
 const SETTINGS_CONTROLS_WIDTH: f32 = 378.0;
+const TITLE_BAR_HEIGHT: f32 = 36.0;
+const TITLE_BAR_BUTTON_WIDTH: f32 = 46.0;
+const TITLE_BAR_CONTROLS_WIDTH: f32 = TITLE_BAR_BUTTON_WIDTH * 3.0;
+const WINDOW_RESIZE_BORDER: f32 = 5.0;
+
+#[derive(Clone, Copy)]
+enum TitleBarControl {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+}
 
 #[derive(Debug, Clone)]
 enum ConnectionState {
@@ -77,6 +90,7 @@ pub struct EscomApp {
     store: Arc<Mutex<ReceiveStore>>,
     worker: WorkerHandle,
     font_catalog: FontCatalog,
+    title_icon: egui::TextureHandle,
 
     send_input: String,
     focus_terminal_surface: bool,
@@ -121,6 +135,16 @@ impl EscomApp {
         preferences.ui_font_weight = applied_fonts.ui_weight;
         preferences.data_font_weight = applied_fonts.data_weight;
 
+        let icon_data = icon::icon_data();
+        let title_icon = creation_context.egui_ctx.load_texture(
+            "escom-title-icon",
+            egui::ColorImage::from_rgba_unmultiplied(
+                [icon_data.width as usize, icon_data.height as usize],
+                &icon_data.rgba,
+            ),
+            egui::TextureOptions::LINEAR,
+        );
+
         let store = Arc::new(Mutex::new(ReceiveStore::new(
             preferences.buffer_limit_bytes(),
         )));
@@ -141,6 +165,7 @@ impl EscomApp {
             store,
             worker,
             font_catalog,
+            title_icon,
             send_input: String::new(),
             focus_terminal_surface: false,
             send_error: None,
@@ -163,6 +188,125 @@ impl EscomApp {
             last_port_refresh: Instant::now() - PORT_REFRESH_INTERVAL,
             notice,
         }
+    }
+
+    fn show_title_bar(&self, root_ui: &mut egui::Ui) {
+        let context = root_ui.ctx().clone();
+        let maximized = context.input(|input| input.viewport().maximized.unwrap_or(false));
+        let title_fill = if root_ui.visuals().dark_mode {
+            Color32::from_rgb(31, 34, 40)
+        } else {
+            Color32::from_rgb(246, 247, 249)
+        };
+
+        egui::Panel::top("custom_title_bar")
+            .resizable(false)
+            .exact_size(TITLE_BAR_HEIGHT)
+            .frame(egui::Frame::new().fill(title_fill).inner_margin(0.0))
+            .show(root_ui, |ui| {
+                let rect = ui.max_rect();
+                let controls_left = rect.right() - TITLE_BAR_CONTROLS_WIDTH;
+                let drag_rect =
+                    egui::Rect::from_min_max(rect.min, egui::pos2(controls_left, rect.bottom()));
+                let drag_response = ui.interact(
+                    drag_rect,
+                    ui.id().with("window_drag_area"),
+                    egui::Sense::click_and_drag(),
+                );
+                if drag_response.double_clicked_by(egui::PointerButton::Primary) {
+                    context.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                } else if drag_response.is_pointer_button_down_on() {
+                    context.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+
+                let icon_rect = egui::Rect::from_center_size(
+                    egui::pos2(rect.left() + 18.0, rect.center().y),
+                    egui::vec2(18.0, 18.0),
+                );
+                ui.painter().image(
+                    self.title_icon.id(),
+                    icon_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+                ui.painter().text(
+                    egui::pos2(icon_rect.right() + 8.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    "ESCOM",
+                    FontId::new(14.0, egui::FontFamily::Proportional),
+                    ui.visuals().text_color(),
+                );
+
+                let close_rect = title_bar_control_rect(rect, 0);
+                let maximize_rect = title_bar_control_rect(rect, 1);
+                let minimize_rect = title_bar_control_rect(rect, 2);
+
+                if title_bar_control(ui, minimize_rect, TitleBarControl::Minimize).clicked() {
+                    context.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+                let maximize_control = if maximized {
+                    TitleBarControl::Restore
+                } else {
+                    TitleBarControl::Maximize
+                };
+                if title_bar_control(ui, maximize_rect, maximize_control).clicked() {
+                    context.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                }
+                if title_bar_control(ui, close_rect, TitleBarControl::Close).clicked() {
+                    context.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+
+                ui.painter().hline(
+                    rect.x_range(),
+                    rect.bottom() - 0.5,
+                    ui.visuals().widgets.noninteractive.bg_stroke,
+                );
+            });
+    }
+
+    fn handle_window_resize(&self, context: &egui::Context) {
+        let (maximized, fullscreen, pointer_position, primary_pressed, viewport_rect) = context
+            .input(|input| {
+                (
+                    input.viewport().maximized.unwrap_or(false),
+                    input.viewport().fullscreen.unwrap_or(false),
+                    input.pointer.hover_pos(),
+                    input.pointer.primary_pressed(),
+                    input.viewport_rect(),
+                )
+            });
+        if maximized || fullscreen {
+            return;
+        }
+        let Some(pointer_position) = pointer_position else {
+            return;
+        };
+        let Some(direction) = window_resize_direction(viewport_rect, pointer_position) else {
+            return;
+        };
+
+        context.set_cursor_icon(resize_cursor(direction));
+        if primary_pressed {
+            context.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+        }
+    }
+
+    fn paint_window_border(&self, context: &egui::Context) {
+        if context.input(|input| input.viewport().maximized.unwrap_or(false)) {
+            return;
+        }
+        let rect = context.input(|input| input.viewport_rect()).shrink(0.5);
+        context
+            .layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("custom_window_border"),
+            ))
+            .rect_stroke(
+                rect,
+                0.0,
+                context.style_of(context.theme()).visuals.window_stroke,
+                egui::StrokeKind::Inside,
+            );
     }
 
     fn process_worker_events(&mut self) {
@@ -1420,6 +1564,7 @@ impl eframe::App for EscomApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
+        self.show_title_bar(ui);
         self.show_connection_panel(ui);
         self.show_status_panel(ui);
         if self.preferences.receive_mode != ReceiveMode::Terminal {
@@ -1427,6 +1572,8 @@ impl eframe::App for EscomApp {
         }
         self.show_output_panel(ui);
         self.show_settings_window(&context);
+        self.handle_window_resize(&context);
+        self.paint_window_border(&context);
     }
 }
 
@@ -1434,6 +1581,142 @@ impl Drop for EscomApp {
     fn drop(&mut self) {
         let _ = settings::save(&self.preferences);
         self.worker.shutdown();
+    }
+}
+
+fn title_bar_control_rect(title_rect: egui::Rect, index_from_right: usize) -> egui::Rect {
+    let right = title_rect.right() - index_from_right as f32 * TITLE_BAR_BUTTON_WIDTH;
+    egui::Rect::from_min_max(
+        egui::pos2(right - TITLE_BAR_BUTTON_WIDTH, title_rect.top()),
+        egui::pos2(right, title_rect.bottom()),
+    )
+}
+
+fn title_bar_control(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    control: TitleBarControl,
+) -> egui::Response {
+    let label = match control {
+        TitleBarControl::Minimize => "最小化",
+        TitleBarControl::Maximize => "最大化",
+        TitleBarControl::Restore => "还原",
+        TitleBarControl::Close => "关闭",
+    };
+    let response = ui.interact(rect, ui.id().with(label), egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+
+    let is_close = matches!(control, TitleBarControl::Close);
+    let icon_color = if is_close && response.hovered() {
+        Color32::WHITE
+    } else {
+        ui.visuals().text_color()
+    };
+    let fill = if is_close && response.is_pointer_button_down_on() {
+        Some(Color32::from_rgb(150, 25, 20))
+    } else if is_close && response.hovered() {
+        Some(Color32::from_rgb(196, 43, 28))
+    } else if response.is_pointer_button_down_on() {
+        Some(ui.visuals().widgets.active.weak_bg_fill)
+    } else if response.hovered() {
+        Some(ui.visuals().widgets.hovered.weak_bg_fill)
+    } else {
+        None
+    };
+    if let Some(fill) = fill {
+        ui.painter().rect_filled(rect, 0.0, fill);
+    }
+
+    let center = rect.center();
+    let stroke = egui::Stroke::new(1.25, icon_color);
+    match control {
+        TitleBarControl::Minimize => {
+            ui.painter()
+                .hline((center.x - 5.0)..=(center.x + 5.0), center.y + 4.0, stroke);
+        }
+        TitleBarControl::Maximize => {
+            ui.painter().rect_stroke(
+                egui::Rect::from_center_size(center, egui::vec2(10.0, 10.0)),
+                0.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        TitleBarControl::Restore => {
+            ui.painter().rect_stroke(
+                egui::Rect::from_center_size(center + egui::vec2(1.5, -1.5), egui::vec2(8.0, 8.0)),
+                0.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().rect_stroke(
+                egui::Rect::from_center_size(center + egui::vec2(-1.5, 1.5), egui::vec2(8.0, 8.0)),
+                0.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        TitleBarControl::Close => {
+            ui.painter().line_segment(
+                [
+                    center + egui::vec2(-5.0, -5.0),
+                    center + egui::vec2(5.0, 5.0),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    center + egui::vec2(5.0, -5.0),
+                    center + egui::vec2(-5.0, 5.0),
+                ],
+                stroke,
+            );
+        }
+    }
+
+    response.on_hover_text(label)
+}
+
+fn window_resize_direction(
+    viewport_rect: egui::Rect,
+    pointer_position: egui::Pos2,
+) -> Option<egui::ResizeDirection> {
+    let in_title_controls = pointer_position.y < viewport_rect.top() + TITLE_BAR_HEIGHT
+        && pointer_position.x >= viewport_rect.right() - TITLE_BAR_CONTROLS_WIDTH;
+    let left = pointer_position.x <= viewport_rect.left() + WINDOW_RESIZE_BORDER;
+    let right = pointer_position.x >= viewport_rect.right() - WINDOW_RESIZE_BORDER
+        && pointer_position.y >= viewport_rect.top() + TITLE_BAR_HEIGHT;
+    let top =
+        pointer_position.y <= viewport_rect.top() + WINDOW_RESIZE_BORDER && !in_title_controls;
+    let bottom = pointer_position.y >= viewport_rect.bottom() - WINDOW_RESIZE_BORDER;
+
+    match (left, right, top, bottom) {
+        (true, _, true, _) => Some(egui::ResizeDirection::NorthWest),
+        (_, true, true, _) => Some(egui::ResizeDirection::NorthEast),
+        (true, _, _, true) => Some(egui::ResizeDirection::SouthWest),
+        (_, true, _, true) => Some(egui::ResizeDirection::SouthEast),
+        (true, _, _, _) => Some(egui::ResizeDirection::West),
+        (_, true, _, _) => Some(egui::ResizeDirection::East),
+        (_, _, true, _) => Some(egui::ResizeDirection::North),
+        (_, _, _, true) => Some(egui::ResizeDirection::South),
+        _ => None,
+    }
+}
+
+fn resize_cursor(direction: egui::ResizeDirection) -> egui::CursorIcon {
+    match direction {
+        egui::ResizeDirection::North | egui::ResizeDirection::South => {
+            egui::CursorIcon::ResizeVertical
+        }
+        egui::ResizeDirection::East | egui::ResizeDirection::West => {
+            egui::CursorIcon::ResizeHorizontal
+        }
+        egui::ResizeDirection::NorthEast | egui::ResizeDirection::SouthWest => {
+            egui::CursorIcon::ResizeNeSw
+        }
+        egui::ResizeDirection::NorthWest | egui::ResizeDirection::SouthEast => {
+            egui::CursorIcon::ResizeNwSe
+        }
     }
 }
 
@@ -1651,6 +1934,54 @@ mod tests {
         assert_eq!(human_bytes(7), "7 B");
         assert_eq!(human_bytes(2048), "2.0 KiB");
         assert_eq!(human_bytes(2 * 1024 * 1024), "2.0 MiB");
+    }
+
+    #[test]
+    fn borderless_resize_hit_zones_map_to_edges_and_corners() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0));
+
+        assert_eq!(
+            window_resize_direction(viewport, egui::pos2(1.0, 1.0)),
+            Some(egui::ResizeDirection::NorthWest)
+        );
+        assert_eq!(
+            window_resize_direction(viewport, egui::pos2(1.0, 819.0)),
+            Some(egui::ResizeDirection::SouthWest)
+        );
+        assert_eq!(
+            window_resize_direction(viewport, egui::pos2(1279.0, 819.0)),
+            Some(egui::ResizeDirection::SouthEast)
+        );
+        assert_eq!(
+            window_resize_direction(viewport, egui::pos2(1.0, 400.0)),
+            Some(egui::ResizeDirection::West)
+        );
+        assert_eq!(
+            window_resize_direction(viewport, egui::pos2(1279.0, 400.0)),
+            Some(egui::ResizeDirection::East)
+        );
+        assert_eq!(
+            window_resize_direction(viewport, egui::pos2(640.0, 1.0)),
+            Some(egui::ResizeDirection::North)
+        );
+        assert_eq!(
+            window_resize_direction(viewport, egui::pos2(640.0, 819.0)),
+            Some(egui::ResizeDirection::South)
+        );
+        assert_eq!(
+            window_resize_direction(viewport, egui::pos2(640.0, 400.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn title_bar_controls_take_priority_over_resize_hit_zone() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0));
+
+        assert_eq!(
+            window_resize_direction(viewport, egui::pos2(1279.0, 1.0)),
+            None
+        );
     }
 
     #[test]

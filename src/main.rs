@@ -19,6 +19,8 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([1024.0, 640.0])
+            .with_decorations(false)
+            .with_has_shadow(true)
             .with_icon(icon::icon_data()),
         centered: true,
         persist_window: true,
