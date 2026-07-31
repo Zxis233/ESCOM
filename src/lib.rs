@@ -1,8 +1,10 @@
 pub mod app;
 pub mod fonts;
 pub mod formatting;
+pub mod highlight;
 pub mod icon;
 pub mod model;
+pub mod search;
 pub mod serial_worker;
 pub mod settings;
 pub mod store;

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,24 +14,29 @@ use crate::fonts::{FontCatalog, data_font_family};
 use crate::formatting::{
     FormattedRow, display_text, encode_text, format_snapshot, parse_send_input, render_export,
 };
+use crate::highlight::{self, HighlightRules, HighlightStyle};
 use crate::icon;
 use crate::model::{
     HistoryItem, LineEnding, ReceiveMode, SendMode, SerialConfig, TextEncoding, data_bits_label,
     flow_control_label, parity_label, parse_baud_rate, stop_bits_label,
 };
+use crate::search::{self, SearchIndex, SearchMatch};
 use crate::serial_worker::{WorkerEvent, WorkerHandle};
 use crate::settings::{
     self, AppBackgroundSource, BUFFER_LIMIT_OPTIONS_MIB, DEFAULT_BACKGROUND_DARK_OPACITY,
-    DEFAULT_BACKGROUND_LIGHT_OPACITY, MAX_DATA_LINE_SPACING, MIN_DATA_LINE_SPACING, UiPreferences,
+    DEFAULT_BACKGROUND_LIGHT_OPACITY, MAX_DATA_LINE_SPACING, MAX_FONT_SIZE, MIN_DATA_LINE_SPACING,
+    MIN_FONT_SIZE, UiPreferences,
 };
 use crate::store::ReceiveStore;
 use crate::window_chrome;
 
 const FORMAT_DEBOUNCE: Duration = Duration::from_millis(80);
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 const PORT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const NOTICE_DURATION: Duration = Duration::from_secs(6);
 const MAX_HISTORY: usize = 50;
 const CONNECTION_CONTROL_HEIGHT: f32 = 32.0;
+const SEARCH_BAR_RIGHT_PADDING: f32 = 8.0;
 const CONFIG_LABEL_WIDTH: f32 = 48.0;
 const CONFIG_COMBO_WIDTH: f32 = 100.0;
 const SETTINGS_LABEL_WIDTH: f32 = 76.0;
@@ -92,7 +98,18 @@ enum BackgroundEvent {
         generation: u64,
         rows: Vec<FormattedRow>,
     },
+    Searched {
+        token: u64,
+        index: SearchIndex,
+    },
     Exported(Result<PathBuf, String>),
+}
+
+#[derive(Clone, Copy)]
+enum HighlightConfigAction {
+    Reload,
+    Open,
+    CopyPath,
 }
 
 pub struct EscomApp {
@@ -122,6 +139,21 @@ pub struct EscomApp {
     last_format_started: Instant,
     paused: bool,
     force_scroll_bottom: bool,
+    search_query: String,
+    search_case_sensitive: bool,
+    search_regex: bool,
+    search_filter: bool,
+    search_index: Arc<SearchIndex>,
+    search_token: u64,
+    search_pending: bool,
+    search_in_progress: bool,
+    search_reset_selection: bool,
+    search_last_changed: Instant,
+    search_selected_match: Option<usize>,
+    search_scroll_to_row: Option<usize>,
+    focus_search: bool,
+    highlight_rules: Arc<HighlightRules>,
+    highlight_config_error: Option<String>,
     background_tx: Sender<BackgroundEvent>,
     background_rx: Receiver<BackgroundEvent>,
 
@@ -173,8 +205,17 @@ impl EscomApp {
         let worker = WorkerHandle::spawn(Arc::clone(&store));
         let _ = worker.refresh_ports();
         let (background_tx, background_rx) = unbounded();
-        let notice = (!applied_fonts.warnings.is_empty()).then(|| Notice {
-            message: applied_fonts.warnings.join("；"),
+        let highlight_path = highlight::config_path();
+        let (highlight_rules, highlight_config_error) = match HighlightRules::load_or_create() {
+            Ok(rules) => (rules, None),
+            Err(error) => (HighlightRules::empty(highlight_path), Some(error)),
+        };
+        let mut startup_warnings = applied_fonts.warnings.clone();
+        if let Some(error) = &highlight_config_error {
+            startup_warnings.push(error.clone());
+        }
+        let notice = (!startup_warnings.is_empty()).then(|| Notice {
+            message: startup_warnings.join("；"),
             expires_at: Instant::now() + NOTICE_DURATION,
             error: true,
         });
@@ -208,6 +249,21 @@ impl EscomApp {
             last_format_started: Instant::now() - FORMAT_DEBOUNCE,
             paused: false,
             force_scroll_bottom: false,
+            search_query: String::new(),
+            search_case_sensitive: false,
+            search_regex: false,
+            search_filter: false,
+            search_index: Arc::new(SearchIndex::default()),
+            search_token: 0,
+            search_pending: false,
+            search_in_progress: false,
+            search_reset_selection: false,
+            search_last_changed: Instant::now() - SEARCH_DEBOUNCE,
+            search_selected_match: None,
+            search_scroll_to_row: None,
+            focus_search: false,
+            highlight_rules: Arc::new(highlight_rules),
+            highlight_config_error,
             background_tx,
             background_rx,
             settings_open: false,
@@ -385,8 +441,27 @@ impl EscomApp {
                         self.display_rows = Arc::new(rows);
                         self.display_generation = generation;
                         self.force_format = false;
+                        self.request_search(false);
                     } else {
                         self.force_format = true;
+                    }
+                }
+                BackgroundEvent::Searched { token, index } => {
+                    self.search_in_progress = false;
+                    if token == self.search_token {
+                        self.search_index = Arc::new(index);
+                        if self.search_index.error.is_some() || self.search_index.matches.is_empty()
+                        {
+                            self.search_selected_match = None;
+                            self.search_scroll_to_row = None;
+                        } else if self.search_reset_selection {
+                            self.search_selected_match = Some(0);
+                            self.queue_selected_search_scroll();
+                        } else if let Some(selected) = self.search_selected_match {
+                            self.search_selected_match =
+                                Some(selected.min(self.search_index.matches.len() - 1));
+                        }
+                        self.search_reset_selection = false;
                     }
                 }
                 BackgroundEvent::Exported(result) => match result {
@@ -454,6 +529,101 @@ impl EscomApp {
                 repaint_context.request_repaint();
             })
             .expect("failed to start formatting task");
+    }
+
+    fn request_search(&mut self, reset_selection: bool) {
+        self.search_token = self.search_token.wrapping_add(1);
+        self.search_last_changed = Instant::now();
+        self.search_pending = !self.search_query.is_empty();
+        self.search_reset_selection |= reset_selection;
+        if reset_selection {
+            self.search_index = Arc::new(SearchIndex::default());
+            self.search_selected_match = None;
+            self.search_scroll_to_row = None;
+        }
+        if self.search_query.is_empty() {
+            self.search_pending = false;
+            self.search_reset_selection = false;
+        }
+    }
+
+    fn maybe_start_search(&mut self, context: &egui::Context) {
+        if !self.search_pending || self.search_in_progress || self.search_query.is_empty() {
+            return;
+        }
+        if self.search_last_changed.elapsed() < SEARCH_DEBOUNCE {
+            context.request_repaint_after(SEARCH_DEBOUNCE - self.search_last_changed.elapsed());
+            return;
+        }
+
+        let token = self.search_token;
+        let rows = Arc::clone(&self.display_rows);
+        let query = self.search_query.clone();
+        let case_sensitive = self.search_case_sensitive;
+        let regex_mode = self.search_regex;
+        let timestamps = self.preferences.timestamps;
+        let sender = self.background_tx.clone();
+        let repaint_context = context.clone();
+        self.search_pending = false;
+        self.search_in_progress = true;
+
+        thread::Builder::new()
+            .name("escom-search".into())
+            .spawn(move || {
+                let index =
+                    search::search_rows(&rows, &query, case_sensitive, regex_mode, timestamps);
+                let _ = sender.send(BackgroundEvent::Searched { token, index });
+                repaint_context.request_repaint();
+            })
+            .expect("failed to start search task");
+    }
+
+    fn navigate_search(&mut self, direction: isize) {
+        let count = self.search_index.matches.len();
+        if count == 0 {
+            return;
+        }
+        let current = self.search_selected_match.unwrap_or(0);
+        let next = if direction < 0 {
+            current.checked_sub(1).unwrap_or(count - 1)
+        } else {
+            (current + 1) % count
+        };
+        self.search_selected_match = Some(next);
+        self.queue_selected_search_scroll();
+    }
+
+    fn queue_selected_search_scroll(&mut self) {
+        let Some(selected) = self.search_selected_match else {
+            return;
+        };
+        let Some(found) = self.search_index.matches.get(selected) else {
+            return;
+        };
+        let visible_row = if self.search_filter {
+            self.search_index
+                .matched_rows
+                .binary_search(&found.row_index)
+                .ok()
+        } else {
+            Some(found.row_index)
+        };
+        self.search_scroll_to_row = visible_row;
+    }
+
+    fn reload_highlight_rules(&mut self) {
+        match HighlightRules::load_or_create() {
+            Ok(rules) => {
+                let count = rules.len();
+                self.highlight_rules = Arc::new(rules);
+                self.highlight_config_error = None;
+                self.set_notice(format!("已加载 {count} 条高亮规则"), false);
+            }
+            Err(error) => {
+                self.highlight_config_error = Some(error.clone());
+                self.set_notice(error, true);
+            }
+        }
     }
 
     fn process_repeat(&mut self, context: &egui::Context) {
@@ -900,12 +1070,16 @@ impl EscomApp {
                                 }
                             }
                         });
-                    preferences_changed |= ui
+                    let timestamps_changed = ui
                         .add_sized(
                             [76.0, CONNECTION_CONTROL_HEIGHT],
                             egui::Checkbox::new(&mut self.preferences.timestamps, "时间戳"),
                         )
                         .changed();
+                    preferences_changed |= timestamps_changed;
+                    if timestamps_changed {
+                        self.request_search(true);
+                    }
                     preferences_changed |= ui
                         .add_sized(
                             [88.0, CONNECTION_CONTROL_HEIGHT],
@@ -974,6 +1148,7 @@ impl EscomApp {
                         self.export_snapshot(&context);
                     }
                 });
+                self.show_search_bar(ui, &context);
                 if display_changed {
                     self.invalidate_format();
                 }
@@ -988,6 +1163,190 @@ impl EscomApp {
                     self.show_receive_content(ui);
                 }
             });
+    }
+
+    fn show_search_bar(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        if context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::F)) {
+            self.focus_search = true;
+        }
+
+        let mut search_changed = false;
+        let mut navigation = 0_isize;
+        let mut highlight_action = None;
+        ui.horizontal(|ui| {
+            toolbar_label(ui, "查找", 38.0);
+            let search_width = (ui.available_width() - 520.0 - SEARCH_BAR_RIGHT_PADDING).max(160.0);
+            let search_id = ui.make_persistent_id("receive_search_input");
+            let response = ui.add_sized(
+                [search_width, CONNECTION_CONTROL_HEIGHT],
+                egui::TextEdit::singleline(&mut self.search_query)
+                    .id(search_id)
+                    .hint_text("输入文本或正则表达式（Ctrl+F）")
+                    .vertical_align(Align::Center),
+            );
+            if self.focus_search {
+                response.request_focus();
+                self.focus_search = false;
+            }
+            search_changed |= response.changed();
+            if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                navigation = if ui.input(|input| input.modifiers.shift) {
+                    -1
+                } else {
+                    1
+                };
+            }
+
+            if ui
+                .add_enabled(
+                    !self.search_query.is_empty(),
+                    egui::Button::new("×").min_size(egui::vec2(32.0, CONNECTION_CONTROL_HEIGHT)),
+                )
+                .on_hover_text("清除搜索")
+                .clicked()
+            {
+                self.search_query.clear();
+                search_changed = true;
+            }
+
+            if ui
+                .add_sized(
+                    [44.0, CONNECTION_CONTROL_HEIGHT],
+                    egui::Button::selectable(self.search_case_sensitive, "Aa"),
+                )
+                .on_hover_text("区分大小写")
+                .clicked()
+            {
+                self.search_case_sensitive = !self.search_case_sensitive;
+                search_changed = true;
+            }
+            if ui
+                .add_sized(
+                    [44.0, CONNECTION_CONTROL_HEIGHT],
+                    egui::Button::selectable(self.search_regex, ".*"),
+                )
+                .on_hover_text("使用正则表达式")
+                .clicked()
+            {
+                self.search_regex = !self.search_regex;
+                search_changed = true;
+            }
+
+            let filter_response = ui
+                .add_enabled(
+                    !self.search_query.is_empty() && self.search_index.error.is_none(),
+                    egui::Button::selectable(self.search_filter, "过滤")
+                        .min_size(egui::vec2(64.0, CONNECTION_CONTROL_HEIGHT)),
+                )
+                .on_hover_text("只显示包含匹配项的行");
+            if filter_response.clicked() {
+                self.search_filter = !self.search_filter;
+                self.queue_selected_search_scroll();
+            }
+
+            let can_navigate = !self.search_index.matches.is_empty();
+            if ui
+                .add_enabled(
+                    can_navigate,
+                    egui::Button::new("上一处")
+                        .min_size(egui::vec2(56.0, CONNECTION_CONTROL_HEIGHT)),
+                )
+                .clicked()
+            {
+                navigation = -1;
+            }
+            if ui
+                .add_enabled(
+                    can_navigate,
+                    egui::Button::new("下一处")
+                        .min_size(egui::vec2(56.0, CONNECTION_CONTROL_HEIGHT)),
+                )
+                .clicked()
+            {
+                navigation = 1;
+            }
+
+            let status_error = self.search_index.error.clone();
+            let status = if self.search_pending || self.search_in_progress {
+                RichText::new("搜索中…").color(ui.visuals().weak_text_color())
+            } else if status_error.is_some() {
+                RichText::new("表达式错误")
+                    .color(ui.visuals().error_fg_color)
+                    .underline()
+            } else if self.search_query.is_empty() {
+                RichText::new("—").color(ui.visuals().weak_text_color())
+            } else {
+                let selected = self.search_selected_match.map_or(0, |index| index + 1);
+                let suffix = if self.search_index.truncated { "+" } else { "" };
+                RichText::new(format!(
+                    "{selected}/{}{suffix}",
+                    self.search_index.matches.len()
+                ))
+            };
+            let status_response = ui.add_sized(
+                [88.0, CONNECTION_CONTROL_HEIGHT],
+                egui::Label::new(status).truncate(),
+            );
+            if let Some(error) = status_error {
+                status_response.on_hover_text(error);
+            }
+
+            let path = self.highlight_rules.path().to_path_buf();
+            let path_display = path.display().to_string();
+            let button_text = if self.highlight_config_error.is_some() {
+                "高亮 !".to_owned()
+            } else {
+                format!("高亮 {}", self.highlight_rules.len())
+            };
+            ui.menu_button(button_text, |ui| {
+                ui.set_min_width(360.0);
+                ui.label(
+                    RichText::new(&path_display)
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
+                if let Some(error) = &self.highlight_config_error {
+                    ui.label(RichText::new(error).color(ui.visuals().error_fg_color));
+                }
+                ui.separator();
+                if ui.button("重新加载").clicked() {
+                    highlight_action = Some(HighlightConfigAction::Reload);
+                    ui.close();
+                }
+                if ui.button("打开配置文件").clicked() {
+                    highlight_action = Some(HighlightConfigAction::Open);
+                    ui.close();
+                }
+                if ui.button("复制配置路径").clicked() {
+                    highlight_action = Some(HighlightConfigAction::CopyPath);
+                    ui.close();
+                }
+            })
+            .response
+            .on_hover_text("高亮规则由 highlight.toml 管理");
+            ui.add_space(SEARCH_BAR_RIGHT_PADDING);
+        });
+
+        if search_changed {
+            self.request_search(true);
+            context.request_repaint_after(SEARCH_DEBOUNCE);
+        }
+        if navigation != 0 {
+            self.navigate_search(navigation);
+        }
+        match highlight_action {
+            Some(HighlightConfigAction::Reload) => self.reload_highlight_rules(),
+            Some(HighlightConfigAction::Open) => {
+                if let Err(error) = open_config_file(self.highlight_rules.path()) {
+                    self.set_notice(error, true);
+                }
+            }
+            Some(HighlightConfigAction::CopyPath) => {
+                context.copy_text(self.highlight_rules.path().display().to_string());
+                self.set_notice("已复制高亮配置路径", false);
+            }
+            None => {}
+        }
     }
 
     fn show_receive_content(&mut self, ui: &mut egui::Ui) {
@@ -1010,21 +1369,67 @@ impl EscomApp {
         let data_font = FontId::new(self.preferences.data_font_size, data_font_family());
         let rows = Arc::clone(&self.display_rows);
         let timestamps = self.preferences.timestamps;
+        let search_index = Arc::clone(&self.search_index);
+        let highlight_rules = Arc::clone(&self.highlight_rules);
+        let selected_match = self.search_selected_match;
+        let filter_active =
+            self.search_filter && !self.search_query.is_empty() && search_index.error.is_none();
+        let visible_row_count = if filter_active {
+            search_index.matched_row_count(rows.len())
+        } else {
+            rows.len()
+        };
+        if visible_row_count == 0 {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    RichText::new(if self.search_pending || self.search_in_progress {
+                        "正在搜索…"
+                    } else {
+                        "没有匹配的接收数据"
+                    })
+                    .color(ui.visuals().weak_text_color()),
+                );
+            });
+            return;
+        }
+
         let mut scroll_area = egui::ScrollArea::both()
             .id_salt("receive_output")
             .auto_shrink([false, false])
-            .stick_to_bottom(self.preferences.auto_scroll);
+            .stick_to_bottom(self.preferences.auto_scroll && self.search_query.is_empty());
         if self.force_scroll_bottom {
             scroll_area = scroll_area.vertical_scroll_offset(f32::INFINITY);
             self.force_scroll_bottom = false;
+        } else if let Some(visible_row) = self.search_scroll_to_row.take() {
+            scroll_area = scroll_area
+                .vertical_scroll_offset(visible_row as f32 * (row_height + line_spacing));
         }
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = line_spacing;
-            scroll_area.show_rows(ui, row_height, rows.len(), |ui, range| {
-                for row in &rows[range] {
+            scroll_area.show_rows(ui, row_height, visible_row_count, |ui, range| {
+                for visible_row in range {
+                    let row_index = if filter_active {
+                        search_index.matched_rows[visible_row]
+                    } else {
+                        visible_row
+                    };
+                    let Some(row) = rows.get(row_index) else {
+                        continue;
+                    };
                     let text = display_text(row, timestamps);
+                    let line_style = highlight_rules.style_for(&row.text);
+                    let (match_offset, row_matches) = search_index.matches_for_row(row_index);
+                    let layout_job = receive_row_layout_job(
+                        ui,
+                        &text,
+                        &data_font,
+                        line_style,
+                        match_offset,
+                        row_matches,
+                        selected_match,
+                    );
                     ui.add(
-                        egui::Label::new(RichText::new(text).font(data_font.clone()))
+                        egui::Label::new(layout_job)
                             .selectable(true)
                             .wrap_mode(egui::TextWrapMode::Extend),
                     );
@@ -1474,17 +1879,11 @@ impl EscomApp {
 
                         settings_row_label(ui, "界面字号");
                         settings_controls(ui, |ui| {
-                            font_changed |= ui
-                                .add_sized(
-                                    [220.0, CONNECTION_CONTROL_HEIGHT],
-                                    egui::Slider::new(
-                                        &mut self.preferences.ui_font_size,
-                                        10.0..=32.0,
-                                    )
-                                    .integer()
-                                    .suffix(" pt"),
-                                )
-                                .changed();
+                            font_changed |= font_size_combo(
+                                ui,
+                                "ui_font_size",
+                                &mut self.preferences.ui_font_size,
+                            );
                         });
                         ui.end_row();
 
@@ -1529,17 +1928,11 @@ impl EscomApp {
 
                         settings_row_label(ui, "数据字号");
                         settings_controls(ui, |ui| {
-                            preferences_changed |= ui
-                                .add_sized(
-                                    [220.0, CONNECTION_CONTROL_HEIGHT],
-                                    egui::Slider::new(
-                                        &mut self.preferences.data_font_size,
-                                        10.0..=32.0,
-                                    )
-                                    .integer()
-                                    .suffix(" pt"),
-                                )
-                                .changed();
+                            preferences_changed |= font_size_combo(
+                                ui,
+                                "data_font_size",
+                                &mut self.preferences.data_font_size,
+                            );
                         });
                         ui.end_row();
 
@@ -1979,6 +2372,11 @@ impl EscomApp {
         }
         self.invalidate_format();
         self.display_rows = Arc::new(Vec::new());
+        self.search_token = self.search_token.wrapping_add(1);
+        self.search_pending = false;
+        self.search_index = Arc::new(SearchIndex::default());
+        self.search_selected_match = None;
+        self.search_scroll_to_row = None;
     }
 
     fn export_snapshot(&mut self, context: &egui::Context) {
@@ -2043,6 +2441,7 @@ impl eframe::App for EscomApp {
         self.maybe_refresh_ports();
         self.process_repeat(context);
         self.maybe_start_format(context);
+        self.maybe_start_search(context);
         self.save_preferences_if_due();
 
         if self.connection.is_connected() {
@@ -2074,6 +2473,91 @@ impl Drop for EscomApp {
         let _ = settings::save(&self.preferences);
         self.worker.shutdown();
     }
+}
+
+fn receive_row_layout_job(
+    ui: &egui::Ui,
+    text: &str,
+    font: &FontId,
+    line_style: Option<HighlightStyle>,
+    match_offset: usize,
+    row_matches: &[SearchMatch],
+    selected_match: Option<usize>,
+) -> egui::text::LayoutJob {
+    let base_color = line_style
+        .and_then(|style| style.foreground)
+        .unwrap_or_else(|| ui.visuals().text_color());
+    let mut base_format = egui::TextFormat {
+        font_id: font.clone(),
+        color: base_color,
+        ..Default::default()
+    };
+    if let Some(style) = line_style {
+        base_format.background = style.background.unwrap_or(Color32::TRANSPARENT);
+        if style.underline {
+            base_format.underline = egui::Stroke::new(1.0, base_color);
+        }
+    }
+
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = f32::INFINITY;
+    let mut cursor = 0;
+    for (local_index, found) in row_matches.iter().enumerate() {
+        let range = &found.byte_range;
+        if range.start < cursor
+            || range.end > text.len()
+            || !text.is_char_boundary(range.start)
+            || !text.is_char_boundary(range.end)
+        {
+            continue;
+        }
+        if cursor < range.start {
+            job.append(&text[cursor..range.start], 0.0, base_format.clone());
+        }
+        let is_selected = selected_match == Some(match_offset + local_index);
+        let mut match_format = base_format.clone();
+        match_format.background = if is_selected {
+            ui.visuals().selection.bg_fill
+        } else {
+            ui.visuals().selection.bg_fill.gamma_multiply(0.48)
+        };
+        if is_selected {
+            match_format.color = ui.visuals().selection.stroke.color;
+        }
+        job.append(&text[range.clone()], 0.0, match_format);
+        cursor = range.end;
+    }
+    if cursor < text.len() || text.is_empty() {
+        job.append(&text[cursor..], 0.0, base_format);
+    }
+    job
+}
+
+#[cfg(target_os = "windows")]
+fn open_config_file(path: &Path) -> Result<(), String> {
+    Command::new("notepad.exe")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("无法打开高亮配置文件：{error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn open_config_file(path: &Path) -> Result<(), String> {
+    Command::new("open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("无法打开高亮配置文件：{error}"))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_config_file(path: &Path) -> Result<(), String> {
+    Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("无法打开高亮配置文件：{error}"))
 }
 
 fn config_combo(
@@ -2475,6 +2959,23 @@ fn settings_controls<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) 
     .inner
 }
 
+fn font_size_combo(ui: &mut egui::Ui, id: &'static str, font_size: &mut f32) -> bool {
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(format!("{font_size:.0} pt"))
+        .width(120.0)
+        .show_ui(ui, |ui| {
+            for size in MIN_FONT_SIZE as u16..=MAX_FONT_SIZE as u16 {
+                changed |= ui
+                    .selectable_value(font_size, f32::from(size), format!("{size} pt"))
+                    .changed();
+            }
+        })
+        .response
+        .on_hover_text("选择字号（10–48 pt）");
+    changed
+}
+
 fn history_preview(item: &HistoryItem) -> String {
     let normalized = item.input.replace(['\r', '\n'], " ");
     let mut preview: String = normalized.chars().take(36).collect();
@@ -2536,6 +3037,38 @@ mod tests {
         let tall = cover_uv(egui::vec2(100.0, 200.0), egui::vec2(100.0, 100.0));
         assert_eq!(tall.min, egui::pos2(0.0, 0.25));
         assert_eq!(tall.max, egui::pos2(1.0, 0.75));
+    }
+
+    #[test]
+    fn receive_row_layout_combines_rule_and_search_highlights() {
+        egui::__run_test_ui(|ui| {
+            let rule_background = Color32::from_rgba_unmultiplied(220, 40, 40, 80);
+            let matches = [SearchMatch {
+                row_index: 0,
+                byte_range: 0..5,
+            }];
+            let selected_background = ui.visuals().selection.bg_fill;
+            let job = receive_row_layout_job(
+                ui,
+                "ERROR ready",
+                &FontId::monospace(15.0),
+                Some(HighlightStyle {
+                    foreground: None,
+                    background: Some(rule_background),
+                    underline: true,
+                }),
+                0,
+                &matches,
+                Some(0),
+            );
+
+            assert_eq!(job.sections.len(), 2);
+            assert_eq!(job.sections[0].byte_range.start.0, 0);
+            assert_eq!(job.sections[0].byte_range.end.0, 5);
+            assert_eq!(job.sections[0].format.background, selected_background);
+            assert_eq!(job.sections[1].format.background, rule_background);
+            assert_ne!(job.sections[1].format.underline, egui::Stroke::NONE);
+        });
     }
 
     #[test]

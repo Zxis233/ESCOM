@@ -14,6 +14,8 @@ pub const BUFFER_LIMIT_OPTIONS_MIB: [usize; 4] = [5, 20, 100, 500];
 pub const DEFAULT_DATA_LINE_SPACING: f32 = 3.0;
 pub const MIN_DATA_LINE_SPACING: f32 = 0.0;
 pub const MAX_DATA_LINE_SPACING: f32 = 24.0;
+pub const MIN_FONT_SIZE: f32 = 10.0;
+pub const MAX_FONT_SIZE: f32 = 48.0;
 pub const DEFAULT_BACKGROUND_LIGHT_OPACITY: f32 = 0.22;
 pub const DEFAULT_BACKGROUND_DARK_OPACITY: f32 = 0.16;
 
@@ -94,8 +96,8 @@ impl Default for UiPreferences {
 impl UiPreferences {
     pub fn sanitize(&mut self) {
         self.schema_version = SETTINGS_SCHEMA_VERSION;
-        self.ui_font_size = self.ui_font_size.clamp(10.0, 32.0);
-        self.data_font_size = self.data_font_size.clamp(10.0, 32.0);
+        self.ui_font_size = self.ui_font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        self.data_font_size = self.data_font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
         self.data_line_spacing = if self.data_line_spacing.is_finite() {
             self.data_line_spacing
                 .clamp(MIN_DATA_LINE_SPACING, MAX_DATA_LINE_SPACING)
@@ -283,6 +285,7 @@ mod tests {
     fn sanitize_restores_supported_limits() {
         let mut preferences = UiPreferences {
             ui_font_size: 100.0,
+            data_font_size: 100.0,
             data_line_spacing: 100.0,
             ui_font_weight: 0,
             data_font_weight: 1001,
@@ -291,7 +294,8 @@ mod tests {
             ..Default::default()
         };
         preferences.sanitize();
-        assert_eq!(preferences.ui_font_size, 32.0);
+        assert_eq!(preferences.ui_font_size, MAX_FONT_SIZE);
+        assert_eq!(preferences.data_font_size, MAX_FONT_SIZE);
         assert_eq!(preferences.data_line_spacing, MAX_DATA_LINE_SPACING);
         assert_eq!(preferences.ui_font_weight, DEFAULT_FONT_WEIGHT);
         assert_eq!(preferences.data_font_weight, DEFAULT_FONT_WEIGHT);
