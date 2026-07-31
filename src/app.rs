@@ -16,7 +16,7 @@ use crate::formatting::{
 use crate::icon;
 use crate::model::{
     HistoryItem, LineEnding, ReceiveMode, SendMode, SerialConfig, TextEncoding, data_bits_label,
-    flow_control_label, parity_label, stop_bits_label,
+    flow_control_label, parity_label, parse_baud_rate, stop_bits_label,
 };
 use crate::serial_worker::{WorkerEvent, WorkerHandle};
 use crate::settings::{
@@ -39,6 +39,10 @@ const SETTINGS_WINDOW_WIDTH: f32 = 660.0;
 const SETTINGS_WINDOW_HEIGHT: f32 = 454.0;
 const SEND_EDITOR_LIGHT_ALPHA: u8 = 120;
 const SEND_EDITOR_DARK_ALPHA: u8 = 104;
+const COMMON_BAUD_RATES: [u32; 18] = [
+    300, 600, 1_200, 2_400, 4_800, 9_600, 19_200, 38_400, 57_600, 115_200, 230_400, 460_800,
+    576_000, 921_600, 1_000_000, 2_000_000, 3_000_000, 4_000_000,
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
@@ -94,6 +98,7 @@ enum BackgroundEvent {
 pub struct EscomApp {
     preferences: UiPreferences,
     serial_config: SerialConfig,
+    baud_rate_input: String,
     connection: ConnectionState,
     ports: Vec<String>,
     store: Arc<Mutex<ReceiveStore>>,
@@ -175,10 +180,13 @@ impl EscomApp {
         });
 
         let background_url_draft = preferences.background_online_url.clone();
+        let serial_config = SerialConfig::default();
+        let baud_rate_input = serial_config.baud_rate.to_string();
 
         Self {
             preferences,
-            serial_config: SerialConfig::default(),
+            serial_config,
+            baud_rate_input,
             connection: ConnectionState::Disconnected,
             ports: Vec::new(),
             store,
@@ -584,6 +592,72 @@ impl EscomApp {
         }
     }
 
+    fn show_baud_rate_control(&mut self, ui: &mut egui::Ui) {
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+
+            let input_color = if parse_baud_rate(&self.baud_rate_input).is_err() {
+                ui.visuals().error_fg_color
+            } else {
+                ui.visuals().text_color()
+            };
+            let response = ui.add_sized(
+                [96.0, CONNECTION_CONTROL_HEIGHT],
+                egui::TextEdit::singleline(&mut self.baud_rate_input)
+                    .char_limit(10)
+                    .text_color(input_color)
+                    .horizontal_align(Align::Center)
+                    .vertical_align(Align::Center),
+            );
+            let input_changed = response.changed();
+            let input_lost_focus = response.lost_focus();
+
+            if input_changed && let Ok(baud_rate) = parse_baud_rate(&self.baud_rate_input) {
+                self.serial_config.baud_rate = baud_rate;
+            }
+            if input_lost_focus && let Ok(baud_rate) = parse_baud_rate(&self.baud_rate_input) {
+                self.baud_rate_input = baud_rate.to_string();
+            }
+
+            match parse_baud_rate(&self.baud_rate_input) {
+                Ok(_) => {
+                    response.on_hover_text("可直接输入 1 到 4,000,000 之间的自定义波特率");
+                }
+                Err(message) => {
+                    response.on_hover_text(message);
+                }
+            }
+
+            let mut selected_rate = None;
+            let combo_response = egui::ComboBox::from_id_salt("baud_rate_presets")
+                .selected_text("常用")
+                .width(58.0)
+                .height(300.0)
+                .show_ui(ui, |ui| {
+                    ui.set_min_width(116.0);
+                    for baud_rate in COMMON_BAUD_RATES {
+                        if ui
+                            .selectable_label(
+                                self.serial_config.baud_rate == baud_rate,
+                                baud_rate.to_string(),
+                            )
+                            .clicked()
+                        {
+                            selected_rate = Some(baud_rate);
+                            ui.close();
+                        }
+                    }
+                })
+                .response;
+            combo_response.on_hover_text("选择常用波特率");
+
+            if let Some(baud_rate) = selected_rate {
+                self.serial_config.baud_rate = baud_rate;
+                self.baud_rate_input = baud_rate.to_string();
+            }
+        });
+    }
+
     fn show_connection_panel(&mut self, root_ui: &mut egui::Ui) {
         let panel_frame = egui::Frame::side_top_panel(root_ui.style())
             .fill(self.surface_fill(root_ui.visuals().panel_fill, 202));
@@ -629,12 +703,7 @@ impl EscomApp {
                         }
 
                         toolbar_label(ui, "波特率", 52.0);
-                        ui.add_sized(
-                            [88.0, CONNECTION_CONTROL_HEIGHT],
-                            egui::DragValue::new(&mut self.serial_config.baud_rate)
-                                .range(1..=4_000_000)
-                                .speed(100.0),
-                        );
+                        self.show_baud_rate_control(ui);
                     });
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1846,6 +1915,14 @@ impl EscomApp {
     }
 
     fn open_selected_port(&mut self) {
+        let baud_rate = match parse_baud_rate(&self.baud_rate_input) {
+            Ok(baud_rate) => baud_rate,
+            Err(message) => {
+                self.set_notice(message, true);
+                return;
+            }
+        };
+        self.serial_config.baud_rate = baud_rate;
         if let Err(message) = self.serial_config.validate() {
             self.set_notice(message, true);
             return;

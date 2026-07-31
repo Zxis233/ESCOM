@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serialport::{DataBits, FlowControl, Parity, StopBits};
 
+pub const MIN_BAUD_RATE: u32 = 1;
+pub const MAX_BAUD_RATE: u32 = 4_000_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReceiveMode {
     Text,
@@ -108,11 +111,28 @@ impl SerialConfig {
         if self.port_name.trim().is_empty() {
             return Err("请选择串口");
         }
-        if !(1..=4_000_000).contains(&self.baud_rate) {
+        if !(MIN_BAUD_RATE..=MAX_BAUD_RATE).contains(&self.baud_rate) {
             return Err("波特率必须在 1 到 4,000,000 之间");
         }
         Ok(())
     }
+}
+
+pub fn parse_baud_rate(input: &str) -> Result<u32, &'static str> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("请输入波特率");
+    }
+    if !input.chars().all(|character| character.is_ascii_digit()) {
+        return Err("波特率只能包含数字");
+    }
+    let value = input
+        .parse::<u32>()
+        .map_err(|_| "波特率必须在 1 到 4,000,000 之间")?;
+    if !(MIN_BAUD_RATE..=MAX_BAUD_RATE).contains(&value) {
+        return Err("波特率必须在 1 到 4,000,000 之间");
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,5 +185,21 @@ mod tests {
         assert!(config.validate().is_ok());
         config.baud_rate = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn baud_rate_parser_accepts_common_and_custom_values() {
+        assert_eq!(parse_baud_rate("115200"), Ok(115_200));
+        assert_eq!(parse_baud_rate(" 1234567 "), Ok(1_234_567));
+        assert_eq!(parse_baud_rate("4000000"), Ok(MAX_BAUD_RATE));
+    }
+
+    #[test]
+    fn baud_rate_parser_rejects_invalid_values() {
+        assert_eq!(parse_baud_rate(""), Err("请输入波特率"));
+        assert_eq!(parse_baud_rate("115.2k"), Err("波特率只能包含数字"));
+        assert!(parse_baud_rate("0").is_err());
+        assert!(parse_baud_rate("4000001").is_err());
+        assert!(parse_baud_rate("999999999999").is_err());
     }
 }
