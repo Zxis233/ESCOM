@@ -1204,13 +1204,17 @@ impl EscomApp {
                         self.mark_preferences_dirty();
                     }
                     let mut repeat_checkbox = repeat_running;
-                    if ui
-                        .add_sized(
-                            [96.0, CONNECTION_CONTROL_HEIGHT],
-                            egui::Checkbox::new(&mut repeat_checkbox, "循环发送"),
-                        )
-                        .changed()
-                    {
+                    let repeat_available = self.connection.is_connected() || repeat_running;
+                    let repeat_response = ui
+                        .add_enabled_ui(repeat_available, |ui| {
+                            ui.add_sized(
+                                [96.0, CONNECTION_CONTROL_HEIGHT],
+                                egui::Checkbox::new(&mut repeat_checkbox, "循环发送"),
+                            )
+                        })
+                        .inner
+                        .on_disabled_hover_text("请先打开串口");
+                    if repeat_response.changed() {
                         if repeat_checkbox {
                             self.start_repeat(&context);
                         } else {
