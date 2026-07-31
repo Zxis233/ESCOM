@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::fonts::DEFAULT_FONT_WEIGHT;
 use crate::model::{LineEnding, ReceiveMode, SendMode, TextEncoding};
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 2;
 pub const BUFFER_LIMIT_OPTIONS_MIB: [usize; 4] = [5, 20, 100, 500];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +17,8 @@ pub struct UiPreferences {
     pub schema_version: u32,
     pub ui_font_family: String,
     pub data_font_family: String,
+    pub ui_font_weight: u16,
+    pub data_font_weight: u16,
     pub ui_font_size: f32,
     pub data_font_size: f32,
     pub receive_mode: ReceiveMode,
@@ -34,6 +37,8 @@ impl Default for UiPreferences {
             schema_version: SETTINGS_SCHEMA_VERSION,
             ui_font_family: String::new(),
             data_font_family: String::new(),
+            ui_font_weight: DEFAULT_FONT_WEIGHT,
+            data_font_weight: DEFAULT_FONT_WEIGHT,
             ui_font_size: 15.0,
             data_font_size: 15.0,
             receive_mode: ReceiveMode::Text,
@@ -51,8 +56,14 @@ impl Default for UiPreferences {
 impl UiPreferences {
     pub fn sanitize(&mut self) {
         self.schema_version = SETTINGS_SCHEMA_VERSION;
-        self.ui_font_size = self.ui_font_size.clamp(10.0, 28.0);
+        self.ui_font_size = self.ui_font_size.clamp(10.0, 32.0);
         self.data_font_size = self.data_font_size.clamp(10.0, 32.0);
+        if !(1..=1000).contains(&self.ui_font_weight) {
+            self.ui_font_weight = DEFAULT_FONT_WEIGHT;
+        }
+        if !(1..=1000).contains(&self.data_font_weight) {
+            self.data_font_weight = DEFAULT_FONT_WEIGHT;
+        }
         self.repeat_interval_ms = self.repeat_interval_ms.clamp(20, 3_600_000);
         if !BUFFER_LIMIT_OPTIONS_MIB.contains(&self.buffer_limit_mib) {
             self.buffer_limit_mib = 20;
@@ -188,6 +199,7 @@ mod tests {
         let test_path = test_dir.join("settings.json");
         let preferences = UiPreferences {
             ui_font_family: "Microsoft YaHei UI".into(),
+            ui_font_weight: 500,
             timestamps: true,
             ..Default::default()
         };
@@ -195,6 +207,7 @@ mod tests {
         save_to(&test_path, &preferences).unwrap();
         let loaded = load_from(&test_path).unwrap();
         assert_eq!(loaded.ui_font_family, "Microsoft YaHei UI");
+        assert_eq!(loaded.ui_font_weight, 500);
         assert!(loaded.timestamps);
 
         let json = fs::read_to_string(&test_path).unwrap();
@@ -207,14 +220,29 @@ mod tests {
     fn sanitize_restores_supported_limits() {
         let mut preferences = UiPreferences {
             ui_font_size: 100.0,
+            ui_font_weight: 0,
+            data_font_weight: 1001,
             repeat_interval_ms: 1,
             buffer_limit_mib: 7,
             ..Default::default()
         };
         preferences.sanitize();
-        assert_eq!(preferences.ui_font_size, 28.0);
+        assert_eq!(preferences.ui_font_size, 32.0);
+        assert_eq!(preferences.ui_font_weight, DEFAULT_FONT_WEIGHT);
+        assert_eq!(preferences.data_font_weight, DEFAULT_FONT_WEIGHT);
         assert_eq!(preferences.repeat_interval_ms, 20);
         assert_eq!(preferences.buffer_limit_mib, 20);
+    }
+
+    #[test]
+    fn terminal_mode_round_trips_through_preferences() {
+        let preferences = UiPreferences {
+            receive_mode: ReceiveMode::Terminal,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&preferences).unwrap();
+        let loaded: UiPreferences = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.receive_mode, ReceiveMode::Terminal);
     }
 
     #[test]

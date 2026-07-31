@@ -5,6 +5,7 @@ use serialport::{DataBits, FlowControl, Parity, StopBits};
 pub enum ReceiveMode {
     Text,
     Hex,
+    Terminal,
 }
 
 impl ReceiveMode {
@@ -12,6 +13,7 @@ impl ReceiveMode {
         match self {
             Self::Text => "文本",
             Self::Hex => "HEX",
+            Self::Terminal => "终端",
         }
     }
 }

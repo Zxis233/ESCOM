@@ -25,9 +25,11 @@ const FORMAT_DEBOUNCE: Duration = Duration::from_millis(80);
 const PORT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const NOTICE_DURATION: Duration = Duration::from_secs(6);
 const MAX_HISTORY: usize = 50;
-const CONNECTION_CONTROL_HEIGHT: f32 = 30.0;
+const CONNECTION_CONTROL_HEIGHT: f32 = 32.0;
 const CONFIG_LABEL_WIDTH: f32 = 48.0;
 const CONFIG_COMBO_WIDTH: f32 = 100.0;
+const SETTINGS_LABEL_WIDTH: f32 = 60.0;
+const SETTINGS_CONTROLS_WIDTH: f32 = 378.0;
 
 #[derive(Debug, Clone)]
 enum ConnectionState {
@@ -77,6 +79,9 @@ pub struct EscomApp {
     font_catalog: FontCatalog,
 
     send_input: String,
+    terminal_input: String,
+    terminal_history_index: Option<usize>,
+    focus_terminal_input: bool,
     send_error: Option<String>,
     history: VecDeque<HistoryItem>,
     pending_history: HashMap<u64, HistoryItem>,
@@ -109,10 +114,14 @@ impl EscomApp {
             &creation_context.egui_ctx,
             &preferences.ui_font_family,
             &preferences.data_font_family,
+            preferences.ui_font_weight,
+            preferences.data_font_weight,
             preferences.ui_font_size,
         );
         preferences.ui_font_family = applied_fonts.ui_family;
         preferences.data_font_family = applied_fonts.data_family;
+        preferences.ui_font_weight = applied_fonts.ui_weight;
+        preferences.data_font_weight = applied_fonts.data_weight;
 
         let store = Arc::new(Mutex::new(ReceiveStore::new(
             preferences.buffer_limit_bytes(),
@@ -135,6 +144,9 @@ impl EscomApp {
             worker,
             font_catalog,
             send_input: String::new(),
+            terminal_input: String::new(),
+            terminal_history_index: None,
+            focus_terminal_input: false,
             send_error: None,
             history: VecDeque::new(),
             pending_history: HashMap::new(),
@@ -603,10 +615,15 @@ impl EscomApp {
             ui.spacing_mut().interact_size.y = CONNECTION_CONTROL_HEIGHT;
             ui.horizontal(|ui| {
                 toolbar_label(ui, "接收", 38.0);
-                for mode in [ReceiveMode::Text, ReceiveMode::Hex] {
+                for mode in [ReceiveMode::Text, ReceiveMode::Hex, ReceiveMode::Terminal] {
+                    let width = if mode == ReceiveMode::Terminal {
+                        64.0
+                    } else {
+                        50.0
+                    };
                     if ui
                         .add_sized(
-                            [50.0, CONNECTION_CONTROL_HEIGHT],
+                            [width, CONNECTION_CONTROL_HEIGHT],
                             egui::Button::selectable(
                                 self.preferences.receive_mode == mode,
                                 mode.label(),
@@ -616,6 +633,10 @@ impl EscomApp {
                         && self.preferences.receive_mode != mode
                     {
                         self.preferences.receive_mode = mode;
+                        if mode == ReceiveMode::Terminal {
+                            self.repeat = None;
+                            self.focus_terminal_input = true;
+                        }
                         display_changed = true;
                         preferences_changed = true;
                     }
@@ -720,43 +741,218 @@ impl EscomApp {
             }
 
             ui.separator();
-            if self.display_rows.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        RichText::new(if self.paused {
-                            "显示已暂停，接收仍在继续"
-                        } else {
-                            "等待串口数据"
-                        })
-                        .color(ui.visuals().weak_text_color()),
-                    );
+            if self.preferences.receive_mode == ReceiveMode::Terminal {
+                let input_row_height = CONNECTION_CONTROL_HEIGHT + 12.0;
+                let content_height = (ui.available_height() - input_row_height).max(0.0);
+                let content = ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), content_height),
+                    Layout::top_down(Align::LEFT),
+                    |ui| self.show_receive_content(ui),
+                );
+                let surface_clicked = ui.input(|input| {
+                    input.pointer.primary_clicked()
+                        && input
+                            .pointer
+                            .interact_pos()
+                            .is_some_and(|position| content.response.rect.contains(position))
                 });
-                return;
+                ui.separator();
+                self.show_terminal_input(ui, surface_clicked);
+            } else {
+                self.show_receive_content(ui);
             }
-
-            let row_height = self.preferences.data_font_size + 7.0;
-            let data_font = FontId::new(self.preferences.data_font_size, data_font_family());
-            let rows = Arc::clone(&self.display_rows);
-            let timestamps = self.preferences.timestamps;
-            let mut scroll_area = egui::ScrollArea::both()
-                .id_salt("receive_output")
-                .auto_shrink([false, false])
-                .stick_to_bottom(self.preferences.auto_scroll);
-            if self.force_scroll_bottom {
-                scroll_area = scroll_area.vertical_scroll_offset(f32::INFINITY);
-                self.force_scroll_bottom = false;
-            }
-            scroll_area.show_rows(ui, row_height, rows.len(), |ui, range| {
-                for row in &rows[range] {
-                    let text = display_text(row, timestamps);
-                    ui.add(
-                        egui::Label::new(RichText::new(text).font(data_font.clone()))
-                            .selectable(true)
-                            .wrap_mode(egui::TextWrapMode::Extend),
-                    );
-                }
-            });
         });
+    }
+
+    fn show_receive_content(&mut self, ui: &mut egui::Ui) {
+        if self.display_rows.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    RichText::new(if self.paused {
+                        "显示已暂停，接收仍在继续"
+                    } else {
+                        "等待串口数据"
+                    })
+                    .color(ui.visuals().weak_text_color()),
+                );
+            });
+            return;
+        }
+
+        let row_height = self.preferences.data_font_size + 7.0;
+        let data_font = FontId::new(self.preferences.data_font_size, data_font_family());
+        let rows = Arc::clone(&self.display_rows);
+        let timestamps = self.preferences.timestamps;
+        let mut scroll_area = egui::ScrollArea::both()
+            .id_salt("receive_output")
+            .auto_shrink([false, false])
+            .stick_to_bottom(self.preferences.auto_scroll);
+        if self.force_scroll_bottom {
+            scroll_area = scroll_area.vertical_scroll_offset(f32::INFINITY);
+            self.force_scroll_bottom = false;
+        }
+        scroll_area.show_rows(ui, row_height, rows.len(), |ui, range| {
+            for row in &rows[range] {
+                let text = display_text(row, timestamps);
+                ui.add(
+                    egui::Label::new(RichText::new(text).font(data_font.clone()))
+                        .selectable(true)
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                );
+            }
+        });
+    }
+
+    fn show_terminal_input(&mut self, ui: &mut egui::Ui, surface_clicked: bool) {
+        let data_font = FontId::new(self.preferences.data_font_size, data_font_family());
+        let mut ending_changed = false;
+        let input_response = ui
+            .horizontal(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(20.0, CONNECTION_CONTROL_HEIGHT),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.label(RichText::new(">").font(data_font.clone()).strong());
+                    },
+                );
+                let input_width = (ui.available_width() - 148.0).max(120.0);
+                let response = ui.add_sized(
+                    [input_width, CONNECTION_CONTROL_HEIGHT],
+                    egui::TextEdit::singleline(&mut self.terminal_input)
+                        .font(data_font)
+                        .hint_text("输入命令"),
+                );
+                toolbar_label(ui, "行尾", 40.0);
+                egui::ComboBox::from_id_salt("terminal_line_ending")
+                    .selected_text(self.preferences.line_ending.label())
+                    .width(92.0)
+                    .show_ui(ui, |ui| {
+                        for ending in [
+                            LineEnding::None,
+                            LineEnding::Cr,
+                            LineEnding::Lf,
+                            LineEnding::CrLf,
+                        ] {
+                            ending_changed |= ui
+                                .selectable_value(
+                                    &mut self.preferences.line_ending,
+                                    ending,
+                                    ending.label(),
+                                )
+                                .changed();
+                        }
+                    });
+                response
+            })
+            .inner;
+
+        if ending_changed {
+            self.mark_preferences_dirty();
+        }
+        if surface_clicked {
+            self.focus_terminal_input = true;
+        }
+        let pointer_clicked = ui.input(|input| input.pointer.primary_clicked());
+        if self.focus_terminal_input && !pointer_clicked {
+            input_response.request_focus();
+            ui.ctx().request_repaint();
+        }
+        if input_response.has_focus() && !pointer_clicked {
+            self.focus_terminal_input = false;
+        } else if self.focus_terminal_input && pointer_clicked {
+            ui.ctx().request_repaint();
+        }
+
+        let enter_pressed = ui.input(|input| input.key_pressed(egui::Key::Enter));
+        let history_up =
+            input_response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::ArrowUp));
+        let history_down =
+            input_response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::ArrowDown));
+
+        if history_up {
+            self.navigate_terminal_history(true);
+        } else if history_down {
+            self.navigate_terminal_history(false);
+        } else if input_response.changed() {
+            self.terminal_history_index = None;
+        }
+
+        if enter_pressed && (input_response.has_focus() || input_response.lost_focus()) {
+            self.submit_terminal_input();
+        }
+    }
+
+    fn submit_terminal_input(&mut self) {
+        let result = if self.connection.is_connected() {
+            parse_send_input(
+                &self.terminal_input,
+                SendMode::Text,
+                self.preferences.text_encoding,
+                self.preferences.line_ending,
+            )
+        } else {
+            Err("请先连接串口".into())
+        };
+
+        match result {
+            Ok(bytes) => {
+                let history = HistoryItem {
+                    mode: SendMode::Text,
+                    input: self.terminal_input.clone(),
+                };
+                match self.queue_payload(bytes, history) {
+                    Ok(()) => {
+                        self.terminal_input.clear();
+                        self.terminal_history_index = None;
+                        self.focus_terminal_input = true;
+                        self.force_scroll_bottom = true;
+                    }
+                    Err(message) => {
+                        self.send_error = Some(message.clone());
+                        self.set_notice(message, true);
+                    }
+                }
+            }
+            Err(message) => {
+                self.send_error = Some(message.clone());
+                self.set_notice(message, true);
+                self.focus_terminal_input = true;
+            }
+        }
+    }
+
+    fn navigate_terminal_history(&mut self, older: bool) {
+        let commands: Vec<_> = self
+            .history
+            .iter()
+            .filter(|item| item.mode == SendMode::Text)
+            .map(|item| item.input.clone())
+            .collect();
+        if commands.is_empty() {
+            return;
+        }
+
+        if older {
+            let next_index = self
+                .terminal_history_index
+                .map_or(0, |index| (index + 1).min(commands.len() - 1));
+            self.terminal_history_index = Some(next_index);
+            self.terminal_input.clone_from(&commands[next_index]);
+        } else {
+            match self.terminal_history_index {
+                Some(0) => {
+                    self.terminal_history_index = None;
+                    self.terminal_input.clear();
+                }
+                Some(index) => {
+                    let next_index = index - 1;
+                    self.terminal_history_index = Some(next_index);
+                    self.terminal_input.clone_from(&commands[next_index]);
+                }
+                None => {}
+            }
+        }
+        self.focus_terminal_input = true;
     }
 
     fn show_send_panel(&mut self, root_ui: &mut egui::Ui) {
@@ -978,91 +1174,151 @@ impl EscomApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(440.0)
+            .default_width(560.0)
+            .min_width(480.0)
             .show(context, |ui| {
+                ui.spacing_mut().interact_size.y = CONNECTION_CONTROL_HEIGHT;
                 egui::Grid::new("settings_grid")
                     .num_columns(2)
                     .spacing([18.0, 12.0])
                     .show(ui, |ui| {
-                        ui.label("界面字体");
-                        egui::ComboBox::from_id_salt("ui_font")
-                            .selected_text(&self.preferences.ui_font_family)
-                            .width(260.0)
-                            .show_ui(ui, |ui| {
-                                for family in self.font_catalog.ui_families() {
-                                    font_changed |= ui
-                                        .selectable_value(
-                                            &mut self.preferences.ui_font_family,
-                                            family.clone(),
-                                            family,
-                                        )
-                                        .changed();
-                                }
-                            });
+                        settings_row_label(ui, "界面字体");
+                        settings_controls(ui, |ui| {
+                            egui::ComboBox::from_id_salt("ui_font")
+                                .selected_text(&self.preferences.ui_font_family)
+                                .width(260.0)
+                                .show_ui(ui, |ui| {
+                                    for family in self.font_catalog.ui_families() {
+                                        font_changed |= ui
+                                            .selectable_value(
+                                                &mut self.preferences.ui_font_family,
+                                                family.clone(),
+                                                family,
+                                            )
+                                            .changed();
+                                    }
+                                });
+                            let options = self
+                                .font_catalog
+                                .weight_options(&self.preferences.ui_font_family);
+                            egui::ComboBox::from_id_salt("ui_font_weight")
+                                .selected_text(self.font_catalog.weight_label(
+                                    &self.preferences.ui_font_family,
+                                    self.preferences.ui_font_weight,
+                                ))
+                                .width(110.0)
+                                .show_ui(ui, |ui| {
+                                    for option in options {
+                                        font_changed |= ui
+                                            .selectable_value(
+                                                &mut self.preferences.ui_font_weight,
+                                                option.value,
+                                                option.label,
+                                            )
+                                            .changed();
+                                    }
+                                });
+                        });
                         ui.end_row();
 
-                        ui.label("界面字号");
-                        font_changed |= ui
-                            .add(
-                                egui::Slider::new(&mut self.preferences.ui_font_size, 10.0..=28.0)
+                        settings_row_label(ui, "界面字号");
+                        settings_controls(ui, |ui| {
+                            font_changed |= ui
+                                .add_sized(
+                                    [158.0, CONNECTION_CONTROL_HEIGHT],
+                                    egui::Slider::new(
+                                        &mut self.preferences.ui_font_size,
+                                        10.0..=32.0,
+                                    )
                                     .integer(),
-                            )
-                            .changed();
-                        ui.end_row();
-
-                        ui.label("数据字体");
-                        egui::ComboBox::from_id_salt("data_font")
-                            .selected_text(&self.preferences.data_font_family)
-                            .width(260.0)
-                            .show_ui(ui, |ui| {
-                                for family in self.font_catalog.mono_families() {
-                                    font_changed |= ui
-                                        .selectable_value(
-                                            &mut self.preferences.data_font_family,
-                                            family.clone(),
-                                            family,
-                                        )
-                                        .changed();
-                                }
-                            });
-                        ui.end_row();
-
-                        ui.label("数据字号");
-                        if ui
-                            .add(
-                                egui::Slider::new(
-                                    &mut self.preferences.data_font_size,
-                                    10.0..=32.0,
                                 )
-                                .integer(),
-                            )
-                            .changed()
-                        {
-                            preferences_changed = true;
-                        }
+                                .changed();
+                        });
                         ui.end_row();
 
-                        ui.label("接收缓存");
-                        egui::ComboBox::from_id_salt("buffer_limit")
-                            .selected_text(format!("{} MiB", self.preferences.buffer_limit_mib))
-                            .show_ui(ui, |ui| {
-                                for limit in BUFFER_LIMIT_OPTIONS_MIB {
-                                    buffer_changed |= ui
-                                        .selectable_value(
-                                            &mut self.preferences.buffer_limit_mib,
-                                            limit,
-                                            format!("{limit} MiB"),
-                                        )
-                                        .changed();
-                                }
-                            });
+                        settings_row_label(ui, "数据字体");
+                        settings_controls(ui, |ui| {
+                            egui::ComboBox::from_id_salt("data_font")
+                                .selected_text(&self.preferences.data_font_family)
+                                .width(260.0)
+                                .show_ui(ui, |ui| {
+                                    for family in self.font_catalog.mono_families() {
+                                        font_changed |= ui
+                                            .selectable_value(
+                                                &mut self.preferences.data_font_family,
+                                                family.clone(),
+                                                family,
+                                            )
+                                            .changed();
+                                    }
+                                });
+                            let options = self
+                                .font_catalog
+                                .weight_options(&self.preferences.data_font_family);
+                            egui::ComboBox::from_id_salt("data_font_weight")
+                                .selected_text(self.font_catalog.weight_label(
+                                    &self.preferences.data_font_family,
+                                    self.preferences.data_font_weight,
+                                ))
+                                .width(110.0)
+                                .show_ui(ui, |ui| {
+                                    for option in options {
+                                        font_changed |= ui
+                                            .selectable_value(
+                                                &mut self.preferences.data_font_weight,
+                                                option.value,
+                                                option.label,
+                                            )
+                                            .changed();
+                                    }
+                                });
+                        });
+                        ui.end_row();
+
+                        settings_row_label(ui, "数据字号");
+                        settings_controls(ui, |ui| {
+                            if ui
+                                .add_sized(
+                                    [158.0, CONNECTION_CONTROL_HEIGHT],
+                                    egui::Slider::new(
+                                        &mut self.preferences.data_font_size,
+                                        10.0..=32.0,
+                                    )
+                                    .integer(),
+                                )
+                                .changed()
+                            {
+                                preferences_changed = true;
+                            }
+                        });
+                        ui.end_row();
+
+                        settings_row_label(ui, "接收缓存");
+                        settings_controls(ui, |ui| {
+                            egui::ComboBox::from_id_salt("buffer_limit")
+                                .selected_text(format!(
+                                    "{} MiB",
+                                    self.preferences.buffer_limit_mib
+                                ))
+                                .show_ui(ui, |ui| {
+                                    for limit in BUFFER_LIMIT_OPTIONS_MIB {
+                                        buffer_changed |= ui
+                                            .selectable_value(
+                                                &mut self.preferences.buffer_limit_mib,
+                                                limit,
+                                                format!("{limit} MiB"),
+                                            )
+                                            .changed();
+                                    }
+                                });
+                        });
                         ui.end_row();
                     });
 
                 ui.separator();
                 ui.label(
                     RichText::new(
-                        "字体仅从 Windows 已安装字体中选择；数据字体列表只显示等宽字体。",
+                        "字体仅从 Windows 已安装字体中选择；不支持的字重会自动恢复为该字体的默认字重。",
                     )
                     .small()
                     .color(ui.visuals().weak_text_color()),
@@ -1075,10 +1331,14 @@ impl EscomApp {
                 context,
                 &self.preferences.ui_font_family,
                 &self.preferences.data_font_family,
+                self.preferences.ui_font_weight,
+                self.preferences.data_font_weight,
                 self.preferences.ui_font_size,
             );
             self.preferences.ui_font_family = applied.ui_family;
             self.preferences.data_font_family = applied.data_family;
+            self.preferences.ui_font_weight = applied.ui_weight;
+            self.preferences.data_font_weight = applied.data_weight;
             if !applied.warnings.is_empty() {
                 self.set_notice(applied.warnings.join("；"), true);
             }
@@ -1231,7 +1491,9 @@ impl eframe::App for EscomApp {
         let context = ui.ctx().clone();
         self.show_connection_panel(ui);
         self.show_status_panel(ui);
-        self.show_send_panel(ui);
+        if self.preferences.receive_mode != ReceiveMode::Terminal {
+            self.show_send_panel(ui);
+        }
         self.show_output_panel(ui);
         self.show_settings_window(&context);
     }
@@ -1275,6 +1537,25 @@ fn toolbar_separator(ui: &mut egui::Ui) {
         rect.y_range(),
         ui.visuals().widgets.noninteractive.bg_stroke,
     );
+}
+
+fn settings_row_label(ui: &mut egui::Ui, text: &str) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(SETTINGS_LABEL_WIDTH, CONNECTION_CONTROL_HEIGHT),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.label(text);
+        },
+    );
+}
+
+fn settings_controls<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.allocate_ui_with_layout(
+        egui::vec2(SETTINGS_CONTROLS_WIDTH, CONNECTION_CONTROL_HEIGHT),
+        Layout::left_to_right(Align::Center),
+        contents,
+    )
+    .inner
 }
 
 fn history_preview(item: &HistoryItem) -> String {

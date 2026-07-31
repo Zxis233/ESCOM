@@ -84,7 +84,7 @@ pub fn format_snapshot(
     encoding: TextEncoding,
 ) -> Vec<FormattedRow> {
     match mode {
-        ReceiveMode::Text => format_text(snapshot, encoding),
+        ReceiveMode::Text | ReceiveMode::Terminal => format_text(snapshot, encoding),
         ReceiveMode::Hex => format_hex(snapshot),
     }
 }
@@ -309,6 +309,18 @@ mod tests {
             rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
             ["中文", "完成"]
         );
+        assert_eq!(rows[0].received_at, timestamp(1));
+    }
+
+    #[test]
+    fn terminal_mode_uses_streaming_text_formatter() {
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), b"ready> ".to_vec());
+        store.append(timestamp(2), b"ok\r\n".to_vec());
+
+        let rows = format_snapshot(&store.snapshot(), ReceiveMode::Terminal, TextEncoding::Utf8);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "ready> ok");
         assert_eq!(rows[0].received_at, timestamp(1));
     }
 
