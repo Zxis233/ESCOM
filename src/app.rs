@@ -11,7 +11,7 @@ use serialport::{DataBits, FlowControl, Parity, StopBits};
 
 use crate::fonts::{FontCatalog, data_font_family};
 use crate::formatting::{
-    FormattedRow, display_text, format_snapshot, parse_send_input, render_export,
+    FormattedRow, display_text, encode_text, format_snapshot, parse_send_input, render_export,
 };
 use crate::model::{
     HistoryItem, LineEnding, ReceiveMode, SendMode, SerialConfig, TextEncoding, data_bits_label,
@@ -79,9 +79,7 @@ pub struct EscomApp {
     font_catalog: FontCatalog,
 
     send_input: String,
-    terminal_input: String,
-    terminal_history_index: Option<usize>,
-    focus_terminal_input: bool,
+    focus_terminal_surface: bool,
     send_error: Option<String>,
     history: VecDeque<HistoryItem>,
     pending_history: HashMap<u64, HistoryItem>,
@@ -144,9 +142,7 @@ impl EscomApp {
             worker,
             font_catalog,
             send_input: String::new(),
-            terminal_input: String::new(),
-            terminal_history_index: None,
-            focus_terminal_input: false,
+            focus_terminal_surface: false,
             send_error: None,
             history: VecDeque::new(),
             pending_history: HashMap::new(),
@@ -184,6 +180,9 @@ impl EscomApp {
                 WorkerEvent::Opened(port_name) => {
                     self.connection = ConnectionState::Connected(port_name.clone());
                     self.send_error = None;
+                    if self.preferences.receive_mode == ReceiveMode::Terminal {
+                        self.focus_terminal_surface = true;
+                    }
                     self.set_notice(format!("已连接 {port_name}"), false);
                 }
                 WorkerEvent::Closed => {
@@ -352,6 +351,20 @@ impl EscomApp {
         self.next_send_id = self.next_send_id.wrapping_add(1).max(1);
         self.worker.send(id, bytes)?;
         self.pending_history.insert(id, history);
+        self.send_error = None;
+        Ok(())
+    }
+
+    fn queue_terminal_payload(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        if !self.connection.is_connected() {
+            return Err("请先连接串口".into());
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let id = self.next_send_id;
+        self.next_send_id = self.next_send_id.wrapping_add(1).max(1);
+        self.worker.send(id, bytes)?;
         self.send_error = None;
         Ok(())
     }
@@ -635,7 +648,7 @@ impl EscomApp {
                         self.preferences.receive_mode = mode;
                         if mode == ReceiveMode::Terminal {
                             self.repeat = None;
-                            self.focus_terminal_input = true;
+                            self.focus_terminal_surface = true;
                         }
                         display_changed = true;
                         preferences_changed = true;
@@ -742,22 +755,7 @@ impl EscomApp {
 
             ui.separator();
             if self.preferences.receive_mode == ReceiveMode::Terminal {
-                let input_row_height = CONNECTION_CONTROL_HEIGHT + 12.0;
-                let content_height = (ui.available_height() - input_row_height).max(0.0);
-                let content = ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), content_height),
-                    Layout::top_down(Align::LEFT),
-                    |ui| self.show_receive_content(ui),
-                );
-                let surface_clicked = ui.input(|input| {
-                    input.pointer.primary_clicked()
-                        && input
-                            .pointer
-                            .interact_pos()
-                            .is_some_and(|position| content.response.rect.contains(position))
-                });
-                ui.separator();
-                self.show_terminal_input(ui, surface_clicked);
+                self.show_terminal_surface(ui);
             } else {
                 self.show_receive_content(ui);
             }
@@ -803,156 +801,63 @@ impl EscomApp {
         });
     }
 
-    fn show_terminal_input(&mut self, ui: &mut egui::Ui, surface_clicked: bool) {
-        let data_font = FontId::new(self.preferences.data_font_size, data_font_family());
-        let mut ending_changed = false;
-        let input_response = ui
-            .horizontal(|ui| {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(20.0, CONNECTION_CONTROL_HEIGHT),
-                    Layout::left_to_right(Align::Center),
-                    |ui| {
-                        ui.label(RichText::new(">").font(data_font.clone()).strong());
-                    },
-                );
-                let input_width = (ui.available_width() - 148.0).max(120.0);
-                let response = ui.add_sized(
-                    [input_width, CONNECTION_CONTROL_HEIGHT],
-                    egui::TextEdit::singleline(&mut self.terminal_input)
-                        .font(data_font)
-                        .hint_text("输入命令"),
-                );
-                toolbar_label(ui, "行尾", 40.0);
-                egui::ComboBox::from_id_salt("terminal_line_ending")
-                    .selected_text(self.preferences.line_ending.label())
-                    .width(92.0)
-                    .show_ui(ui, |ui| {
-                        for ending in [
-                            LineEnding::None,
-                            LineEnding::Cr,
-                            LineEnding::Lf,
-                            LineEnding::CrLf,
-                        ] {
-                            ending_changed |= ui
-                                .selectable_value(
-                                    &mut self.preferences.line_ending,
-                                    ending,
-                                    ending.label(),
-                                )
-                                .changed();
-                        }
-                    });
-                response
-            })
-            .inner;
-
-        if ending_changed {
-            self.mark_preferences_dirty();
-        }
-        if surface_clicked {
-            self.focus_terminal_input = true;
-        }
-        let pointer_clicked = ui.input(|input| input.pointer.primary_clicked());
-        if self.focus_terminal_input && !pointer_clicked {
-            input_response.request_focus();
-            ui.ctx().request_repaint();
-        }
-        if input_response.has_focus() && !pointer_clicked {
-            self.focus_terminal_input = false;
-        } else if self.focus_terminal_input && pointer_clicked {
-            ui.ctx().request_repaint();
-        }
-
-        let enter_pressed = ui.input(|input| input.key_pressed(egui::Key::Enter));
-        let history_up =
-            input_response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::ArrowUp));
-        let history_down =
-            input_response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::ArrowDown));
-
-        if history_up {
-            self.navigate_terminal_history(true);
-        } else if history_down {
-            self.navigate_terminal_history(false);
-        } else if input_response.changed() {
-            self.terminal_history_index = None;
-        }
-
-        if enter_pressed && (input_response.has_focus() || input_response.lost_focus()) {
-            self.submit_terminal_input();
-        }
-    }
-
-    fn submit_terminal_input(&mut self) {
-        let result = if self.connection.is_connected() {
-            parse_send_input(
-                &self.terminal_input,
-                SendMode::Text,
-                self.preferences.text_encoding,
-                self.preferences.line_ending,
+    fn show_terminal_surface(&mut self, ui: &mut egui::Ui) {
+        let content =
+            ui.allocate_ui_with_layout(ui.available_size(), Layout::top_down(Align::LEFT), |ui| {
+                self.show_receive_content(ui)
+            });
+        let response = ui
+            .interact(
+                content.response.rect,
+                ui.id().with("terminal_surface"),
+                egui::Sense::focusable_noninteractive(),
             )
-        } else {
-            Err("请先连接串口".into())
-        };
+            .on_hover_cursor(egui::CursorIcon::Text);
+        let surface_clicked = ui.input(|input| {
+            input.pointer.primary_clicked()
+                && input
+                    .pointer
+                    .interact_pos()
+                    .is_some_and(|position| response.rect.contains(position))
+        });
+        if surface_clicked || self.focus_terminal_surface {
+            response.request_focus();
+            self.focus_terminal_surface = false;
+        }
 
-        match result {
-            Ok(bytes) => {
-                let history = HistoryItem {
-                    mode: SendMode::Text,
-                    input: self.terminal_input.clone(),
-                };
-                match self.queue_payload(bytes, history) {
-                    Ok(()) => {
-                        self.terminal_input.clear();
-                        self.terminal_history_index = None;
-                        self.focus_terminal_input = true;
-                        self.force_scroll_bottom = true;
-                    }
-                    Err(message) => {
-                        self.send_error = Some(message.clone());
-                        self.set_notice(message, true);
-                    }
+        if !response.has_focus() {
+            return;
+        }
+        ui.memory_mut(|memory| {
+            memory.set_focus_lock_filter(
+                response.id,
+                egui::EventFilter {
+                    tab: true,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    escape: true,
+                },
+            );
+        });
+
+        let events = ui.input(|input| input.events.clone());
+        match terminal_bytes_from_events(
+            &events,
+            self.preferences.text_encoding,
+            self.preferences.line_ending,
+        ) {
+            Ok(bytes) if !bytes.is_empty() => {
+                if let Err(message) = self.queue_terminal_payload(bytes) {
+                    self.send_error = Some(message.clone());
+                    self.set_notice(message, true);
                 }
             }
+            Ok(_) => {}
             Err(message) => {
                 self.send_error = Some(message.clone());
                 self.set_notice(message, true);
-                self.focus_terminal_input = true;
             }
         }
-    }
-
-    fn navigate_terminal_history(&mut self, older: bool) {
-        let commands: Vec<_> = self
-            .history
-            .iter()
-            .filter(|item| item.mode == SendMode::Text)
-            .map(|item| item.input.clone())
-            .collect();
-        if commands.is_empty() {
-            return;
-        }
-
-        if older {
-            let next_index = self
-                .terminal_history_index
-                .map_or(0, |index| (index + 1).min(commands.len() - 1));
-            self.terminal_history_index = Some(next_index);
-            self.terminal_input.clone_from(&commands[next_index]);
-        } else {
-            match self.terminal_history_index {
-                Some(0) => {
-                    self.terminal_history_index = None;
-                    self.terminal_input.clear();
-                }
-                Some(index) => {
-                    let next_index = index - 1;
-                    self.terminal_history_index = Some(next_index);
-                    self.terminal_input.clone_from(&commands[next_index]);
-                }
-                None => {}
-            }
-        }
-        self.focus_terminal_input = true;
     }
 
     fn show_send_panel(&mut self, root_ui: &mut egui::Ui) {
@@ -1539,6 +1444,118 @@ fn toolbar_separator(ui: &mut egui::Ui) {
     );
 }
 
+fn terminal_bytes_from_events(
+    events: &[egui::Event],
+    encoding: TextEncoding,
+    line_ending: LineEnding,
+) -> Result<Vec<u8>, String> {
+    let has_copy = events
+        .iter()
+        .any(|event| matches!(event, egui::Event::Copy));
+    let has_paste = events
+        .iter()
+        .any(|event| matches!(event, egui::Event::Paste(_)));
+    let text_contains_tab = events
+        .iter()
+        .any(|event| matches!(event, egui::Event::Text(text) if text.contains('\t')));
+    let mut bytes = Vec::new();
+
+    for event in events {
+        match event {
+            egui::Event::Text(text) | egui::Event::Paste(text) => {
+                append_terminal_text(&mut bytes, text, encoding)?;
+            }
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+                append_terminal_text(&mut bytes, text, encoding)?;
+            }
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => {
+                if modifiers.ctrl && !modifiers.alt {
+                    if (*key == egui::Key::C && has_copy) || (*key == egui::Key::V && has_paste) {
+                        continue;
+                    }
+                    if let Some(byte) = terminal_control_byte(*key) {
+                        bytes.push(byte);
+                    }
+                    continue;
+                }
+
+                match key {
+                    egui::Key::Enter => bytes.extend_from_slice(line_ending.bytes()),
+                    egui::Key::Tab if !text_contains_tab => bytes.push(b'\t'),
+                    egui::Key::Backspace => bytes.push(0x08),
+                    egui::Key::Escape => bytes.push(0x1B),
+                    egui::Key::Delete => bytes.push(0x7F),
+                    egui::Key::ArrowUp => bytes.extend_from_slice(b"\x1B[A"),
+                    egui::Key::ArrowDown => bytes.extend_from_slice(b"\x1B[B"),
+                    egui::Key::ArrowRight => bytes.extend_from_slice(b"\x1B[C"),
+                    egui::Key::ArrowLeft => bytes.extend_from_slice(b"\x1B[D"),
+                    egui::Key::Home => bytes.extend_from_slice(b"\x1B[H"),
+                    egui::Key::End => bytes.extend_from_slice(b"\x1B[F"),
+                    egui::Key::Insert => bytes.extend_from_slice(b"\x1B[2~"),
+                    egui::Key::PageUp => bytes.extend_from_slice(b"\x1B[5~"),
+                    egui::Key::PageDown => bytes.extend_from_slice(b"\x1B[6~"),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(bytes)
+}
+
+fn append_terminal_text(
+    output: &mut Vec<u8>,
+    text: &str,
+    encoding: TextEncoding,
+) -> Result<(), String> {
+    if !text.is_empty() {
+        output.extend(encode_text(text, encoding, LineEnding::None)?);
+    }
+    Ok(())
+}
+
+fn terminal_control_byte(key: egui::Key) -> Option<u8> {
+    Some(match key {
+        egui::Key::A => 0x01,
+        egui::Key::B => 0x02,
+        egui::Key::C => 0x03,
+        egui::Key::D => 0x04,
+        egui::Key::E => 0x05,
+        egui::Key::F => 0x06,
+        egui::Key::G => 0x07,
+        egui::Key::H => 0x08,
+        egui::Key::I => 0x09,
+        egui::Key::J => 0x0A,
+        egui::Key::K => 0x0B,
+        egui::Key::L => 0x0C,
+        egui::Key::M => 0x0D,
+        egui::Key::N => 0x0E,
+        egui::Key::O => 0x0F,
+        egui::Key::P => 0x10,
+        egui::Key::Q => 0x11,
+        egui::Key::R => 0x12,
+        egui::Key::S => 0x13,
+        egui::Key::T => 0x14,
+        egui::Key::U => 0x15,
+        egui::Key::V => 0x16,
+        egui::Key::W => 0x17,
+        egui::Key::X => 0x18,
+        egui::Key::Y => 0x19,
+        egui::Key::Z => 0x1A,
+        egui::Key::OpenBracket => 0x1B,
+        egui::Key::Backslash => 0x1C,
+        egui::Key::CloseBracket => 0x1D,
+        egui::Key::Minus => 0x1F,
+        egui::Key::Space => 0x00,
+        _ => return None,
+    })
+}
+
 fn settings_row_label(ui: &mut egui::Ui, text: &str) {
     ui.allocate_ui_with_layout(
         egui::vec2(SETTINGS_LABEL_WIDTH, CONNECTION_CONTROL_HEIGHT),
@@ -1583,6 +1600,16 @@ fn human_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
 
+    fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
     #[test]
     fn history_preview_is_single_line_and_bounded() {
         let preview = history_preview(&HistoryItem {
@@ -1598,5 +1625,53 @@ mod tests {
         assert_eq!(human_bytes(7), "7 B");
         assert_eq!(human_bytes(2048), "2.0 KiB");
         assert_eq!(human_bytes(2 * 1024 * 1024), "2.0 MiB");
+    }
+
+    #[test]
+    fn terminal_printable_key_is_sent_once_without_local_echo() {
+        let events = [
+            key_event(egui::Key::H, egui::Modifiers::NONE),
+            egui::Event::Text("H".into()),
+        ];
+        let bytes =
+            terminal_bytes_from_events(&events, TextEncoding::Utf8, LineEnding::CrLf).unwrap();
+        assert_eq!(bytes, b"H");
+
+        let store = ReceiveStore::new(1024);
+        let rows = format_snapshot(&store.snapshot(), ReceiveMode::Terminal, TextEncoding::Utf8);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn terminal_special_and_control_keys_map_to_serial_bytes() {
+        let events = [
+            key_event(egui::Key::Enter, egui::Modifiers::NONE),
+            key_event(egui::Key::Backspace, egui::Modifiers::NONE),
+            key_event(egui::Key::ArrowUp, egui::Modifiers::NONE),
+            key_event(egui::Key::C, egui::Modifiers::CTRL),
+        ];
+        let bytes =
+            terminal_bytes_from_events(&events, TextEncoding::Utf8, LineEnding::CrLf).unwrap();
+        assert_eq!(bytes, b"\r\n\x08\x1B[A\x03");
+    }
+
+    #[test]
+    fn terminal_text_respects_selected_encoding() {
+        let bytes = terminal_bytes_from_events(
+            &[egui::Event::Text("中".into())],
+            TextEncoding::Gbk,
+            LineEnding::CrLf,
+        )
+        .unwrap();
+        assert_eq!(bytes, [0xD6, 0xD0]);
+
+        assert!(
+            terminal_bytes_from_events(
+                &[egui::Event::Text("🙂".into())],
+                TextEncoding::Gbk,
+                LineEnding::CrLf,
+            )
+            .is_err()
+        );
     }
 }
