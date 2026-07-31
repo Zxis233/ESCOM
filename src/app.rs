@@ -867,29 +867,34 @@ impl EscomApp {
             .size_range(150.0..=280.0)
             .show(root_ui, |ui| {
                 let repeat_running = self.repeat.is_some();
+                let mut send_requested = false;
                 ui.spacing_mut().interact_size.y = CONNECTION_CONTROL_HEIGHT;
                 ui.horizontal(|ui| {
                     toolbar_label(ui, "发送", 38.0);
-                    ui.add_enabled_ui(!repeat_running, |ui| {
-                        for mode in [SendMode::Text, SendMode::Hex] {
-                            if ui
-                                .add_sized(
-                                    [50.0, CONNECTION_CONTROL_HEIGHT],
-                                    egui::Button::selectable(
-                                        self.preferences.send_mode == mode,
-                                        mode.label(),
-                                    ),
-                                )
-                                .clicked()
-                                && self.preferences.send_mode != mode
-                            {
-                                self.preferences.send_mode = mode;
-                                self.mark_preferences_dirty();
-                                self.send_error = None;
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        ui.add_enabled_ui(!repeat_running, |ui| {
+                            for mode in [SendMode::Text, SendMode::Hex] {
+                                if ui
+                                    .add_sized(
+                                        [50.0, CONNECTION_CONTROL_HEIGHT],
+                                        egui::Button::selectable(
+                                            self.preferences.send_mode == mode,
+                                            mode.label(),
+                                        ),
+                                    )
+                                    .clicked()
+                                    && self.preferences.send_mode != mode
+                                {
+                                    self.preferences.send_mode = mode;
+                                    self.mark_preferences_dirty();
+                                    self.send_error = None;
+                                }
                             }
-                        }
+                        });
                     });
 
+                    toolbar_separator(ui);
                     toolbar_label(ui, "行尾", 40.0);
                     let mut ending_changed = false;
                     ui.add_enabled_ui(
@@ -920,17 +925,22 @@ impl EscomApp {
                         self.mark_preferences_dirty();
                     }
 
-                    let selected_history = self.history_menu(ui);
+                    let selected_history = ui
+                        .add_enabled_ui(!repeat_running, |ui| self.history_menu(ui))
+                        .inner;
                     if let Some(item) = selected_history {
                         self.preferences.send_mode = item.mode;
                         self.send_input = item.input;
                         self.send_error = None;
                         self.mark_preferences_dirty();
                     }
+                    let can_clear = !repeat_running
+                        && (!self.send_input.is_empty() || self.send_error.is_some());
                     if ui
-                        .add_sized(
-                            [72.0, CONNECTION_CONTROL_HEIGHT],
-                            egui::Button::new("清发送"),
+                        .add_enabled(
+                            can_clear,
+                            egui::Button::new("清发送")
+                                .min_size(egui::vec2(72.0, CONNECTION_CONTROL_HEIGHT)),
                         )
                         .clicked()
                     {
@@ -939,14 +949,15 @@ impl EscomApp {
                     }
 
                     toolbar_separator(ui);
-                    toolbar_label(ui, "间隔 ms", 64.0);
+                    toolbar_label(ui, "循环间隔", 64.0);
                     if ui
                         .add_enabled_ui(!repeat_running, |ui| {
                             ui.add_sized(
-                                [72.0, CONNECTION_CONTROL_HEIGHT],
+                                [92.0, CONNECTION_CONTROL_HEIGHT],
                                 egui::DragValue::new(&mut self.preferences.repeat_interval_ms)
                                     .range(20..=3_600_000)
-                                    .speed(10.0),
+                                    .speed(10.0)
+                                    .suffix(" ms"),
                             )
                         })
                         .inner
@@ -970,24 +981,30 @@ impl EscomApp {
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add_enabled_ui(
-                                self.connection.is_connected() && !repeat_running,
-                                |ui| {
-                                    ui.add_sized(
-                                        [64.0, CONNECTION_CONTROL_HEIGHT],
-                                        egui::Button::new("发送"),
-                                    )
-                                },
-                            )
-                            .inner
-                            .clicked()
-                            && let Err(message) = self.queue_current_input()
-                        {
-                            self.send_error = Some(message);
+                        let can_send = self.connection.is_connected() && !repeat_running;
+                        let mut button = egui::Button::new(RichText::new("发送").strong());
+                        if can_send {
+                            button = button.fill(ui.visuals().selection.bg_fill);
                         }
+                        send_requested = ui
+                            .add_enabled(
+                                can_send,
+                                button.min_size(egui::vec2(72.0, CONNECTION_CONTROL_HEIGHT)),
+                            )
+                            .clicked();
                     });
                 });
+
+                let editor_id = ui.make_persistent_id("send_input_editor");
+                let shortcut_requested = ui.memory(|memory| memory.has_focus(editor_id))
+                    && ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::CTRL, egui::Key::Enter)
+                    });
+                if (send_requested || shortcut_requested)
+                    && let Err(message) = self.queue_current_input()
+                {
+                    self.send_error = Some(message);
+                }
 
                 let hint = match self.preferences.send_mode {
                     SendMode::Text => "输入要发送的文本",
@@ -999,9 +1016,18 @@ impl EscomApp {
                         data_font_family(),
                     ))
                     .hint_text(hint)
+                    .id(editor_id)
                     .desired_rows(4)
                     .desired_width(f32::INFINITY);
-                ui.add_enabled(!repeat_running, text_edit);
+                let error_height = if self.send_error.is_some() {
+                    ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y
+                } else {
+                    0.0
+                };
+                let editor_height = (ui.available_height() - error_height).max(64.0);
+                ui.add_enabled_ui(!repeat_running, |ui| {
+                    ui.add_sized([ui.available_width(), editor_height], text_edit)
+                });
                 if let Some(message) = &self.send_error {
                     ui.label(RichText::new(message).color(ui.visuals().error_fg_color));
                 }
