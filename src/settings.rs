@@ -9,8 +9,11 @@ use serde::{Deserialize, Serialize};
 use crate::fonts::DEFAULT_FONT_WEIGHT;
 use crate::model::{LineEnding, ReceiveMode, SendMode, TextEncoding};
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 4;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 5;
 pub const BUFFER_LIMIT_OPTIONS_MIB: [usize; 4] = [5, 20, 100, 500];
+pub const DEFAULT_DATA_LINE_SPACING: f32 = 3.0;
+pub const MIN_DATA_LINE_SPACING: f32 = 0.0;
+pub const MAX_DATA_LINE_SPACING: f32 = 24.0;
 pub const DEFAULT_BACKGROUND_LIGHT_OPACITY: f32 = 0.22;
 pub const DEFAULT_BACKGROUND_DARK_OPACITY: f32 = 0.16;
 
@@ -42,6 +45,7 @@ pub struct UiPreferences {
     pub data_font_weight: u16,
     pub ui_font_size: f32,
     pub data_font_size: f32,
+    pub data_line_spacing: f32,
     pub receive_mode: ReceiveMode,
     pub send_mode: SendMode,
     pub text_encoding: TextEncoding,
@@ -68,6 +72,7 @@ impl Default for UiPreferences {
             data_font_weight: DEFAULT_FONT_WEIGHT,
             ui_font_size: 15.0,
             data_font_size: 15.0,
+            data_line_spacing: DEFAULT_DATA_LINE_SPACING,
             receive_mode: ReceiveMode::Text,
             send_mode: SendMode::Text,
             text_encoding: TextEncoding::Utf8,
@@ -91,6 +96,12 @@ impl UiPreferences {
         self.schema_version = SETTINGS_SCHEMA_VERSION;
         self.ui_font_size = self.ui_font_size.clamp(10.0, 32.0);
         self.data_font_size = self.data_font_size.clamp(10.0, 32.0);
+        self.data_line_spacing = if self.data_line_spacing.is_finite() {
+            self.data_line_spacing
+                .clamp(MIN_DATA_LINE_SPACING, MAX_DATA_LINE_SPACING)
+        } else {
+            DEFAULT_DATA_LINE_SPACING
+        };
         if !(1..=1000).contains(&self.ui_font_weight) {
             self.ui_font_weight = DEFAULT_FONT_WEIGHT;
         }
@@ -249,6 +260,7 @@ mod tests {
         let preferences = UiPreferences {
             ui_font_family: "Microsoft YaHei UI".into(),
             ui_font_weight: 500,
+            data_line_spacing: 8.0,
             timestamps: true,
             ..Default::default()
         };
@@ -257,6 +269,7 @@ mod tests {
         let loaded = load_from(&test_path).unwrap();
         assert_eq!(loaded.ui_font_family, "Microsoft YaHei UI");
         assert_eq!(loaded.ui_font_weight, 500);
+        assert_eq!(loaded.data_line_spacing, 8.0);
         assert!(loaded.timestamps);
         assert_eq!(loaded.theme_preference, ThemePreference::System);
 
@@ -270,6 +283,7 @@ mod tests {
     fn sanitize_restores_supported_limits() {
         let mut preferences = UiPreferences {
             ui_font_size: 100.0,
+            data_line_spacing: 100.0,
             ui_font_weight: 0,
             data_font_weight: 1001,
             repeat_interval_ms: 1,
@@ -278,6 +292,7 @@ mod tests {
         };
         preferences.sanitize();
         assert_eq!(preferences.ui_font_size, 32.0);
+        assert_eq!(preferences.data_line_spacing, MAX_DATA_LINE_SPACING);
         assert_eq!(preferences.ui_font_weight, DEFAULT_FONT_WEIGHT);
         assert_eq!(preferences.data_font_weight, DEFAULT_FONT_WEIGHT);
         assert_eq!(preferences.repeat_interval_ms, 20);
@@ -330,6 +345,12 @@ mod tests {
             loaded.background_dark_opacity,
             DEFAULT_BACKGROUND_DARK_OPACITY
         );
+    }
+
+    #[test]
+    fn legacy_preferences_default_to_standard_data_line_spacing() {
+        let loaded: UiPreferences = serde_json::from_str(r#"{"schema_version":4}"#).unwrap();
+        assert_eq!(loaded.data_line_spacing, DEFAULT_DATA_LINE_SPACING);
     }
 
     #[test]

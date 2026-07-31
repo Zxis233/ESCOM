@@ -21,7 +21,7 @@ use crate::model::{
 use crate::serial_worker::{WorkerEvent, WorkerHandle};
 use crate::settings::{
     self, AppBackgroundSource, BUFFER_LIMIT_OPTIONS_MIB, DEFAULT_BACKGROUND_DARK_OPACITY,
-    DEFAULT_BACKGROUND_LIGHT_OPACITY, UiPreferences,
+    DEFAULT_BACKGROUND_LIGHT_OPACITY, MAX_DATA_LINE_SPACING, MIN_DATA_LINE_SPACING, UiPreferences,
 };
 use crate::store::ReceiveStore;
 use crate::window_chrome;
@@ -1006,6 +1006,7 @@ impl EscomApp {
         }
 
         let row_height = self.preferences.data_font_size + 7.0;
+        let line_spacing = self.preferences.data_line_spacing;
         let data_font = FontId::new(self.preferences.data_font_size, data_font_family());
         let rows = Arc::clone(&self.display_rows);
         let timestamps = self.preferences.timestamps;
@@ -1017,15 +1018,18 @@ impl EscomApp {
             scroll_area = scroll_area.vertical_scroll_offset(f32::INFINITY);
             self.force_scroll_bottom = false;
         }
-        scroll_area.show_rows(ui, row_height, rows.len(), |ui, range| {
-            for row in &rows[range] {
-                let text = display_text(row, timestamps);
-                ui.add(
-                    egui::Label::new(RichText::new(text).font(data_font.clone()))
-                        .selectable(true)
-                        .wrap_mode(egui::TextWrapMode::Extend),
-                );
-            }
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.y = line_spacing;
+            scroll_area.show_rows(ui, row_height, rows.len(), |ui, range| {
+                for row in &rows[range] {
+                    let text = display_text(row, timestamps);
+                    ui.add(
+                        egui::Label::new(RichText::new(text).font(data_font.clone()))
+                            .selectable(true)
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    );
+                }
+            });
         });
     }
 
@@ -1535,6 +1539,23 @@ impl EscomApp {
                                     .integer()
                                     .suffix(" pt"),
                                 )
+                                .changed();
+                        });
+                        ui.end_row();
+
+                        settings_row_label(ui, "行距");
+                        settings_controls(ui, |ui| {
+                            preferences_changed |= ui
+                                .add_sized(
+                                    [220.0, CONNECTION_CONTROL_HEIGHT],
+                                    egui::Slider::new(
+                                        &mut self.preferences.data_line_spacing,
+                                        MIN_DATA_LINE_SPACING..=MAX_DATA_LINE_SPACING,
+                                    )
+                                    .integer()
+                                    .suffix(" px"),
+                                )
+                                .on_hover_text("调整接收显示区相邻两行文本之间的间距")
                                 .changed();
                         });
                         ui.end_row();
