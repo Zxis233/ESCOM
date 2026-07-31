@@ -19,7 +19,10 @@ use crate::model::{
     flow_control_label, parity_label, stop_bits_label,
 };
 use crate::serial_worker::{WorkerEvent, WorkerHandle};
-use crate::settings::{self, BUFFER_LIMIT_OPTIONS_MIB, UiPreferences};
+use crate::settings::{
+    self, AppBackgroundSource, BUFFER_LIMIT_OPTIONS_MIB, DEFAULT_BACKGROUND_DARK_OPACITY,
+    DEFAULT_BACKGROUND_LIGHT_OPACITY, UiPreferences,
+};
 use crate::store::ReceiveStore;
 
 const FORMAT_DEBOUNCE: Duration = Duration::from_millis(80);
@@ -29,8 +32,10 @@ const MAX_HISTORY: usize = 50;
 const CONNECTION_CONTROL_HEIGHT: f32 = 32.0;
 const CONFIG_LABEL_WIDTH: f32 = 48.0;
 const CONFIG_COMBO_WIDTH: f32 = 100.0;
-const SETTINGS_LABEL_WIDTH: f32 = 60.0;
-const SETTINGS_CONTROLS_WIDTH: f32 = 378.0;
+const SETTINGS_LABEL_WIDTH: f32 = 76.0;
+const SETTINGS_CONTROLS_WIDTH: f32 = 476.0;
+const SETTINGS_WINDOW_WIDTH: f32 = 660.0;
+const SETTINGS_WINDOW_HEIGHT: f32 = 454.0;
 const TITLE_BAR_HEIGHT: f32 = 36.0;
 const TITLE_BAR_BUTTON_WIDTH: f32 = 46.0;
 const TITLE_BAR_CONTROLS_WIDTH: f32 = TITLE_BAR_BUTTON_WIDTH * 3.0;
@@ -42,6 +47,19 @@ enum TitleBarControl {
     Maximize,
     Restore,
     Close,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    Fonts,
+    Background,
+}
+
+enum BackgroundLoadState {
+    Idle,
+    Loading,
+    Ready,
+    Error(String),
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +130,10 @@ pub struct EscomApp {
     background_rx: Receiver<BackgroundEvent>,
 
     settings_open: bool,
+    settings_tab: SettingsTab,
+    background_url_draft: String,
+    background_load_uri: Option<String>,
+    background_load_state: BackgroundLoadState,
     preferences_dirty_since: Option<Instant>,
     last_port_refresh: Instant,
     notice: Option<Notice>,
@@ -121,6 +143,7 @@ impl EscomApp {
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         let mut preferences = settings::load();
         preferences.sanitize();
+        egui_extras::install_image_loaders(&creation_context.egui_ctx);
         creation_context
             .egui_ctx
             .set_theme(preferences.theme_preference);
@@ -160,6 +183,8 @@ impl EscomApp {
             error: true,
         });
 
+        let background_url_draft = preferences.background_online_url.clone();
+
         Self {
             preferences,
             serial_config: SerialConfig::default(),
@@ -187,10 +212,111 @@ impl EscomApp {
             background_tx,
             background_rx,
             settings_open: false,
+            settings_tab: SettingsTab::Fonts,
+            background_url_draft,
+            background_load_uri: None,
+            background_load_state: BackgroundLoadState::Idle,
             preferences_dirty_since: None,
             last_port_refresh: Instant::now() - PORT_REFRESH_INTERVAL,
             notice,
         }
+    }
+
+    fn background_image_uri(&self) -> Option<String> {
+        match self.preferences.background_source {
+            AppBackgroundSource::None => None,
+            AppBackgroundSource::Local => {
+                let path = self.preferences.background_local_path.trim();
+                (!path.is_empty()).then(|| local_background_uri(path))
+            }
+            AppBackgroundSource::Online => {
+                let url = self.preferences.background_online_url.trim();
+                (!url.is_empty()).then(|| url.to_owned())
+            }
+        }
+    }
+
+    fn has_configured_background(&self) -> bool {
+        match self.preferences.background_source {
+            AppBackgroundSource::None => false,
+            AppBackgroundSource::Local => !self.preferences.background_local_path.trim().is_empty(),
+            AppBackgroundSource::Online => {
+                !self.preferences.background_online_url.trim().is_empty()
+            }
+        }
+    }
+
+    fn active_background_opacity(&self, dark_mode: bool) -> f32 {
+        if dark_mode {
+            self.preferences.background_dark_opacity
+        } else {
+            self.preferences.background_light_opacity
+        }
+    }
+
+    fn surface_fill(&self, base: Color32, alpha_with_background: u8) -> Color32 {
+        if self.has_configured_background() {
+            Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), alpha_with_background)
+        } else {
+            base
+        }
+    }
+
+    fn paint_app_background(&mut self, root_ui: &mut egui::Ui) {
+        let rect = root_ui.max_rect();
+        let base_fill = root_ui.visuals().panel_fill;
+        root_ui.painter().rect_filled(rect, 0.0, base_fill);
+
+        let Some(uri) = self.background_image_uri() else {
+            self.background_load_uri = None;
+            self.background_load_state = BackgroundLoadState::Idle;
+            return;
+        };
+
+        if self.background_load_uri.as_deref() != Some(uri.as_str()) {
+            self.background_load_uri = Some(uri.clone());
+            self.background_load_state = BackgroundLoadState::Loading;
+        }
+
+        let context = root_ui.ctx().clone();
+        match context.try_load_texture(
+            &uri,
+            egui::TextureOptions::LINEAR,
+            egui::load::SizeHint::default(),
+        ) {
+            Ok(egui::load::TexturePoll::Ready { texture }) => {
+                self.background_load_state = BackgroundLoadState::Ready;
+                paint_texture_cover(
+                    root_ui.painter(),
+                    rect,
+                    texture,
+                    self.active_background_opacity(root_ui.visuals().dark_mode),
+                );
+            }
+            Ok(egui::load::TexturePoll::Pending { .. }) => {
+                self.background_load_state = BackgroundLoadState::Loading;
+                context.request_repaint_after(Duration::from_millis(100));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let is_new_error = !matches!(
+                    &self.background_load_state,
+                    BackgroundLoadState::Error(previous) if previous == &message
+                );
+                self.background_load_state = BackgroundLoadState::Error(message.clone());
+                if is_new_error {
+                    self.set_notice(format!("背景图片加载失败：{message}"), true);
+                }
+            }
+        }
+    }
+
+    fn reload_background_image(&mut self, context: &egui::Context) {
+        if let Some(uri) = self.background_load_uri.take() {
+            context.forget_image(&uri);
+        }
+        self.background_load_state = BackgroundLoadState::Idle;
+        context.request_repaint();
     }
 
     fn show_title_bar(&self, root_ui: &mut egui::Ui) {
@@ -201,6 +327,7 @@ impl EscomApp {
         } else {
             Color32::from_rgb(246, 247, 249)
         };
+        let title_fill = self.surface_fill(title_fill, 218);
 
         egui::Panel::top("custom_title_bar")
             .resizable(false)
@@ -582,8 +709,11 @@ impl EscomApp {
     }
 
     fn show_connection_panel(&mut self, root_ui: &mut egui::Ui) {
+        let panel_frame = egui::Frame::side_top_panel(root_ui.style())
+            .fill(self.surface_fill(root_ui.visuals().panel_fill, 202));
         egui::Panel::top("connection_panel")
             .resizable(false)
+            .frame(panel_frame)
             .show(root_ui, |ui| {
                 ui.add_space(4.0);
                 ui.spacing_mut().interact_size.y = CONNECTION_CONTROL_HEIGHT;
@@ -661,6 +791,8 @@ impl EscomApp {
                             .add_sized([60.0, CONNECTION_CONTROL_HEIGHT], egui::Button::new("设置"))
                             .clicked()
                         {
+                            self.background_url_draft
+                                .clone_from(&self.preferences.background_online_url);
                             self.settings_open = true;
                         }
                     });
@@ -769,144 +901,148 @@ impl EscomApp {
 
     fn show_output_panel(&mut self, root_ui: &mut egui::Ui) {
         let context = root_ui.ctx().clone();
-        egui::CentralPanel::default().show(root_ui, |ui| {
-            let mut preferences_changed = false;
-            let mut display_changed = false;
-            ui.spacing_mut().interact_size.y = CONNECTION_CONTROL_HEIGHT;
-            ui.horizontal(|ui| {
-                toolbar_label(ui, "接收", 38.0);
-                for mode in [ReceiveMode::Text, ReceiveMode::Hex, ReceiveMode::Terminal] {
-                    let width = if mode == ReceiveMode::Terminal {
-                        64.0
+        let panel_frame = egui::Frame::central_panel(root_ui.style())
+            .fill(self.surface_fill(root_ui.visuals().panel_fill, 82));
+        egui::CentralPanel::default()
+            .frame(panel_frame)
+            .show(root_ui, |ui| {
+                let mut preferences_changed = false;
+                let mut display_changed = false;
+                ui.spacing_mut().interact_size.y = CONNECTION_CONTROL_HEIGHT;
+                ui.horizontal(|ui| {
+                    toolbar_label(ui, "接收", 38.0);
+                    for mode in [ReceiveMode::Text, ReceiveMode::Hex, ReceiveMode::Terminal] {
+                        let width = if mode == ReceiveMode::Terminal {
+                            64.0
+                        } else {
+                            50.0
+                        };
+                        if ui
+                            .add_sized(
+                                [width, CONNECTION_CONTROL_HEIGHT],
+                                egui::Button::selectable(
+                                    self.preferences.receive_mode == mode,
+                                    mode.label(),
+                                ),
+                            )
+                            .clicked()
+                            && self.preferences.receive_mode != mode
+                        {
+                            self.preferences.receive_mode = mode;
+                            if mode == ReceiveMode::Terminal {
+                                self.repeat = None;
+                                self.focus_terminal_surface = true;
+                            }
+                            display_changed = true;
+                            preferences_changed = true;
+                        }
+                    }
+                    egui::ComboBox::from_id_salt("text_encoding")
+                        .selected_text(self.preferences.text_encoding.label())
+                        .width(92.0)
+                        .show_ui(ui, |ui| {
+                            for encoding in [TextEncoding::Utf8, TextEncoding::Gbk] {
+                                if ui
+                                    .selectable_value(
+                                        &mut self.preferences.text_encoding,
+                                        encoding,
+                                        encoding.label(),
+                                    )
+                                    .changed()
+                                {
+                                    display_changed = true;
+                                    preferences_changed = true;
+                                }
+                            }
+                        });
+                    preferences_changed |= ui
+                        .add_sized(
+                            [76.0, CONNECTION_CONTROL_HEIGHT],
+                            egui::Checkbox::new(&mut self.preferences.timestamps, "时间戳"),
+                        )
+                        .changed();
+                    preferences_changed |= ui
+                        .add_sized(
+                            [88.0, CONNECTION_CONTROL_HEIGHT],
+                            egui::Checkbox::new(&mut self.preferences.auto_scroll, "自动滚动"),
+                        )
+                        .changed();
+
+                    let pause_label = if self.paused {
+                        "继续显示"
                     } else {
-                        50.0
+                        "暂停显示"
                     };
                     if ui
                         .add_sized(
-                            [width, CONNECTION_CONTROL_HEIGHT],
-                            egui::Button::selectable(
-                                self.preferences.receive_mode == mode,
-                                mode.label(),
-                            ),
+                            [80.0, CONNECTION_CONTROL_HEIGHT],
+                            egui::Button::new(pause_label),
                         )
                         .clicked()
-                        && self.preferences.receive_mode != mode
                     {
-                        self.preferences.receive_mode = mode;
-                        if mode == ReceiveMode::Terminal {
-                            self.repeat = None;
-                            self.focus_terminal_surface = true;
-                        }
-                        display_changed = true;
+                        self.paused = !self.paused;
+                        self.invalidate_format();
+                    }
+                    if ui
+                        .add_sized(
+                            [64.0, CONNECTION_CONTROL_HEIGHT],
+                            egui::Button::new("到底部"),
+                        )
+                        .clicked()
+                    {
+                        self.force_scroll_bottom = true;
+                        self.preferences.auto_scroll = true;
                         preferences_changed = true;
                     }
-                }
-                egui::ComboBox::from_id_salt("text_encoding")
-                    .selected_text(self.preferences.text_encoding.label())
-                    .width(92.0)
-                    .show_ui(ui, |ui| {
-                        for encoding in [TextEncoding::Utf8, TextEncoding::Gbk] {
-                            if ui
-                                .selectable_value(
-                                    &mut self.preferences.text_encoding,
-                                    encoding,
-                                    encoding.label(),
-                                )
-                                .changed()
-                            {
-                                display_changed = true;
-                                preferences_changed = true;
-                            }
-                        }
-                    });
-                preferences_changed |= ui
-                    .add_sized(
-                        [76.0, CONNECTION_CONTROL_HEIGHT],
-                        egui::Checkbox::new(&mut self.preferences.timestamps, "时间戳"),
-                    )
-                    .changed();
-                preferences_changed |= ui
-                    .add_sized(
-                        [88.0, CONNECTION_CONTROL_HEIGHT],
-                        egui::Checkbox::new(&mut self.preferences.auto_scroll, "自动滚动"),
-                    )
-                    .changed();
 
-                let pause_label = if self.paused {
-                    "继续显示"
-                } else {
-                    "暂停显示"
-                };
-                if ui
-                    .add_sized(
-                        [80.0, CONNECTION_CONTROL_HEIGHT],
-                        egui::Button::new(pause_label),
-                    )
-                    .clicked()
-                {
-                    self.paused = !self.paused;
+                    toolbar_separator(ui);
+                    if ui
+                        .add_sized(
+                            [64.0, CONNECTION_CONTROL_HEIGHT],
+                            egui::Button::new("清接收"),
+                        )
+                        .clicked()
+                    {
+                        self.clear_receive();
+                    }
+                    if ui
+                        .add_sized(
+                            [80.0, CONNECTION_CONTROL_HEIGHT],
+                            egui::Button::new("全部清空"),
+                        )
+                        .clicked()
+                    {
+                        self.clear_receive();
+                        self.send_input.clear();
+                        self.send_error = None;
+                    }
+                    if ui
+                        .add_enabled_ui(self.receive_bytes_len() > 0, |ui| {
+                            ui.add_sized(
+                                [80.0, CONNECTION_CONTROL_HEIGHT],
+                                egui::Button::new("导出 TXT"),
+                            )
+                        })
+                        .inner
+                        .clicked()
+                    {
+                        self.export_snapshot(&context);
+                    }
+                });
+                if display_changed {
                     self.invalidate_format();
                 }
-                if ui
-                    .add_sized(
-                        [64.0, CONNECTION_CONTROL_HEIGHT],
-                        egui::Button::new("到底部"),
-                    )
-                    .clicked()
-                {
-                    self.force_scroll_bottom = true;
-                    self.preferences.auto_scroll = true;
-                    preferences_changed = true;
+                if preferences_changed {
+                    self.mark_preferences_dirty();
                 }
 
-                toolbar_separator(ui);
-                if ui
-                    .add_sized(
-                        [64.0, CONNECTION_CONTROL_HEIGHT],
-                        egui::Button::new("清接收"),
-                    )
-                    .clicked()
-                {
-                    self.clear_receive();
-                }
-                if ui
-                    .add_sized(
-                        [80.0, CONNECTION_CONTROL_HEIGHT],
-                        egui::Button::new("全部清空"),
-                    )
-                    .clicked()
-                {
-                    self.clear_receive();
-                    self.send_input.clear();
-                    self.send_error = None;
-                }
-                if ui
-                    .add_enabled_ui(self.receive_bytes_len() > 0, |ui| {
-                        ui.add_sized(
-                            [80.0, CONNECTION_CONTROL_HEIGHT],
-                            egui::Button::new("导出 TXT"),
-                        )
-                    })
-                    .inner
-                    .clicked()
-                {
-                    self.export_snapshot(&context);
+                ui.separator();
+                if self.preferences.receive_mode == ReceiveMode::Terminal {
+                    self.show_terminal_surface(ui);
+                } else {
+                    self.show_receive_content(ui);
                 }
             });
-            if display_changed {
-                self.invalidate_format();
-            }
-            if preferences_changed {
-                self.mark_preferences_dirty();
-            }
-
-            ui.separator();
-            if self.preferences.receive_mode == ReceiveMode::Terminal {
-                self.show_terminal_surface(ui);
-            } else {
-                self.show_receive_content(ui);
-            }
-        });
     }
 
     fn show_receive_content(&mut self, ui: &mut egui::Ui) {
@@ -1010,12 +1146,14 @@ impl EscomApp {
     fn show_send_panel(&mut self, root_ui: &mut egui::Ui) {
         let context = root_ui.ctx().clone();
         let toolbar_gap = root_ui.spacing().item_spacing.y.round() as i8;
-        let panel_frame = egui::Frame::side_top_panel(root_ui.style()).inner_margin(egui::Margin {
-            left: 8,
-            right: 8,
-            top: toolbar_gap,
-            bottom: 2,
-        });
+        let panel_frame = egui::Frame::side_top_panel(root_ui.style())
+            .inner_margin(egui::Margin {
+                left: 8,
+                right: 8,
+                top: toolbar_gap,
+                bottom: 2,
+            })
+            .fill(self.surface_fill(root_ui.visuals().panel_fill, 112));
         egui::Panel::bottom("send_panel")
             .resizable(true)
             .size_range(150.0..=280.0)
@@ -1193,9 +1331,12 @@ impl EscomApp {
         let context = root_ui.ctx().clone();
         let mut theme_preference = self.preferences.theme_preference;
         let mut theme_changed = false;
+        let panel_frame = egui::Frame::side_top_panel(root_ui.style())
+            .fill(self.surface_fill(root_ui.visuals().panel_fill, 210));
         egui::Panel::bottom("status_panel")
             .resizable(false)
             .exact_size(30.0)
+            .frame(panel_frame)
             .show(root_ui, |ui| {
                 ui.spacing_mut().interact_size.y = CONNECTION_CONTROL_HEIGHT;
                 egui::containers::Sides::new().shrink_left().show(
@@ -1266,26 +1407,76 @@ impl EscomApp {
             return;
         }
         let mut open = self.settings_open;
-        let mut font_changed = false;
-        let mut preferences_changed = false;
-        let mut buffer_changed = false;
-        egui::Window::new("界面设置")
+        let max_window_height = context.input(|input| {
+            (input.viewport_rect().height() - 32.0).max(SETTINGS_WINDOW_HEIGHT + 48.0)
+        });
+        egui::Window::new("设置")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(560.0)
-            .min_width(480.0)
+            .default_width(SETTINGS_WINDOW_WIDTH)
+            .min_width(SETTINGS_WINDOW_WIDTH)
+            .max_height(max_window_height)
+            .vscroll(true)
             .show(context, |ui| {
                 ui.spacing_mut().interact_size.y = CONNECTION_CONTROL_HEIGHT;
-                egui::Grid::new("settings_grid")
+                ui.set_min_size(egui::vec2(
+                    SETTINGS_WINDOW_WIDTH - 32.0,
+                    SETTINGS_WINDOW_HEIGHT,
+                ));
+                self.show_settings_tabs(ui);
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                match self.settings_tab {
+                    SettingsTab::Fonts => self.show_font_settings_tab(ui, context),
+                    SettingsTab::Background => self.show_background_settings_tab(ui, context),
+                }
+            });
+        self.settings_open = open;
+    }
+
+    fn show_settings_tabs(&mut self, ui: &mut egui::Ui) {
+        let gap = ui.spacing().item_spacing.x;
+        let tab_width = (ui.available_width() - gap) * 0.5;
+        ui.horizontal(|ui| {
+            for (tab, label) in [
+                (SettingsTab::Fonts, "字体与显示"),
+                (SettingsTab::Background, "应用背景"),
+            ] {
+                if ui
+                    .add_sized(
+                        [tab_width, 38.0],
+                        egui::Button::selectable(self.settings_tab == tab, label),
+                    )
+                    .clicked()
+                {
+                    self.settings_tab = tab;
+                }
+            }
+        });
+    }
+
+    fn show_font_settings_tab(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        let mut font_changed = false;
+        let mut preferences_changed = false;
+        let mut buffer_changed = false;
+
+        settings_card(
+            ui,
+            "字体",
+            "分别设置界面控件与串口数据所使用的字体。",
+            |ui| {
+                egui::Grid::new("font_settings_grid")
                     .num_columns(2)
-                    .spacing([18.0, 12.0])
+                    .spacing([16.0, 12.0])
                     .show(ui, |ui| {
                         settings_row_label(ui, "界面字体");
                         settings_controls(ui, |ui| {
                             egui::ComboBox::from_id_salt("ui_font")
                                 .selected_text(&self.preferences.ui_font_family)
-                                .width(260.0)
+                                .width(292.0)
                                 .show_ui(ui, |ui| {
                                     for family in self.font_catalog.ui_families() {
                                         font_changed |= ui
@@ -1305,7 +1496,7 @@ impl EscomApp {
                                     &self.preferences.ui_font_family,
                                     self.preferences.ui_font_weight,
                                 ))
-                                .width(110.0)
+                                .width(118.0)
                                 .show_ui(ui, |ui| {
                                     for option in options {
                                         font_changed |= ui
@@ -1324,12 +1515,13 @@ impl EscomApp {
                         settings_controls(ui, |ui| {
                             font_changed |= ui
                                 .add_sized(
-                                    [158.0, CONNECTION_CONTROL_HEIGHT],
+                                    [220.0, CONNECTION_CONTROL_HEIGHT],
                                     egui::Slider::new(
                                         &mut self.preferences.ui_font_size,
                                         10.0..=32.0,
                                     )
-                                    .integer(),
+                                    .integer()
+                                    .suffix(" pt"),
                                 )
                                 .changed();
                         });
@@ -1339,7 +1531,7 @@ impl EscomApp {
                         settings_controls(ui, |ui| {
                             egui::ComboBox::from_id_salt("data_font")
                                 .selected_text(&self.preferences.data_font_family)
-                                .width(260.0)
+                                .width(292.0)
                                 .show_ui(ui, |ui| {
                                     for family in self.font_catalog.mono_families() {
                                         font_changed |= ui
@@ -1359,7 +1551,7 @@ impl EscomApp {
                                     &self.preferences.data_font_family,
                                     self.preferences.data_font_weight,
                                 ))
-                                .width(110.0)
+                                .width(118.0)
                                 .show_ui(ui, |ui| {
                                     for option in options {
                                         font_changed |= ui
@@ -1376,29 +1568,38 @@ impl EscomApp {
 
                         settings_row_label(ui, "数据字号");
                         settings_controls(ui, |ui| {
-                            if ui
+                            preferences_changed |= ui
                                 .add_sized(
-                                    [158.0, CONNECTION_CONTROL_HEIGHT],
+                                    [220.0, CONNECTION_CONTROL_HEIGHT],
                                     egui::Slider::new(
                                         &mut self.preferences.data_font_size,
                                         10.0..=32.0,
                                     )
-                                    .integer(),
+                                    .integer()
+                                    .suffix(" pt"),
                                 )
-                                .changed()
-                            {
-                                preferences_changed = true;
-                            }
+                                .changed();
                         });
                         ui.end_row();
+                    });
+            },
+        );
 
+        ui.add_space(10.0);
+        settings_card(
+            ui,
+            "显示缓存",
+            "限制接收缓存占用，达到上限后自动淘汰最早的数据。",
+            |ui| {
+                egui::Grid::new("buffer_settings_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 0.0])
+                    .show(ui, |ui| {
                         settings_row_label(ui, "接收缓存");
                         settings_controls(ui, |ui| {
                             egui::ComboBox::from_id_salt("buffer_limit")
-                                .selected_text(format!(
-                                    "{} MiB",
-                                    self.preferences.buffer_limit_mib
-                                ))
+                                .selected_text(format!("{} MiB", self.preferences.buffer_limit_mib))
+                                .width(140.0)
                                 .show_ui(ui, |ui| {
                                     for limit in BUFFER_LIMIT_OPTIONS_MIB {
                                         buffer_changed |= ui
@@ -1413,17 +1614,17 @@ impl EscomApp {
                         });
                         ui.end_row();
                     });
+            },
+        );
 
-                ui.separator();
-                ui.label(
-                    RichText::new(
-                        "字体仅从 Windows 已安装字体中选择；不支持的字重会自动恢复为该字体的默认字重。",
-                    )
-                    .small()
-                    .color(ui.visuals().weak_text_color()),
-                );
-            });
-        self.settings_open = open;
+        ui.add_space(9.0);
+        ui.label(
+            RichText::new(
+                "字体来自 Windows 已安装字体；不支持的字重会自动恢复为该字体的默认字重。",
+            )
+            .small()
+            .color(ui.visuals().weak_text_color()),
+        );
 
         if font_changed {
             let applied = self.font_catalog.apply(
@@ -1453,6 +1654,286 @@ impl EscomApp {
         if preferences_changed {
             self.mark_preferences_dirty();
         }
+    }
+
+    fn show_background_settings_tab(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        let mut preferences_changed = false;
+        let mut reload_requested = false;
+
+        settings_card(
+            ui,
+            "背景来源",
+            "背景会居中裁剪并铺满整个应用窗口。",
+            |ui| {
+                let gap = ui.spacing().item_spacing.x;
+                let option_width = (ui.available_width() - gap * 2.0) / 3.0;
+                ui.horizontal(|ui| {
+                    for source in [
+                        AppBackgroundSource::None,
+                        AppBackgroundSource::Local,
+                        AppBackgroundSource::Online,
+                    ] {
+                        if ui
+                            .add_sized(
+                                [option_width, CONNECTION_CONTROL_HEIGHT],
+                                egui::Button::selectable(
+                                    self.preferences.background_source == source,
+                                    source.label(),
+                                ),
+                            )
+                            .clicked()
+                            && self.preferences.background_source != source
+                        {
+                            self.preferences.background_source = source;
+                            preferences_changed = true;
+                            reload_requested = true;
+                        }
+                    }
+                });
+
+                ui.add_space(10.0);
+                match self.preferences.background_source {
+                    AppBackgroundSource::None => {
+                        ui.label(
+                            RichText::new("当前使用主题的默认纯色背景。")
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    }
+                    AppBackgroundSource::Local => {
+                        ui.horizontal(|ui| {
+                            let mut path_display =
+                                if self.preferences.background_local_path.trim().is_empty() {
+                                    "尚未选择图片".to_owned()
+                                } else {
+                                    self.preferences.background_local_path.clone()
+                                };
+                            let field_width = (ui.available_width() - 184.0).max(220.0);
+                            ui.add_sized(
+                                [field_width, CONNECTION_CONTROL_HEIGHT],
+                                egui::TextEdit::singleline(&mut path_display).interactive(false),
+                            )
+                            .on_hover_text(&path_display);
+                            if ui
+                                .add_sized(
+                                    [88.0, CONNECTION_CONTROL_HEIGHT],
+                                    egui::Button::new("选择图片"),
+                                )
+                                .clicked()
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .set_title("选择应用背景")
+                                    .add_filter(
+                                        "图片文件",
+                                        &[
+                                            "png", "jpg", "jpeg", "webp", "bmp", "gif", "tif",
+                                            "tiff",
+                                        ],
+                                    )
+                                    .pick_file()
+                            {
+                                self.preferences.background_local_path =
+                                    path.to_string_lossy().into_owned();
+                                self.preferences.background_source = AppBackgroundSource::Local;
+                                preferences_changed = true;
+                                reload_requested = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    !self.preferences.background_local_path.trim().is_empty(),
+                                    egui::Button::new("重新加载")
+                                        .min_size(egui::vec2(80.0, CONNECTION_CONTROL_HEIGHT)),
+                                )
+                                .clicked()
+                            {
+                                reload_requested = true;
+                            }
+                        });
+                        self.show_background_load_status(ui, false);
+                    }
+                    AppBackgroundSource::Online => {
+                        ui.horizontal(|ui| {
+                            let field_width = (ui.available_width() - 92.0).max(260.0);
+                            let response = ui.add_sized(
+                                [field_width, CONNECTION_CONTROL_HEIGHT],
+                                egui::TextEdit::singleline(&mut self.background_url_draft)
+                                    .hint_text("https://example.com/background.jpg"),
+                            );
+                            let enter_pressed = response.lost_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                            let apply_clicked = ui
+                                .add_sized(
+                                    [84.0, CONNECTION_CONTROL_HEIGHT],
+                                    egui::Button::new("应用地址"),
+                                )
+                                .clicked();
+                            if apply_clicked || enter_pressed {
+                                match normalized_online_image_url(&self.background_url_draft) {
+                                    Ok(url) => {
+                                        self.background_url_draft.clone_from(&url);
+                                        if self.preferences.background_online_url != url
+                                            || self.preferences.background_source
+                                                != AppBackgroundSource::Online
+                                        {
+                                            self.preferences.background_online_url = url;
+                                            self.preferences.background_source =
+                                                AppBackgroundSource::Online;
+                                            preferences_changed = true;
+                                        }
+                                        reload_requested = true;
+                                    }
+                                    Err(message) => self.set_notice(message, true),
+                                }
+                            }
+                        });
+                        self.show_background_load_status(ui, true);
+                    }
+                }
+            },
+        );
+
+        ui.add_space(10.0);
+        settings_card(
+            ui,
+            "背景不透明度",
+            "为亮色与暗色主题分别设置，切换主题时自动使用对应数值。",
+            |ui| {
+                egui::Grid::new("background_opacity_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 10.0])
+                    .show(ui, |ui| {
+                        settings_row_label(ui, "亮色模式");
+                        settings_controls(ui, |ui| {
+                            preferences_changed |= background_opacity_control(
+                                ui,
+                                &mut self.preferences.background_light_opacity,
+                            );
+                        });
+                        ui.end_row();
+
+                        settings_row_label(ui, "暗色模式");
+                        settings_controls(ui, |ui| {
+                            preferences_changed |= background_opacity_control(
+                                ui,
+                                &mut self.preferences.background_dark_opacity,
+                            );
+                        });
+                        ui.end_row();
+                    });
+
+                ui.horizontal(|ui| {
+                    let is_default = (self.preferences.background_light_opacity
+                        - DEFAULT_BACKGROUND_LIGHT_OPACITY)
+                        .abs()
+                        < f32::EPSILON
+                        && (self.preferences.background_dark_opacity
+                            - DEFAULT_BACKGROUND_DARK_OPACITY)
+                            .abs()
+                            < f32::EPSILON;
+                    ui.add_space((ui.available_width() - 104.0).max(0.0));
+                    if ui
+                        .add_enabled(
+                            !is_default,
+                            egui::Button::new("恢复推荐值")
+                                .min_size(egui::vec2(104.0, CONNECTION_CONTROL_HEIGHT)),
+                        )
+                        .clicked()
+                    {
+                        self.preferences.background_light_opacity =
+                            DEFAULT_BACKGROUND_LIGHT_OPACITY;
+                        self.preferences.background_dark_opacity = DEFAULT_BACKGROUND_DARK_OPACITY;
+                        preferences_changed = true;
+                    }
+                });
+            },
+        );
+
+        ui.add_space(10.0);
+        settings_card(
+            ui,
+            "效果预览",
+            "预览亮色与暗色模式下的实际透明度。",
+            |ui| {
+                self.show_background_previews(ui);
+            },
+        );
+
+        if reload_requested {
+            self.reload_background_image(context);
+        }
+        if preferences_changed {
+            self.mark_preferences_dirty();
+        }
+    }
+
+    fn show_background_load_status(&self, ui: &mut egui::Ui, check_draft: bool) {
+        let draft_changed = check_draft
+            && self.background_url_draft.trim() != self.preferences.background_online_url.trim();
+        let (message, color) = if draft_changed {
+            (
+                "地址有修改，点击“应用地址”后生效。".to_owned(),
+                Color32::from_rgb(210, 140, 30),
+            )
+        } else {
+            match &self.background_load_state {
+                BackgroundLoadState::Idle => (
+                    if check_draft {
+                        "输入图片地址并点击“应用地址”。".to_owned()
+                    } else {
+                        "选择图片后将在这里显示加载状态。".to_owned()
+                    },
+                    ui.visuals().weak_text_color(),
+                ),
+                BackgroundLoadState::Loading => (
+                    "正在加载背景图片…".to_owned(),
+                    ui.visuals().weak_text_color(),
+                ),
+                BackgroundLoadState::Ready => (
+                    "背景图片已加载。".to_owned(),
+                    Color32::from_rgb(45, 155, 90),
+                ),
+                BackgroundLoadState::Error(message) => {
+                    (format!("加载失败：{message}"), ui.visuals().error_fg_color)
+                }
+            }
+        };
+        ui.add_space(5.0);
+        ui.label(RichText::new(message).small().color(color));
+    }
+
+    fn show_background_previews(&self, ui: &mut egui::Ui) {
+        let texture = self.background_image_uri().and_then(|uri| {
+            match ui.ctx().try_load_texture(
+                &uri,
+                egui::TextureOptions::LINEAR,
+                egui::load::SizeHint::default(),
+            ) {
+                Ok(egui::load::TexturePoll::Ready { texture }) => Some(texture),
+                Ok(egui::load::TexturePoll::Pending { .. }) => {
+                    ui.ctx().request_repaint_after(Duration::from_millis(100));
+                    None
+                }
+                Err(_) => None,
+            }
+        });
+        let gap = ui.spacing().item_spacing.x;
+        let preview_width = (ui.available_width() - gap) * 0.5;
+        ui.horizontal(|ui| {
+            background_preview(
+                ui,
+                preview_width,
+                "亮色",
+                false,
+                texture,
+                self.preferences.background_light_opacity,
+            );
+            background_preview(
+                ui,
+                preview_width,
+                "暗色",
+                true,
+                texture,
+                self.preferences.background_dark_opacity,
+            );
+        });
     }
 
     fn history_menu(&mut self, ui: &mut egui::Ui) -> Option<HistoryItem> {
@@ -1588,6 +2069,7 @@ impl eframe::App for EscomApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
+        self.paint_app_background(ui);
         self.show_title_bar(ui);
         self.show_connection_panel(ui);
         self.show_status_panel(ui);
@@ -1889,10 +2371,197 @@ fn terminal_control_byte(key: egui::Key) -> Option<u8> {
     })
 }
 
+fn settings_card<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    description: &str,
+    contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let frame = egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(8)
+        .inner_margin(egui::Margin::same(12));
+    frame
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(RichText::new(title).strong().size(16.0));
+            ui.label(
+                RichText::new(description)
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+            ui.add_space(8.0);
+            contents(ui)
+        })
+        .inner
+}
+
+fn normalized_online_image_url(input: &str) -> Result<String, &'static str> {
+    let value = input.trim();
+    if value.is_empty() {
+        return Err("请输入在线图片地址");
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err("在线图片地址不能包含空格");
+    }
+    let lowercase = value.to_ascii_lowercase();
+    let prefix_len = if lowercase.starts_with("https://") {
+        "https://".len()
+    } else if lowercase.starts_with("http://") {
+        "http://".len()
+    } else {
+        return Err("在线图片地址必须以 http:// 或 https:// 开头");
+    };
+    let authority = value[prefix_len..]
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if authority.is_empty() {
+        return Err("在线图片地址缺少有效的主机名");
+    }
+    Ok(value.to_owned())
+}
+
+fn local_background_uri(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    if let Some(unc_path) = normalized.strip_prefix("//") {
+        format!("file://{unc_path}")
+    } else {
+        format!("file:///{normalized}")
+    }
+}
+
+fn background_opacity_control(ui: &mut egui::Ui, opacity: &mut f32) -> bool {
+    let changed = ui
+        .add_sized(
+            [390.0, CONNECTION_CONTROL_HEIGHT],
+            egui::Slider::new(opacity, 0.0..=1.0).show_value(false),
+        )
+        .changed();
+    ui.allocate_ui_with_layout(
+        egui::vec2(60.0, CONNECTION_CONTROL_HEIGHT),
+        Layout::right_to_left(Align::Center),
+        |ui| {
+            ui.label(RichText::new(format!("{:.0}%", *opacity * 100.0)).monospace());
+        },
+    );
+    changed
+}
+
+fn background_preview(
+    ui: &mut egui::Ui,
+    width: f32,
+    label: &str,
+    dark_mode: bool,
+    texture: Option<egui::load::SizedTexture>,
+    opacity: f32,
+) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 96.0), egui::Sense::hover());
+    let base = if dark_mode {
+        Color32::from_gray(27)
+    } else {
+        Color32::from_gray(248)
+    };
+    ui.painter().rect_filled(rect, 6.0, base);
+    if let Some(texture) = texture {
+        paint_texture_cover(ui.painter(), rect, texture, opacity);
+    } else {
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "暂无背景",
+            FontId::proportional(13.0),
+            if dark_mode {
+                Color32::from_gray(150)
+            } else {
+                Color32::from_gray(110)
+            },
+        );
+    }
+
+    let toolbar_rect =
+        egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.top() + 26.0));
+    ui.painter().rect_filled(
+        toolbar_rect,
+        egui::CornerRadius {
+            nw: 6,
+            ne: 6,
+            sw: 0,
+            se: 0,
+        },
+        Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 218),
+    );
+    let text_color = if dark_mode {
+        Color32::from_gray(235)
+    } else {
+        Color32::from_gray(30)
+    };
+    ui.painter().text(
+        toolbar_rect.left_center() + egui::vec2(9.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        format!("{label}模式"),
+        FontId::proportional(13.0),
+        text_color,
+    );
+    let content_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 10.0, toolbar_rect.bottom() + 10.0),
+        egui::pos2(rect.right() - 10.0, rect.bottom() - 10.0),
+    );
+    ui.painter().rect_filled(
+        content_rect,
+        4.0,
+        Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 118),
+    );
+    ui.painter().rect_stroke(
+        rect,
+        6.0,
+        ui.visuals().widgets.noninteractive.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    response.on_hover_text(format!("背景不透明度 {:.0}%", opacity * 100.0));
+}
+
+fn paint_texture_cover(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    texture: egui::load::SizedTexture,
+    opacity: f32,
+) {
+    let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+    if alpha == 0 {
+        return;
+    }
+    painter.image(
+        texture.id,
+        rect,
+        cover_uv(texture.size, rect.size()),
+        Color32::from_white_alpha(alpha),
+    );
+}
+
+fn cover_uv(image_size: egui::Vec2, target_size: egui::Vec2) -> egui::Rect {
+    if image_size.x <= 0.0 || image_size.y <= 0.0 || target_size.x <= 0.0 || target_size.y <= 0.0 {
+        return egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+    }
+
+    let image_aspect = image_size.x / image_size.y;
+    let target_aspect = target_size.x / target_size.y;
+    if image_aspect > target_aspect {
+        let visible_width = target_aspect / image_aspect;
+        let inset = (1.0 - visible_width) * 0.5;
+        egui::Rect::from_min_max(egui::pos2(inset, 0.0), egui::pos2(1.0 - inset, 1.0))
+    } else {
+        let visible_height = image_aspect / target_aspect;
+        let inset = (1.0 - visible_height) * 0.5;
+        egui::Rect::from_min_max(egui::pos2(0.0, inset), egui::pos2(1.0, 1.0 - inset))
+    }
+}
+
 fn settings_row_label(ui: &mut egui::Ui, text: &str) {
     ui.allocate_ui_with_layout(
         egui::vec2(SETTINGS_LABEL_WIDTH, CONNECTION_CONTROL_HEIGHT),
-        Layout::left_to_right(Align::Center),
+        Layout::right_to_left(Align::Center),
         |ui| {
             ui.label(text);
         },
@@ -2053,6 +2722,40 @@ mod tests {
         assert_eq!(
             window_resize_direction(viewport, egui::pos2(1279.0, 1.0)),
             None
+        );
+    }
+
+    #[test]
+    fn cover_uv_center_crops_wide_and_tall_images() {
+        let wide = cover_uv(egui::vec2(200.0, 100.0), egui::vec2(100.0, 100.0));
+        assert_eq!(wide.min, egui::pos2(0.25, 0.0));
+        assert_eq!(wide.max, egui::pos2(0.75, 1.0));
+
+        let tall = cover_uv(egui::vec2(100.0, 200.0), egui::vec2(100.0, 100.0));
+        assert_eq!(tall.min, egui::pos2(0.0, 0.25));
+        assert_eq!(tall.max, egui::pos2(1.0, 0.75));
+    }
+
+    #[test]
+    fn online_background_url_requires_http_and_a_host() {
+        assert_eq!(
+            normalized_online_image_url(" https://example.com/image.png ").unwrap(),
+            "https://example.com/image.png"
+        );
+        assert!(normalized_online_image_url("file:///tmp/image.png").is_err());
+        assert!(normalized_online_image_url("https://").is_err());
+        assert!(normalized_online_image_url("https://example.com/a b.png").is_err());
+    }
+
+    #[test]
+    fn local_background_paths_use_windows_file_uri_shape() {
+        assert_eq!(
+            local_background_uri(r"D:\Pictures\background image.png"),
+            "file:///D:/Pictures/background image.png"
+        );
+        assert_eq!(
+            local_background_uri(r"\\server\share\background.png"),
+            "file://server/share/background.png"
         );
     }
 

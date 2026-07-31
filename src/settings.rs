@@ -9,8 +9,28 @@ use serde::{Deserialize, Serialize};
 use crate::fonts::DEFAULT_FONT_WEIGHT;
 use crate::model::{LineEnding, ReceiveMode, SendMode, TextEncoding};
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 3;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 4;
 pub const BUFFER_LIMIT_OPTIONS_MIB: [usize; 4] = [5, 20, 100, 500];
+pub const DEFAULT_BACKGROUND_LIGHT_OPACITY: f32 = 0.22;
+pub const DEFAULT_BACKGROUND_DARK_OPACITY: f32 = 0.16;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AppBackgroundSource {
+    #[default]
+    None,
+    Local,
+    Online,
+}
+
+impl AppBackgroundSource {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "不使用背景",
+            Self::Local => "本地图片",
+            Self::Online => "在线图片",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -31,6 +51,11 @@ pub struct UiPreferences {
     pub repeat_interval_ms: u64,
     pub buffer_limit_mib: usize,
     pub theme_preference: ThemePreference,
+    pub background_source: AppBackgroundSource,
+    pub background_local_path: String,
+    pub background_online_url: String,
+    pub background_light_opacity: f32,
+    pub background_dark_opacity: f32,
 }
 
 impl Default for UiPreferences {
@@ -52,6 +77,11 @@ impl Default for UiPreferences {
             repeat_interval_ms: 1_000,
             buffer_limit_mib: 20,
             theme_preference: ThemePreference::System,
+            background_source: AppBackgroundSource::None,
+            background_local_path: String::new(),
+            background_online_url: String::new(),
+            background_light_opacity: DEFAULT_BACKGROUND_LIGHT_OPACITY,
+            background_dark_opacity: DEFAULT_BACKGROUND_DARK_OPACITY,
         }
     }
 }
@@ -71,10 +101,26 @@ impl UiPreferences {
         if !BUFFER_LIMIT_OPTIONS_MIB.contains(&self.buffer_limit_mib) {
             self.buffer_limit_mib = 20;
         }
+        self.background_light_opacity = sanitized_opacity(
+            self.background_light_opacity,
+            DEFAULT_BACKGROUND_LIGHT_OPACITY,
+        );
+        self.background_dark_opacity = sanitized_opacity(
+            self.background_dark_opacity,
+            DEFAULT_BACKGROUND_DARK_OPACITY,
+        );
     }
 
     pub fn buffer_limit_bytes(&self) -> usize {
         self.buffer_limit_mib.saturating_mul(1024 * 1024)
+    }
+}
+
+fn sanitized_opacity(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        fallback
     }
 }
 
@@ -270,6 +316,37 @@ mod tests {
     fn legacy_preferences_default_to_system_theme() {
         let loaded: UiPreferences = serde_json::from_str(r#"{"schema_version":2}"#).unwrap();
         assert_eq!(loaded.theme_preference, ThemePreference::System);
+    }
+
+    #[test]
+    fn legacy_preferences_default_to_no_background() {
+        let loaded: UiPreferences = serde_json::from_str(r#"{"schema_version":3}"#).unwrap();
+        assert_eq!(loaded.background_source, AppBackgroundSource::None);
+        assert_eq!(
+            loaded.background_light_opacity,
+            DEFAULT_BACKGROUND_LIGHT_OPACITY
+        );
+        assert_eq!(
+            loaded.background_dark_opacity,
+            DEFAULT_BACKGROUND_DARK_OPACITY
+        );
+    }
+
+    #[test]
+    fn sanitize_clamps_background_opacity() {
+        let mut preferences = UiPreferences {
+            background_light_opacity: 2.0,
+            background_dark_opacity: f32::NAN,
+            ..Default::default()
+        };
+
+        preferences.sanitize();
+
+        assert_eq!(preferences.background_light_opacity, 1.0);
+        assert_eq!(
+            preferences.background_dark_opacity,
+            DEFAULT_BACKGROUND_DARK_OPACITY
+        );
     }
 
     #[test]
