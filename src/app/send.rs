@@ -389,7 +389,7 @@ impl EscomApp {
 pub(super) fn terminal_bytes_from_events(
     events: &[egui::Event],
     encoding: TextEncoding,
-    line_ending: LineEnding,
+    _line_ending: LineEnding,
 ) -> Result<Vec<u8>, String> {
     let has_copy = events
         .iter()
@@ -427,17 +427,19 @@ pub(super) fn terminal_bytes_from_events(
                 }
 
                 match key {
-                    egui::Key::Enter => bytes.extend_from_slice(line_ending.bytes()),
+                    // A terminal Return key transmits CR. Text-mode line-ending settings do not
+                    // apply here; sending CRLF can execute an empty second command in FinSH.
+                    egui::Key::Enter => bytes.push(b'\r'),
                     egui::Key::Tab if !text_contains_tab => bytes.push(b'\t'),
                     egui::Key::Backspace => bytes.push(0x08),
                     egui::Key::Escape => bytes.push(0x1B),
-                    egui::Key::Delete => bytes.push(0x7F),
+                    egui::Key::Delete => bytes.extend_from_slice(b"\x1B[3~"),
                     egui::Key::ArrowUp => bytes.extend_from_slice(b"\x1B[A"),
                     egui::Key::ArrowDown => bytes.extend_from_slice(b"\x1B[B"),
                     egui::Key::ArrowRight => bytes.extend_from_slice(b"\x1B[C"),
                     egui::Key::ArrowLeft => bytes.extend_from_slice(b"\x1B[D"),
-                    egui::Key::Home => bytes.extend_from_slice(b"\x1B[H"),
-                    egui::Key::End => bytes.extend_from_slice(b"\x1B[F"),
+                    egui::Key::Home => bytes.extend_from_slice(b"\x1B[1~"),
+                    egui::Key::End => bytes.extend_from_slice(b"\x1B[4~"),
                     egui::Key::Insert => bytes.extend_from_slice(b"\x1B[2~"),
                     egui::Key::PageUp => bytes.extend_from_slice(b"\x1B[5~"),
                     egui::Key::PageDown => bytes.extend_from_slice(b"\x1B[6~"),

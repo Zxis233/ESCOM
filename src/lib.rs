@@ -8,4 +8,5 @@ pub mod search;
 pub mod serial_worker;
 pub mod settings;
 pub mod store;
+mod terminal;
 pub mod window_chrome;

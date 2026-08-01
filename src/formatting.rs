@@ -9,6 +9,7 @@ use encoding_rs::{CoderResult, GBK, UTF_8};
 
 use crate::model::{LineEnding, ReceiveMode, SendMode, TextEncoding};
 use crate::store::{ReceiveCursor, ReceiveDelta, ReceiveSnapshot, RxChunk};
+use crate::terminal::IncrementalTerminalFormatter;
 
 pub const MAX_DISPLAY_ROWS: usize = 100_000;
 pub const MAX_DISPLAY_TEXT_BYTES: usize = 16 * 1024 * 1024;
@@ -74,6 +75,7 @@ pub struct DisplayFormatter {
 
 enum DisplayFormatterState {
     Text(IncrementalTextFormatter),
+    Terminal(Box<IncrementalTerminalFormatter>),
     Hex,
 }
 
@@ -104,9 +106,13 @@ impl DisplayFormatter {
         limits: DisplayLimits,
     ) -> (Self, Vec<FormattedRow>) {
         let state = match mode {
-            ReceiveMode::Text | ReceiveMode::Terminal => DisplayFormatterState::Text(
-                IncrementalTextFormatter::new(encoding, limits.max_line_bytes),
-            ),
+            ReceiveMode::Text => DisplayFormatterState::Text(IncrementalTextFormatter::new(
+                encoding,
+                limits.max_line_bytes,
+            )),
+            ReceiveMode::Terminal => DisplayFormatterState::Terminal(Box::new(
+                IncrementalTerminalFormatter::new(encoding),
+            )),
             ReceiveMode::Hex => DisplayFormatterState::Hex,
         };
         let mut formatter = Self {
@@ -149,6 +155,13 @@ impl DisplayFormatter {
         self.limited
     }
 
+    pub fn terminal_cursor(&self) -> Option<(usize, usize)> {
+        match &self.state {
+            DisplayFormatterState::Terminal(state) => state.cursor(),
+            _ => None,
+        }
+    }
+
     pub fn apply_delta(
         &mut self,
         delta: &ReceiveDelta,
@@ -158,6 +171,10 @@ impl DisplayFormatter {
             || delta.next_sequence < self.cursor.next_sequence
         {
             return Err(DisplayUpdateError::ResetOrGap);
+        }
+
+        if matches!(&self.state, DisplayFormatterState::Terminal(_)) {
+            return self.apply_terminal_delta(delta);
         }
 
         let partial_visible = matches!(
@@ -256,6 +273,9 @@ impl DisplayFormatter {
                         );
                     }
                 }
+                DisplayFormatterState::Terminal(_) => {
+                    unreachable!("terminal deltas are handled before append-only formatting")
+                }
             }
         }
 
@@ -273,6 +293,40 @@ impl DisplayFormatter {
             remove_prefix,
             replace_tail,
             rows,
+        })
+    }
+
+    fn apply_terminal_delta(
+        &mut self,
+        delta: &ReceiveDelta,
+    ) -> Result<DisplayUpdate, DisplayUpdateError> {
+        let DisplayFormatterState::Terminal(state) = &mut self.state else {
+            unreachable!("terminal update requires terminal formatter state");
+        };
+        let update = state.apply_chunks(
+            &delta.chunks,
+            self.limits.max_rows,
+            self.limits.max_text_bytes,
+            self.limits.max_line_bytes,
+        );
+        self.limited |= state.is_limited();
+        self.cursor = ReceiveCursor {
+            stream_id: delta.stream_id,
+            next_sequence: delta.next_sequence,
+        };
+
+        Ok(DisplayUpdate {
+            generation: delta.generation,
+            remove_prefix: update.remove_prefix,
+            replace_tail: update.replace_tail,
+            rows: update
+                .rows
+                .into_iter()
+                .map(|row| FormattedRow {
+                    received_at: row.received_at,
+                    text: row.text,
+                })
+                .collect(),
         })
     }
 }
@@ -545,7 +599,8 @@ pub fn format_snapshot(
     encoding: TextEncoding,
 ) -> Vec<FormattedRow> {
     match mode {
-        ReceiveMode::Text | ReceiveMode::Terminal => format_text(snapshot, encoding),
+        ReceiveMode::Text => format_text(snapshot, encoding),
+        ReceiveMode::Terminal => DisplayFormatter::rebuild(snapshot, mode, encoding).1,
         ReceiveMode::Hex => format_hex(snapshot),
     }
 }

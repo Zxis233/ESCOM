@@ -48,6 +48,10 @@ impl EscomApp {
                     .expect("delta formatting requires an initialized formatter")
                     .apply_delta(&delta);
                 if let Ok(update) = update {
+                    self.terminal_cursor = self
+                        .display_formatter
+                        .as_ref()
+                        .and_then(DisplayFormatter::terminal_cursor);
                     self.apply_display_update(update);
                     self.last_format_started = Instant::now();
                     return;
@@ -81,7 +85,7 @@ impl EscomApp {
                     token,
                     generation,
                     rows,
-                    formatter,
+                    formatter: Box::new(formatter),
                 });
                 repaint_context.request_repaint();
             })
@@ -289,6 +293,9 @@ impl EscomApp {
         let data_font = FontId::new(self.preferences.data_font_size, data_font_family());
         let rows = Arc::clone(&self.display_rows);
         let timestamps = self.preferences.timestamps;
+        let terminal_cursor = (self.preferences.receive_mode == ReceiveMode::Terminal)
+            .then_some(self.terminal_cursor)
+            .flatten();
         let search_index = Arc::clone(&self.search_index);
         let highlight_rules = Arc::clone(&self.highlight_rules);
         let search_current = self.search_index_is_current();
@@ -357,11 +364,18 @@ impl EscomApp {
                         row_matches,
                         selected_match,
                     );
-                    ui.add(
+                    let response = ui.add(
                         egui::Label::new(layout_job)
                             .selectable(true)
                             .wrap_mode(egui::TextWrapMode::Extend),
                     );
+                    if let Some((cursor_row, cursor_col)) = terminal_cursor
+                        && cursor_row == row_index
+                    {
+                        paint_terminal_cursor(
+                            ui, &response, row, &data_font, cursor_col, timestamps,
+                        );
+                    }
                 }
             });
         });
@@ -378,6 +392,7 @@ impl EscomApp {
         self.display_rows = Arc::new(Vec::new());
         self.display_generation = generation;
         self.display_formatter = None;
+        self.terminal_cursor = None;
         self.search_token = self.search_token.wrapping_add(1);
         self.search_pending = false;
         self.search_wait_for_debounce = false;
@@ -436,6 +451,35 @@ impl EscomApp {
             .map(|store| store.bytes_len())
             .unwrap_or(0)
     }
+}
+
+fn paint_terminal_cursor(
+    ui: &mut egui::Ui,
+    response: &egui::Response,
+    row: &FormattedRow,
+    font: &FontId,
+    column: usize,
+    timestamps: bool,
+) {
+    let timestamp_prefix =
+        timestamps.then(|| format!("[{}] ", row.received_at.format("%Y-%m-%d %H:%M:%S%.3f")));
+    let (prefix_width, cell_width) = ui.fonts_mut(|fonts| {
+        let prefix_width = timestamp_prefix.as_ref().map_or(0.0, |prefix| {
+            fonts
+                .layout_no_wrap(prefix.clone(), font.clone(), Color32::WHITE)
+                .size()
+                .x
+        });
+        (prefix_width, fonts.glyph_width(font, 'M').max(1.0))
+    });
+    let x = response.rect.left() + prefix_width + column as f32 * cell_width;
+    let cursor_height = ui.fonts_mut(|fonts| fonts.row_height(font)).max(1.0);
+    let top = response.rect.center().y - cursor_height * 0.5;
+    ui.painter().vline(
+        x,
+        top..=top + cursor_height,
+        egui::Stroke::new(1.5, ui.visuals().strong_text_color()),
+    );
 }
 
 pub(super) fn receive_row_layout_job(

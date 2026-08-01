@@ -106,7 +106,7 @@ enum BackgroundEvent {
         token: u64,
         generation: u64,
         rows: Vec<FormattedRow>,
-        formatter: DisplayFormatter,
+        formatter: Box<DisplayFormatter>,
     },
     Searched {
         token: u64,
@@ -145,6 +145,7 @@ pub struct EscomApp {
     display_rows: Arc<Vec<FormattedRow>>,
     display_generation: u64,
     display_formatter: Option<DisplayFormatter>,
+    terminal_cursor: Option<(usize, usize)>,
     format_token: u64,
     format_in_progress: bool,
     export_in_progress: bool,
@@ -271,6 +272,7 @@ impl EscomApp {
             display_rows: Arc::new(Vec::new()),
             display_generation: u64::MAX,
             display_formatter: None,
+            terminal_cursor: None,
             format_token: 0,
             format_in_progress: false,
             export_in_progress: false,
@@ -385,9 +387,10 @@ impl EscomApp {
                 } => {
                     self.format_in_progress = false;
                     if token == self.format_token && !self.paused {
+                        self.terminal_cursor = formatter.terminal_cursor();
                         self.display_rows = Arc::new(rows);
                         self.display_generation = generation;
-                        self.display_formatter = Some(formatter);
+                        self.display_formatter = Some(*formatter);
                         self.force_format = false;
                         self.request_search_for_display();
                     } else {

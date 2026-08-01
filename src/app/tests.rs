@@ -177,7 +177,19 @@ fn terminal_special_and_control_keys_map_to_serial_bytes() {
         key_event(egui::Key::C, egui::Modifiers::CTRL),
     ];
     let bytes = terminal_bytes_from_events(&events, TextEncoding::Utf8, LineEnding::CrLf).unwrap();
-    assert_eq!(bytes, b"\r\n\x08\x1B[A\x03");
+    assert_eq!(bytes, b"\r\x08\x1B[A\x03");
+}
+
+#[test]
+fn terminal_navigation_keys_use_rt_thread_compatible_sequences() {
+    let events = [
+        key_event(egui::Key::Home, egui::Modifiers::NONE),
+        key_event(egui::Key::End, egui::Modifiers::NONE),
+        key_event(egui::Key::Delete, egui::Modifiers::NONE),
+    ];
+
+    let bytes = terminal_bytes_from_events(&events, TextEncoding::Utf8, LineEnding::CrLf).unwrap();
+    assert_eq!(bytes, b"\x1B[1~\x1B[4~\x1B[3~");
 }
 
 #[test]
