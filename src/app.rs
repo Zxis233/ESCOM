@@ -43,6 +43,7 @@ const SETTINGS_LABEL_WIDTH: f32 = 76.0;
 const SETTINGS_WINDOW_WIDTH: f32 = 660.0;
 const SETTINGS_WINDOW_HEIGHT: f32 = 454.0;
 const SETTINGS_VIEWPORT_MARGIN: f32 = 16.0;
+const THEME_ICON_SIZE: f32 = 17.0;
 const SEND_EDITOR_LIGHT_ALPHA: u8 = 120;
 const SEND_EDITOR_DARK_ALPHA: u8 = 104;
 const COMMON_BAUD_RATES: [u32; 18] = [
@@ -1937,63 +1938,72 @@ impl EscomApp {
         let context = root_ui.ctx().clone();
         let mut theme_preference = self.preferences.theme_preference;
         let mut theme_changed = false;
-        let control_height = toolbar_control_height(root_ui);
+        let control_height = status_control_height(root_ui);
         let panel_frame = egui::Frame::side_top_panel(root_ui.style())
             .fill(self.surface_fill(root_ui.visuals().panel_fill, 210));
+        let panel_height = framed_control_height(control_height, &panel_frame);
         egui::Panel::bottom("status_panel")
             .resizable(false)
-            .exact_size(control_height)
+            .exact_size(panel_height)
             .frame(panel_frame)
             .show(root_ui, |ui| {
                 ui.spacing_mut().interact_size.y = control_height;
-                egui::containers::Sides::new().shrink_left().show(
-                    ui,
-                    |ui| {
-                        let (status, color) = match &self.connection {
-                            ConnectionState::Disconnected => ("未连接".to_owned(), Color32::GRAY),
-                            ConnectionState::Connecting => ("正在连接".to_owned(), Color32::YELLOW),
-                            ConnectionState::Connected(port) => {
-                                (format!("已连接 {port}"), Color32::from_rgb(40, 170, 90))
-                            }
-                        };
-                        ui.label(RichText::new("●").color(color));
-                        ui.label(status);
-                        toolbar_separator(ui);
-                        ui.label(format!("RX {} B", self.worker.stats.rx_bytes()));
-                        ui.label(format!("TX {} B", self.worker.stats.tx_bytes()));
-
-                        let (bytes_len, dropped) = self.store_status();
-                        toolbar_separator(ui);
-                        ui.label(format!("缓存 {}", human_bytes(bytes_len as u64)));
-                        if dropped > 0 {
-                            ui.label(
-                                RichText::new(format!("已淘汰 {}", human_bytes(dropped)))
-                                    .color(Color32::YELLOW),
-                            );
-                        }
-                        if self.format_in_progress {
-                            ui.label("正在整理显示...");
-                        }
-
-                        if let Some(notice) = &self.notice
-                            && Instant::now() < notice.expires_at
-                        {
-                            toolbar_separator(ui);
-                            let color = if notice.error {
-                                ui.visuals().error_fg_color
-                            } else {
-                                ui.visuals().text_color()
+                egui::containers::Sides::new()
+                    .height(control_height)
+                    .shrink_left()
+                    .truncate()
+                    .show(
+                        ui,
+                        |ui| {
+                            let (status, color) = match &self.connection {
+                                ConnectionState::Disconnected => {
+                                    ("未连接".to_owned(), Color32::GRAY)
+                                }
+                                ConnectionState::Connecting => {
+                                    ("正在连接".to_owned(), Color32::YELLOW)
+                                }
+                                ConnectionState::Connected(port) => {
+                                    (format!("已连接 {port}"), Color32::from_rgb(40, 170, 90))
+                                }
                             };
-                            ui.label(RichText::new(&notice.message).color(color));
-                            context.request_repaint_after(
-                                notice.expires_at.saturating_duration_since(Instant::now()),
-                            );
-                        }
-                    },
-                    |ui| {
-                        theme_changed = show_theme_menu(ui, &mut theme_preference);
-                    },
-                );
+                            ui.label(RichText::new("●").color(color));
+                            ui.label(status);
+                            toolbar_separator(ui);
+                            ui.label(format!("RX {} B", self.worker.stats.rx_bytes()));
+                            ui.label(format!("TX {} B", self.worker.stats.tx_bytes()));
+
+                            let (bytes_len, dropped) = self.store_status();
+                            toolbar_separator(ui);
+                            ui.label(format!("缓存 {}", human_bytes(bytes_len as u64)));
+                            if dropped > 0 {
+                                ui.label(
+                                    RichText::new(format!("已淘汰 {}", human_bytes(dropped)))
+                                        .color(Color32::YELLOW),
+                                );
+                            }
+                            if self.format_in_progress {
+                                ui.label("正在整理显示...");
+                            }
+
+                            if let Some(notice) = &self.notice
+                                && Instant::now() < notice.expires_at
+                            {
+                                toolbar_separator(ui);
+                                let color = if notice.error {
+                                    ui.visuals().error_fg_color
+                                } else {
+                                    ui.visuals().text_color()
+                                };
+                                ui.label(RichText::new(&notice.message).color(color));
+                                context.request_repaint_after(
+                                    notice.expires_at.saturating_duration_since(Instant::now()),
+                                );
+                            }
+                        },
+                        |ui| {
+                            theme_changed = show_theme_menu(ui, &mut theme_preference);
+                        },
+                    );
             });
         if theme_changed {
             self.preferences.theme_preference = theme_preference;
@@ -2886,6 +2896,26 @@ fn toolbar_control_height_from_metrics(text_height: f32, vertical_padding: f32) 
         .max(MIN_CONTROL_HEIGHT)
 }
 
+fn status_control_height(ui: &mut egui::Ui) -> f32 {
+    let text_font = egui::TextStyle::Button.resolve(ui.style());
+    let icon_font = FontId::proportional(THEME_ICON_SIZE);
+    let (text_height, icon_height) =
+        ui.fonts_mut(|fonts| (fonts.row_height(&text_font), fonts.row_height(&icon_font)));
+    status_control_height_from_metrics(text_height, icon_height, ui.spacing().button_padding.y)
+}
+
+fn status_control_height_from_metrics(
+    text_height: f32,
+    icon_height: f32,
+    vertical_padding: f32,
+) -> f32 {
+    toolbar_control_height_from_metrics(text_height.max(icon_height), vertical_padding)
+}
+
+fn framed_control_height(control_height: f32, frame: &egui::Frame) -> f32 {
+    (control_height + frame.total_margin().sum().y).ceil()
+}
+
 fn styled_text_width(ui: &mut egui::Ui, text: &str, style: egui::TextStyle) -> f32 {
     let font_id = style.resolve(ui.style());
     ui.fonts_mut(|fonts| {
@@ -3314,7 +3344,7 @@ fn show_theme_menu(ui: &mut egui::Ui, theme_preference: &mut egui::ThemePreferen
     let mut changed = false;
     let response = ui
         .menu_button(
-            RichText::new(theme_preference_icon(current)).size(17.0),
+            RichText::new(theme_preference_icon(current)).size(THEME_ICON_SIZE),
             |ui| {
                 ui.set_min_width(132.0);
                 for (preference, label) in [
@@ -3447,6 +3477,15 @@ mod tests {
     fn toolbar_control_height_expands_with_large_text_metrics() {
         assert_eq!(toolbar_control_height_from_metrics(13.0, 3.0), 32.0);
         assert_eq!(toolbar_control_height_from_metrics(50.0, 4.0), 58.0);
+    }
+
+    #[test]
+    fn status_panel_height_covers_icon_and_frame_margins() {
+        let control_height = status_control_height_from_metrics(13.0, 21.0, 6.0);
+        let frame = egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 2));
+
+        assert_eq!(control_height, 33.0);
+        assert_eq!(framed_control_height(control_height, &frame), 37.0);
     }
 
     #[test]
