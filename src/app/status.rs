@@ -50,6 +50,17 @@ impl EscomApp {
                                         .color(Color32::YELLOW),
                                 );
                             }
+                            if self
+                                .display_formatter
+                                .as_ref()
+                                .is_some_and(DisplayFormatter::is_limited)
+                            {
+                                ui.label(RichText::new("显示窗口已截断").color(Color32::YELLOW))
+                                    .on_hover_text(format!(
+                                        "当前显示最多保留最近 {MAX_DISPLAY_ROWS} 行或 {} 文本；原始接收缓存和导出不受影响",
+                                        human_bytes(MAX_DISPLAY_TEXT_BYTES as u64)
+                                    ));
+                            }
                             if self.format_in_progress {
                                 ui.label("正在整理显示...");
                             }

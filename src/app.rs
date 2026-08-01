@@ -11,7 +11,8 @@ use serialport::{DataBits, FlowControl, Parity, StopBits};
 
 use crate::fonts::{FontCatalog, data_font_family};
 use crate::formatting::{
-    DisplayFormatter, DisplayUpdate, FormattedRow, display_text, encode_text, format_snapshot,
+    DisplayFormatter, DisplayUpdate, FormattedRow, MAX_DISPLAY_INCREMENT_BYTES, MAX_DISPLAY_ROWS,
+    MAX_DISPLAY_TEXT_BYTES, display_snapshot_limit, display_text, encode_text, format_snapshot,
     parse_send_input, render_export,
 };
 use crate::highlight::{self, HighlightRules, HighlightStyle};

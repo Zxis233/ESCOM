@@ -18,6 +18,7 @@ pub struct ReceiveSnapshot {
     pub next_sequence: u64,
     pub chunks: Vec<RxChunk>,
     pub bytes_len: usize,
+    pub omitted_bytes: usize,
     pub dropped_bytes: u64,
 }
 
@@ -115,16 +116,63 @@ impl ReceiveStore {
             next_sequence: self.next_sequence,
             chunks: self.chunks.iter().cloned().collect(),
             bytes_len: self.bytes_len,
+            omitted_bytes: 0,
+            dropped_bytes: self.dropped_bytes,
+        }
+    }
+
+    pub fn tail_snapshot(&self, max_bytes: usize) -> ReceiveSnapshot {
+        if self.bytes_len <= max_bytes {
+            return self.snapshot();
+        }
+
+        let mut remaining = max_bytes;
+        let mut chunks = Vec::new();
+        for chunk in self.chunks.iter().rev() {
+            if remaining == 0 {
+                break;
+            }
+            let take = chunk.bytes.len().min(remaining);
+            let bytes = if take == chunk.bytes.len() {
+                Arc::clone(&chunk.bytes)
+            } else {
+                Arc::from(&chunk.bytes[chunk.bytes.len() - take..])
+            };
+            chunks.push(RxChunk {
+                sequence: chunk.sequence,
+                received_at: chunk.received_at,
+                bytes,
+            });
+            remaining -= take;
+        }
+        chunks.reverse();
+
+        let bytes_len = max_bytes - remaining;
+        let first_sequence = chunks
+            .first()
+            .map_or(self.next_sequence, |chunk| chunk.sequence);
+        ReceiveSnapshot {
+            generation: self.generation,
+            stream_id: self.stream_id,
+            first_sequence,
+            next_sequence: self.next_sequence,
+            chunks,
+            bytes_len,
+            omitted_bytes: self.bytes_len.saturating_sub(bytes_len),
             dropped_bytes: self.dropped_bytes,
         }
     }
 
     pub fn delta_since(&self, cursor: ReceiveCursor) -> ReceiveDelta {
+        self.delta_since_bounded(cursor, usize::MAX)
+    }
+
+    pub fn delta_since_bounded(&self, cursor: ReceiveCursor, max_bytes: usize) -> ReceiveDelta {
         let first_sequence = self
             .chunks
             .front()
             .map_or(self.next_sequence, |chunk| chunk.sequence);
-        let reset_or_gap = cursor.stream_id != self.stream_id
+        let mut reset_or_gap = cursor.stream_id != self.stream_id
             || cursor.next_sequence < first_sequence
             || cursor.next_sequence > self.next_sequence;
         let chunks = if reset_or_gap {
@@ -132,10 +180,20 @@ impl ReceiveStore {
         } else {
             let start =
                 usize::try_from(cursor.next_sequence - first_sequence).unwrap_or(self.chunks.len());
-            self.chunks
-                .range(start.min(self.chunks.len())..)
-                .cloned()
-                .collect()
+            let start = start.min(self.chunks.len());
+            let mut bytes_len = 0_usize;
+            for chunk in self.chunks.range(start..) {
+                bytes_len = bytes_len.saturating_add(chunk.bytes.len());
+                if bytes_len > max_bytes {
+                    reset_or_gap = true;
+                    break;
+                }
+            }
+            if reset_or_gap {
+                Vec::new()
+            } else {
+                self.chunks.range(start..).cloned().collect()
+            }
         };
 
         ReceiveDelta {
@@ -233,5 +291,38 @@ mod tests {
         });
         assert!(delta.reset_or_gap);
         assert_ne!(delta.stream_id, snapshot.stream_id);
+    }
+
+    #[test]
+    fn tail_snapshot_retains_only_the_latest_bytes() {
+        let mut store = ReceiveStore::new(1024);
+        store.append(Local::now(), vec![1, 2, 3]);
+        store.append(Local::now(), vec![4, 5, 6]);
+
+        let snapshot = store.tail_snapshot(4);
+
+        assert_eq!(snapshot.bytes_len, 4);
+        assert_eq!(snapshot.omitted_bytes, 2);
+        assert_eq!(snapshot.first_sequence, 0);
+        assert_eq!(snapshot.next_sequence, 2);
+        assert_eq!(&*snapshot.chunks[0].bytes, &[3]);
+        assert_eq!(&*snapshot.chunks[1].bytes, &[4, 5, 6]);
+    }
+
+    #[test]
+    fn bounded_delta_rejects_an_excessive_backlog_without_cloning_it() {
+        let mut store = ReceiveStore::new(1024);
+        let cursor = ReceiveCursor {
+            stream_id: 0,
+            next_sequence: 0,
+        };
+        store.append(Local::now(), vec![1, 2, 3]);
+        store.append(Local::now(), vec![4, 5, 6]);
+
+        let delta = store.delta_since_bounded(cursor, 5);
+
+        assert!(delta.reset_or_gap);
+        assert!(delta.chunks.is_empty());
+        assert_eq!(delta.next_sequence, 2);
     }
 }

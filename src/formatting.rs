@@ -7,6 +7,33 @@ use encoding_rs::{CoderResult, GBK, UTF_8};
 use crate::model::{LineEnding, ReceiveMode, SendMode, TextEncoding};
 use crate::store::{ReceiveCursor, ReceiveDelta, ReceiveSnapshot, RxChunk};
 
+pub const MAX_DISPLAY_ROWS: usize = 100_000;
+pub const MAX_DISPLAY_TEXT_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_DISPLAY_LINE_BYTES: usize = 512 * 1024;
+pub const MAX_DISPLAY_INCREMENT_BYTES: usize = 128 * 1024;
+const MAX_TEXT_REBUILD_BYTES: usize = 16 * 1024 * 1024;
+const HEX_BYTES_PER_ROW: usize = 16;
+
+pub const fn display_snapshot_limit(mode: ReceiveMode) -> usize {
+    match mode {
+        ReceiveMode::Text | ReceiveMode::Terminal => MAX_TEXT_REBUILD_BYTES,
+        ReceiveMode::Hex => MAX_DISPLAY_ROWS * HEX_BYTES_PER_ROW,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DisplayLimits {
+    max_rows: usize,
+    max_text_bytes: usize,
+    max_line_bytes: usize,
+}
+
+const DEFAULT_DISPLAY_LIMITS: DisplayLimits = DisplayLimits {
+    max_rows: MAX_DISPLAY_ROWS,
+    max_text_bytes: MAX_DISPLAY_TEXT_BYTES,
+    max_line_bytes: MAX_DISPLAY_LINE_BYTES,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormattedRow {
     pub received_at: DateTime<Local>,
@@ -31,6 +58,10 @@ pub struct DisplayFormatter {
     encoding: TextEncoding,
     cursor: ReceiveCursor,
     row_end_sequences: VecDeque<u64>,
+    row_text_bytes: VecDeque<usize>,
+    text_bytes: usize,
+    limited: bool,
+    limits: DisplayLimits,
     state: DisplayFormatterState,
 }
 
@@ -46,6 +77,8 @@ struct IncrementalTextFormatter {
     current_end_sequence: Option<u64>,
     skip_lf_after_cr: bool,
     partial_visible: bool,
+    max_line_bytes: usize,
+    line_limited: bool,
 }
 
 impl DisplayFormatter {
@@ -54,10 +87,19 @@ impl DisplayFormatter {
         mode: ReceiveMode,
         encoding: TextEncoding,
     ) -> (Self, Vec<FormattedRow>) {
+        Self::rebuild_with_limits(snapshot, mode, encoding, DEFAULT_DISPLAY_LIMITS)
+    }
+
+    fn rebuild_with_limits(
+        snapshot: &ReceiveSnapshot,
+        mode: ReceiveMode,
+        encoding: TextEncoding,
+        limits: DisplayLimits,
+    ) -> (Self, Vec<FormattedRow>) {
         let state = match mode {
-            ReceiveMode::Text | ReceiveMode::Terminal => {
-                DisplayFormatterState::Text(IncrementalTextFormatter::new(encoding))
-            }
+            ReceiveMode::Text | ReceiveMode::Terminal => DisplayFormatterState::Text(
+                IncrementalTextFormatter::new(encoding, limits.max_line_bytes),
+            ),
             ReceiveMode::Hex => DisplayFormatterState::Hex,
         };
         let mut formatter = Self {
@@ -68,6 +110,10 @@ impl DisplayFormatter {
                 next_sequence: snapshot.first_sequence,
             },
             row_end_sequences: VecDeque::new(),
+            row_text_bytes: VecDeque::new(),
+            text_bytes: 0,
+            limited: snapshot.omitted_bytes != 0,
+            limits,
             state,
         };
         let delta = ReceiveDelta {
@@ -90,6 +136,10 @@ impl DisplayFormatter {
 
     pub fn is_compatible(&self, mode: ReceiveMode, encoding: TextEncoding) -> bool {
         self.mode == mode && self.encoding == encoding
+    }
+
+    pub const fn is_limited(&self) -> bool {
+        self.limited
     }
 
     pub fn apply_delta(
@@ -119,33 +169,93 @@ impl DisplayFormatter {
                 .is_some_and(|sequence| *sequence < delta.first_sequence)
         {
             self.row_end_sequences.pop_front();
+            if let Some(bytes) = self.row_text_bytes.pop_front() {
+                self.text_bytes = self.text_bytes.saturating_sub(bytes);
+            }
             remove_prefix += 1;
         }
 
         let replace_tail = usize::from(partial_visible && !delta.chunks.is_empty());
         if replace_tail != 0 {
             self.row_end_sequences.pop_back();
+            if let Some(bytes) = self.row_text_bytes.pop_back() {
+                self.text_bytes = self.text_bytes.saturating_sub(bytes);
+            }
             if let DisplayFormatterState::Text(state) = &mut self.state {
                 state.partial_visible = false;
             }
         }
 
+        let mut retained_existing = self.row_end_sequences.len();
+        let mut cap_removed_existing = 0;
+        let mut removed_new_rows = 0;
         let mut rows = Vec::new();
         if !delta.chunks.is_empty() {
-            match &mut self.state {
+            let Self {
+                state,
+                row_end_sequences,
+                row_text_bytes,
+                text_bytes,
+                limited,
+                limits,
+                ..
+            } = self;
+            match state {
                 DisplayFormatterState::Text(state) => {
                     for chunk in &delta.chunks {
-                        state.push_chunk(chunk, &mut rows, &mut self.row_end_sequences);
+                        let new_rows_start = rows.len();
+                        state.push_chunk(chunk, &mut rows, row_end_sequences);
+                        *limited |= state.line_limited;
+                        register_new_rows(&rows[new_rows_start..], row_text_bytes, text_bytes);
+                        enforce_display_limits(
+                            &mut retained_existing,
+                            &mut cap_removed_existing,
+                            &mut removed_new_rows,
+                            row_end_sequences,
+                            row_text_bytes,
+                            text_bytes,
+                            limited,
+                            *limits,
+                        );
                     }
-                    state.push_partial_row(&mut rows, &mut self.row_end_sequences);
+                    let new_rows_start = rows.len();
+                    state.push_partial_row(&mut rows, row_end_sequences);
+                    register_new_rows(&rows[new_rows_start..], row_text_bytes, text_bytes);
+                    enforce_display_limits(
+                        &mut retained_existing,
+                        &mut cap_removed_existing,
+                        &mut removed_new_rows,
+                        row_end_sequences,
+                        row_text_bytes,
+                        text_bytes,
+                        limited,
+                        *limits,
+                    );
                 }
                 DisplayFormatterState::Hex => {
                     for chunk in &delta.chunks {
-                        push_hex_chunk(chunk, &mut rows, &mut self.row_end_sequences);
+                        let new_rows_start = rows.len();
+                        push_hex_chunk(chunk, &mut rows, row_end_sequences);
+                        register_new_rows(&rows[new_rows_start..], row_text_bytes, text_bytes);
+                        enforce_display_limits(
+                            &mut retained_existing,
+                            &mut cap_removed_existing,
+                            &mut removed_new_rows,
+                            row_end_sequences,
+                            row_text_bytes,
+                            text_bytes,
+                            limited,
+                            *limits,
+                        );
                     }
                 }
             }
         }
+
+        if removed_new_rows != 0 {
+            rows.drain(..removed_new_rows.min(rows.len()));
+        }
+        remove_prefix += cap_removed_existing;
 
         self.cursor = ReceiveCursor {
             stream_id: delta.stream_id,
@@ -160,8 +270,47 @@ impl DisplayFormatter {
     }
 }
 
+fn register_new_rows(
+    rows: &[FormattedRow],
+    row_text_bytes: &mut VecDeque<usize>,
+    text_bytes: &mut usize,
+) {
+    for row in rows {
+        let bytes = row.text.len();
+        row_text_bytes.push_back(bytes);
+        *text_bytes = text_bytes.saturating_add(bytes);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enforce_display_limits(
+    retained_existing: &mut usize,
+    removed_existing: &mut usize,
+    removed_new: &mut usize,
+    row_end_sequences: &mut VecDeque<u64>,
+    row_text_bytes: &mut VecDeque<usize>,
+    text_bytes: &mut usize,
+    limited: &mut bool,
+    limits: DisplayLimits,
+) {
+    while row_text_bytes.len() > limits.max_rows || *text_bytes > limits.max_text_bytes {
+        let Some(bytes) = row_text_bytes.pop_front() else {
+            break;
+        };
+        row_end_sequences.pop_front();
+        *text_bytes = text_bytes.saturating_sub(bytes);
+        if *retained_existing != 0 {
+            *retained_existing -= 1;
+            *removed_existing += 1;
+        } else {
+            *removed_new += 1;
+        }
+        *limited = true;
+    }
+}
+
 impl IncrementalTextFormatter {
-    fn new(encoding: TextEncoding) -> Self {
+    fn new(encoding: TextEncoding, max_line_bytes: usize) -> Self {
         let selected_encoding = match encoding {
             TextEncoding::Utf8 => UTF_8,
             TextEncoding::Gbk => GBK,
@@ -173,6 +322,8 @@ impl IncrementalTextFormatter {
             current_end_sequence: None,
             skip_lf_after_cr: false,
             partial_visible: false,
+            max_line_bytes: max_line_bytes.max(16),
+            line_limited: false,
         }
     }
 
@@ -237,6 +388,23 @@ impl IncrementalTextFormatter {
                 }
             }
         }
+        self.trim_current_line(received_at);
+    }
+
+    fn trim_current_line(&mut self, received_at: DateTime<Local>) {
+        if self.current.len() <= self.max_line_bytes {
+            return;
+        }
+
+        let retain_bytes = (self.max_line_bytes / 2).max(1);
+        let mut retain_from = self.current.len().saturating_sub(retain_bytes);
+        while retain_from < self.current.len() && !self.current.is_char_boundary(retain_from) {
+            retain_from += 1;
+        }
+        self.current.drain(..retain_from);
+        self.current.insert(0, '…');
+        self.line_started_at = Some(received_at);
+        self.line_limited = true;
     }
 
     fn push_completed_row(
@@ -734,6 +902,128 @@ mod tests {
         apply_display_update(&mut rows, formatter.apply_delta(&delta).unwrap());
         assert_eq!(rows[0].text, "中");
         assert_eq!(rows[0].received_at, timestamp(1));
+    }
+
+    #[test]
+    fn display_formatter_limits_rows_during_rebuild() {
+        let mut store = ReceiveStore::new(1024);
+        for (index, row) in [b"a\n", b"b\n", b"c\n", b"d\n"].into_iter().enumerate() {
+            store.append(timestamp(index as u32 + 1), row.to_vec());
+        }
+        let limits = DisplayLimits {
+            max_rows: 3,
+            max_text_bytes: 1024,
+            max_line_bytes: 128,
+        };
+
+        let (formatter, rows) = DisplayFormatter::rebuild_with_limits(
+            &store.snapshot(),
+            ReceiveMode::Text,
+            TextEncoding::Utf8,
+            limits,
+        );
+
+        assert!(formatter.is_limited());
+        assert_eq!(
+            rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+            ["b", "c", "d"]
+        );
+    }
+
+    #[test]
+    fn display_formatter_limits_total_text_bytes() {
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), b"aaaa\nbbbb\n".to_vec());
+        let limits = DisplayLimits {
+            max_rows: 10,
+            max_text_bytes: 6,
+            max_line_bytes: 128,
+        };
+
+        let (formatter, rows) = DisplayFormatter::rebuild_with_limits(
+            &store.snapshot(),
+            ReceiveMode::Text,
+            TextEncoding::Utf8,
+            limits,
+        );
+
+        assert!(formatter.is_limited());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "bbbb");
+    }
+
+    #[test]
+    fn display_formatter_bounds_a_line_without_newlines() {
+        let mut store = ReceiveStore::new(1024);
+        store.append(
+            timestamp(1),
+            b"0123456789abcdefghijklmnopqrstuvwxyz".to_vec(),
+        );
+        let limits = DisplayLimits {
+            max_rows: 10,
+            max_text_bytes: 1024,
+            max_line_bytes: 16,
+        };
+
+        let (formatter, rows) = DisplayFormatter::rebuild_with_limits(
+            &store.snapshot(),
+            ReceiveMode::Text,
+            TextEncoding::Utf8,
+            limits,
+        );
+
+        assert!(formatter.is_limited());
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].text.starts_with('…'));
+        assert!(rows[0].text.len() <= 16);
+        assert!(rows[0].text.ends_with("stuvwxyz"));
+    }
+
+    #[test]
+    fn incremental_display_limit_prunes_existing_rows() {
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), b"a\nb\nc\n".to_vec());
+        let limits = DisplayLimits {
+            max_rows: 3,
+            max_text_bytes: 1024,
+            max_line_bytes: 128,
+        };
+        let (mut formatter, mut rows) = DisplayFormatter::rebuild_with_limits(
+            &store.snapshot(),
+            ReceiveMode::Text,
+            TextEncoding::Utf8,
+            limits,
+        );
+
+        store.append(timestamp(2), b"d\n".to_vec());
+        let update = formatter
+            .apply_delta(&store.delta_since(formatter.cursor()))
+            .unwrap();
+        assert_eq!(update.remove_prefix, 1);
+        apply_display_update(&mut rows, update);
+
+        assert!(formatter.is_limited());
+        assert_eq!(
+            rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+            ["b", "c", "d"]
+        );
+    }
+
+    #[test]
+    fn default_hex_display_window_never_exceeds_the_row_limit() {
+        let mut store = ReceiveStore::new(4 * 1024 * 1024);
+        store.append(
+            timestamp(1),
+            vec![0xA5; (MAX_DISPLAY_ROWS + 128) * HEX_BYTES_PER_ROW],
+        );
+        let snapshot = store.tail_snapshot(display_snapshot_limit(ReceiveMode::Hex));
+
+        let (formatter, rows) =
+            DisplayFormatter::rebuild(&snapshot, ReceiveMode::Hex, TextEncoding::Utf8);
+
+        assert!(formatter.is_limited());
+        assert_eq!(rows.len(), MAX_DISPLAY_ROWS);
+        assert!(rows.iter().map(|row| row.text.len()).sum::<usize>() <= MAX_DISPLAY_TEXT_BYTES);
     }
 
     #[test]

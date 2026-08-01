@@ -316,7 +316,7 @@ impl EscomApp {
         settings_card(
             ui,
             "显示缓存",
-            "限制接收缓存占用，达到上限后自动淘汰最早的数据。",
+            "限制原始接收缓存占用；显示区会独立保留最近内容，导出仍使用完整缓存。",
             |ui| {
                 egui::Grid::new("buffer_settings_grid")
                     .num_columns(2)

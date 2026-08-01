@@ -4,8 +4,7 @@
 
 **优先级建议**
 
-- **高：500 MiB 缓存仍会被完整物化为显示行。** `show_rows` 只虚拟化绘制，`Vec<FormattedRow>` 仍包含全部数据；HEX 模式每 16 字节创建一行，内存可能远超原始缓存。[app.rs:1589](D:/ESCOM/src/app.rs:1589) [formatting.rs:367](D:/ESCOM/src/formatting.rs:367)  
-  建议改为“原始块 + 行索引 + 可见区域懒解码”，或为显示区增加独立上限。
+- **已解决（原高）：500 MiB 缓存不会再被完整物化为显示行。** 原始缓存容量保持不变；显示重建只读取尾部窗口，并限制为最多 100,000 行、16 MiB 文本和 512 KiB 单行。超过 128 KiB 的增量积压会转为后台尾部重建，避免阻塞 UI 线程。[receive.rs](D:/ESCOM/src/app/receive.rs) [formatting.rs](D:/ESCOM/src/formatting.rs) [store.rs](D:/ESCOM/src/store.rs)
 
 - **高：导出存在很高的瞬时内存峰值。** 当前流程同时保留原始快照、格式化行、完整 `String` 和完整输出 `Vec<u8>`。[app.rs:2670](D:/ESCOM/src/app.rs:2670) [formatting.rs:378](D:/ESCOM/src/formatting.rs:378)  
   建议直接使用 `BufWriter` 流式解码和写文件。

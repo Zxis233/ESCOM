@@ -36,7 +36,7 @@ impl EscomApp {
                 .store
                 .lock()
                 .ok()
-                .map(|store| store.delta_since(cursor));
+                .map(|store| store.delta_since_bounded(cursor, MAX_DISPLAY_INCREMENT_BYTES));
             let Some(delta) = delta else {
                 self.set_notice("接收缓存不可用", true);
                 return;
@@ -56,7 +56,11 @@ impl EscomApp {
             self.force_format = true;
         }
 
-        let snapshot = self.store.lock().ok().map(|store| store.snapshot());
+        let snapshot = self
+            .store
+            .lock()
+            .ok()
+            .map(|store| store.tail_snapshot(display_snapshot_limit(mode)));
         let Some(snapshot) = snapshot else {
             self.set_notice("接收缓存不可用", true);
             return;
