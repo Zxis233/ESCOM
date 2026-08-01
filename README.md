@@ -127,9 +127,48 @@ ESCOM 的本地文件保存在 `%APPDATA%\ESCOM\`：
 
 | 文件 | 用途 |
 | --- | --- |
-| `settings.json` | 界面、显示、主题和背景偏好 |
+| `settings.toml` | 界面、字体、收发显示和背景偏好 |
 | `highlight.toml` | 接收内容高亮规则 |
 | `window.ron` | 窗口位置与尺寸 |
+
+`settings.toml` 按功能分组，首次启动时会自动创建。建议关闭 ESCOM 后再手动修改，重新启动后生效：
+
+```toml
+schema_version = 6
+
+[interface]
+theme = "system" # system、light 或 dark
+
+[fonts]
+ui_family = "" # 留空表示自动选择
+data_family = ""
+ui_weight = 400 # 1-1000
+data_weight = 400
+ui_size = 15.0 # 10-18
+data_size = 15.0 # 10-48
+data_line_spacing = 3.0 # 0-24
+
+[receive]
+mode = "text" # text、hex 或 terminal
+encoding = "utf8" # utf8 或 gbk
+timestamps = false
+auto_scroll = true
+buffer_limit_mib = 20 # 5、20、100 或 500
+
+[send]
+mode = "text" # text 或 hex
+line_ending = "crlf" # none、cr、lf 或 crlf
+repeat_interval_ms = 1000 # 20-3600000
+
+[background]
+source = "none" # none、local 或 online
+local_path = ""
+online_url = ""
+light_opacity = 0.22 # 0.0-1.0
+dark_opacity = 0.16 # 0.0-1.0
+```
+
+配置中的字段可以省略，缺失字段会使用默认值。字段名或枚举值无效时，应用启动后会显示错误提示。旧版 `settings.json` 会在首次启动新版时自动迁移，成功后归档为 `settings.json.migrated.bak`。
 
 - 应用不会持久化串口参数、发送内容、发送历史或接收数据。
 - 应用启动时不会自动连接串口。

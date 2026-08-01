@@ -178,7 +178,7 @@ pub struct EscomApp {
 
 impl EscomApp {
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
-        let mut preferences = settings::load();
+        let (mut preferences, settings_warning) = settings::load();
         preferences.sanitize();
         egui_extras::install_image_loaders(&creation_context.egui_ctx);
         creation_context
@@ -220,6 +220,9 @@ impl EscomApp {
             Err(error) => (HighlightRules::empty(highlight_path), Some(error)),
         };
         let mut startup_warnings = applied_fonts.warnings.clone();
+        if let Some(error) = settings_warning {
+            startup_warnings.push(error);
+        }
         if let Some(error) = &highlight_config_error {
             startup_warnings.push(error.clone());
         }

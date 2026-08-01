@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::fonts::DEFAULT_FONT_WEIGHT;
 use crate::model::{LineEnding, ReceiveMode, SendMode, TextEncoding};
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 5;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 6;
+pub const SETTINGS_FILE_NAME: &str = "settings.toml";
+const LEGACY_SETTINGS_FILE_NAME: &str = "settings.json";
 pub const BUFFER_LIMIT_OPTIONS_MIB: [usize; 4] = [5, 20, 100, 500];
 pub const DEFAULT_DATA_LINE_SPACING: f32 = 3.0;
 pub const MIN_DATA_LINE_SPACING: f32 = 0.0;
@@ -138,6 +140,237 @@ fn sanitized_opacity(value: f32, fallback: f32) -> f32 {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SettingsDocument {
+    schema_version: u32,
+    interface: InterfaceSettings,
+    fonts: FontSettings,
+    receive: ReceiveSettings,
+    send: SendSettings,
+    background: BackgroundSettings,
+}
+
+impl Default for SettingsDocument {
+    fn default() -> Self {
+        Self::from(&UiPreferences::default())
+    }
+}
+
+impl From<&UiPreferences> for SettingsDocument {
+    fn from(preferences: &UiPreferences) -> Self {
+        Self {
+            schema_version: SETTINGS_SCHEMA_VERSION,
+            interface: InterfaceSettings {
+                theme: preferences.theme_preference.into(),
+            },
+            fonts: FontSettings {
+                ui_family: preferences.ui_font_family.clone(),
+                data_family: preferences.data_font_family.clone(),
+                ui_weight: preferences.ui_font_weight,
+                data_weight: preferences.data_font_weight,
+                ui_size: preferences.ui_font_size,
+                data_size: preferences.data_font_size,
+                data_line_spacing: preferences.data_line_spacing,
+            },
+            receive: ReceiveSettings {
+                mode: preferences.receive_mode.into(),
+                encoding: preferences.text_encoding.into(),
+                timestamps: preferences.timestamps,
+                auto_scroll: preferences.auto_scroll,
+                buffer_limit_mib: preferences.buffer_limit_mib,
+            },
+            send: SendSettings {
+                mode: preferences.send_mode.into(),
+                line_ending: preferences.line_ending.into(),
+                repeat_interval_ms: preferences.repeat_interval_ms,
+            },
+            background: BackgroundSettings {
+                source: preferences.background_source.into(),
+                local_path: preferences.background_local_path.clone(),
+                online_url: preferences.background_online_url.clone(),
+                light_opacity: preferences.background_light_opacity,
+                dark_opacity: preferences.background_dark_opacity,
+            },
+        }
+    }
+}
+
+impl From<SettingsDocument> for UiPreferences {
+    fn from(settings: SettingsDocument) -> Self {
+        Self {
+            schema_version: settings.schema_version,
+            ui_font_family: settings.fonts.ui_family,
+            data_font_family: settings.fonts.data_family,
+            ui_font_weight: settings.fonts.ui_weight,
+            data_font_weight: settings.fonts.data_weight,
+            ui_font_size: settings.fonts.ui_size,
+            data_font_size: settings.fonts.data_size,
+            data_line_spacing: settings.fonts.data_line_spacing,
+            receive_mode: settings.receive.mode.into(),
+            send_mode: settings.send.mode.into(),
+            text_encoding: settings.receive.encoding.into(),
+            timestamps: settings.receive.timestamps,
+            auto_scroll: settings.receive.auto_scroll,
+            line_ending: settings.send.line_ending.into(),
+            repeat_interval_ms: settings.send.repeat_interval_ms,
+            buffer_limit_mib: settings.receive.buffer_limit_mib,
+            theme_preference: settings.interface.theme.into(),
+            background_source: settings.background.source.into(),
+            background_local_path: settings.background.local_path,
+            background_online_url: settings.background.online_url,
+            background_light_opacity: settings.background.light_opacity,
+            background_dark_opacity: settings.background.dark_opacity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct InterfaceSettings {
+    theme: ThemeValue,
+}
+
+impl Default for InterfaceSettings {
+    fn default() -> Self {
+        Self {
+            theme: ThemeValue::System,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FontSettings {
+    ui_family: String,
+    data_family: String,
+    ui_weight: u16,
+    data_weight: u16,
+    ui_size: f32,
+    data_size: f32,
+    data_line_spacing: f32,
+}
+
+impl Default for FontSettings {
+    fn default() -> Self {
+        let preferences = UiPreferences::default();
+        Self {
+            ui_family: preferences.ui_font_family,
+            data_family: preferences.data_font_family,
+            ui_weight: preferences.ui_font_weight,
+            data_weight: preferences.data_font_weight,
+            ui_size: preferences.ui_font_size,
+            data_size: preferences.data_font_size,
+            data_line_spacing: preferences.data_line_spacing,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ReceiveSettings {
+    mode: ReceiveModeValue,
+    encoding: TextEncodingValue,
+    timestamps: bool,
+    auto_scroll: bool,
+    buffer_limit_mib: usize,
+}
+
+impl Default for ReceiveSettings {
+    fn default() -> Self {
+        let preferences = UiPreferences::default();
+        Self {
+            mode: preferences.receive_mode.into(),
+            encoding: preferences.text_encoding.into(),
+            timestamps: preferences.timestamps,
+            auto_scroll: preferences.auto_scroll,
+            buffer_limit_mib: preferences.buffer_limit_mib,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SendSettings {
+    mode: SendModeValue,
+    line_ending: LineEndingValue,
+    repeat_interval_ms: u64,
+}
+
+impl Default for SendSettings {
+    fn default() -> Self {
+        let preferences = UiPreferences::default();
+        Self {
+            mode: preferences.send_mode.into(),
+            line_ending: preferences.line_ending.into(),
+            repeat_interval_ms: preferences.repeat_interval_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct BackgroundSettings {
+    source: BackgroundSourceValue,
+    local_path: String,
+    online_url: String,
+    light_opacity: f32,
+    dark_opacity: f32,
+}
+
+impl Default for BackgroundSettings {
+    fn default() -> Self {
+        let preferences = UiPreferences::default();
+        Self {
+            source: preferences.background_source.into(),
+            local_path: preferences.background_local_path,
+            online_url: preferences.background_online_url,
+            light_opacity: preferences.background_light_opacity,
+            dark_opacity: preferences.background_dark_opacity,
+        }
+    }
+}
+
+macro_rules! setting_value {
+    ($name:ident, $runtime:ty, $default:ident, { $($variant:ident),+ $(,)? }) => {
+        #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        enum $name {
+            #[default]
+            $default,
+            $($variant,)+
+        }
+
+        impl From<$runtime> for $name {
+            fn from(value: $runtime) -> Self {
+                match value {
+                    <$runtime>::$default => Self::$default,
+                    $(<$runtime>::$variant => Self::$variant,)+
+                }
+            }
+        }
+
+        impl From<$name> for $runtime {
+            fn from(value: $name) -> Self {
+                match value {
+                    $name::$default => Self::$default,
+                    $($name::$variant => Self::$variant,)+
+                }
+            }
+        }
+    };
+}
+
+setting_value!(ThemeValue, ThemePreference, System, { Light, Dark });
+setting_value!(ReceiveModeValue, ReceiveMode, Text, { Hex, Terminal });
+setting_value!(SendModeValue, SendMode, Text, { Hex });
+setting_value!(TextEncodingValue, TextEncoding, Utf8, { Gbk });
+setting_value!(LineEndingValue, LineEnding, CrLf, { None, Cr, Lf });
+setting_value!(BackgroundSourceValue, AppBackgroundSource, None, {
+    Local,
+    Online
+});
+
 pub fn settings_dir() -> PathBuf {
     BaseDirs::new()
         .map(|dirs| dirs.config_dir().join("ESCOM"))
@@ -145,7 +378,11 @@ pub fn settings_dir() -> PathBuf {
 }
 
 pub fn settings_path() -> PathBuf {
-    settings_dir().join("settings.json")
+    settings_dir().join(SETTINGS_FILE_NAME)
+}
+
+fn legacy_settings_path() -> PathBuf {
+    settings_dir().join(LEGACY_SETTINGS_FILE_NAME)
 }
 
 pub fn eframe_persistence_path() -> PathBuf {
@@ -156,9 +393,14 @@ pub fn prepare_storage() -> io::Result<()> {
     prepare_storage_at(&settings_dir())
 }
 
-pub fn load() -> UiPreferences {
-    let _ = prepare_storage();
-    load_from(&settings_path()).unwrap_or_default()
+pub fn load() -> (UiPreferences, Option<String>) {
+    if let Err(error) = prepare_storage() {
+        return (
+            UiPreferences::default(),
+            Some(format!("初始化配置目录失败：{error}")),
+        );
+    }
+    load_at(&settings_path(), &legacy_settings_path())
 }
 
 pub fn save(preferences: &UiPreferences) -> Result<(), String> {
@@ -215,22 +457,139 @@ fn recover_staged_window_state(migration_path: &Path, window_state_path: &Path) 
     Ok(())
 }
 
-fn load_from(path: &Path) -> Option<UiPreferences> {
-    let backup_path = path.with_extension("json.bak");
-    let bytes = fs::read(path).or_else(|_| fs::read(backup_path)).ok()?;
-    let mut preferences: UiPreferences = serde_json::from_slice(&bytes).ok()?;
+fn load_at(path: &Path, legacy_path: &Path) -> (UiPreferences, Option<String>) {
+    let backup_path = path.with_extension("toml.bak");
+    let mut primary_error = None;
+
+    if path.is_file() {
+        match load_toml_from(path) {
+            Ok(preferences) => return (preferences, None),
+            Err(error) => primary_error = Some(error),
+        }
+    }
+
+    if backup_path.is_file() {
+        match load_toml_from(&backup_path) {
+            Ok(preferences) => {
+                return (
+                    preferences,
+                    Some(format!(
+                        "主配置无法读取，已使用备份 {}：{}",
+                        backup_path.display(),
+                        primary_error.unwrap_or_else(|| "主配置文件不存在".to_owned())
+                    )),
+                );
+            }
+            Err(backup_error) => {
+                if let Some(primary_error) = primary_error {
+                    return (
+                        UiPreferences::default(),
+                        Some(format!(
+                            "配置文件和备份均无法读取：{primary_error}；{backup_error}"
+                        )),
+                    );
+                }
+                return (UiPreferences::default(), Some(backup_error));
+            }
+        }
+    }
+
+    if let Some(error) = primary_error {
+        return (UiPreferences::default(), Some(error));
+    }
+
+    match load_legacy_json(legacy_path) {
+        Ok(Some((preferences, source_path))) => {
+            let warning = match save_to(path, &preferences) {
+                Ok(()) => archive_legacy_json(&source_path, legacy_path).err(),
+                Err(error) => Some(format!(
+                    "已读取旧版 JSON 配置，但无法写入 {}：{error}",
+                    path.display()
+                )),
+            };
+            (preferences, warning)
+        }
+        Ok(None) => {
+            let preferences = UiPreferences::default();
+            let warning = save_to(path, &preferences)
+                .err()
+                .map(|error| format!("无法创建默认配置 {}：{error}", path.display()));
+            (preferences, warning)
+        }
+        Err(error) => (UiPreferences::default(), Some(error)),
+    }
+}
+
+fn load_toml_from(path: &Path) -> Result<UiPreferences, String> {
+    let source = fs::read_to_string(path)
+        .map_err(|error| format!("无法读取配置 {}：{error}", path.display()))?;
+    let document: SettingsDocument =
+        toml::from_str(source.strip_prefix('\u{feff}').unwrap_or(&source))
+            .map_err(|error| format!("配置 {} 的 TOML 格式无效：{error}", path.display()))?;
+    if document.schema_version != SETTINGS_SCHEMA_VERSION {
+        return Err(format!(
+            "不支持配置 {} 的 schema_version {}，当前支持版本 {}",
+            path.display(),
+            document.schema_version,
+            SETTINGS_SCHEMA_VERSION
+        ));
+    }
+    let mut preferences = UiPreferences::from(document);
     preferences.sanitize();
-    Some(preferences)
+    Ok(preferences)
+}
+
+fn load_legacy_json(path: &Path) -> Result<Option<(UiPreferences, PathBuf)>, String> {
+    let backup_path = path.with_extension("json.bak");
+    let mut errors = Vec::new();
+
+    for candidate in [path, backup_path.as_path()] {
+        if !candidate.is_file() {
+            continue;
+        }
+        match fs::read(candidate) {
+            Ok(bytes) => match serde_json::from_slice::<UiPreferences>(&bytes) {
+                Ok(mut preferences) => {
+                    preferences.sanitize();
+                    return Ok(Some((preferences, candidate.to_path_buf())));
+                }
+                Err(error) => errors.push(format!("{}：{error}", candidate.display())),
+            },
+            Err(error) => errors.push(format!("{}：{error}", candidate.display())),
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(None)
+    } else {
+        Err(format!("旧版 JSON 配置无法读取：{}", errors.join("；")))
+    }
+}
+
+fn archive_legacy_json(source_path: &Path, legacy_path: &Path) -> Result<(), String> {
+    let archive_path = legacy_path.with_extension("json.migrated.bak");
+    if archive_path.exists() {
+        return Err(format!(
+            "TOML 配置已创建，但旧版配置未归档：{} 已存在",
+            archive_path.display()
+        ));
+    }
+    fs::rename(source_path, &archive_path).map_err(|error| {
+        format!(
+            "TOML 配置已创建，但无法将旧版配置归档到 {}：{error}",
+            archive_path.display()
+        )
+    })
 }
 
 fn save_to(path: &Path, preferences: &UiPreferences) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temp_path = path.with_extension("json.tmp");
-    let backup_path = path.with_extension("json.bak");
-    let bytes = serde_json::to_vec_pretty(preferences).map_err(io::Error::other)?;
-    fs::write(&temp_path, bytes)?;
+    let temp_path = path.with_extension("toml.tmp");
+    let backup_path = path.with_extension("toml.bak");
+    let source = render_toml(preferences).map_err(io::Error::other)?;
+    fs::write(&temp_path, source.as_bytes())?;
 
     let _ = fs::remove_file(&backup_path);
     if path.exists() {
@@ -244,41 +603,79 @@ fn save_to(path: &Path, preferences: &UiPreferences) -> io::Result<()> {
     Ok(())
 }
 
+fn render_toml(preferences: &UiPreferences) -> Result<String, toml::ser::Error> {
+    let source = toml::to_string_pretty(&SettingsDocument::from(preferences))?;
+    let mut annotated = String::with_capacity(source.len() + 400);
+    for line in source.lines() {
+        let comment = match line {
+            "[interface]" => Some("# theme: system、light 或 dark"),
+            "[fonts]" => Some("# family 留空表示自动选择；weight 范围 1-1000"),
+            "[receive]" => Some(
+                "# mode: text、hex 或 terminal；encoding: utf8 或 gbk\n# buffer_limit_mib: 5、20、100 或 500",
+            ),
+            "[send]" => Some("# mode: text 或 hex；line_ending: none、cr、lf 或 crlf"),
+            "[background]" => Some("# source: none、local 或 online；opacity 范围 0.0-1.0"),
+            _ => None,
+        };
+        if let Some(comment) = comment {
+            annotated.push_str(comment);
+            annotated.push('\n');
+        }
+        annotated.push_str(line);
+        annotated.push('\n');
+    }
+    Ok(format!(
+        "# ESCOM 用户配置\n# 修改后请重启应用；缺失字段会使用默认值。\n\n{annotated}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn preferences_round_trip_only_contains_ui_state() {
-        let unique = format!(
-            "escom-settings-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let test_dir = std::env::temp_dir().join(unique);
-        let test_path = test_dir.join("settings.json");
+        let test_dir = unique_test_dir("toml-round-trip");
+        let test_path = test_dir.join(SETTINGS_FILE_NAME);
         let preferences = UiPreferences {
             ui_font_family: "Microsoft YaHei UI".into(),
             ui_font_weight: 500,
             data_line_spacing: 8.0,
+            receive_mode: ReceiveMode::Terminal,
+            send_mode: SendMode::Hex,
             timestamps: true,
+            background_local_path: r"C:\images\[send]\background.png".into(),
             ..Default::default()
         };
 
         save_to(&test_path, &preferences).unwrap();
-        let loaded = load_from(&test_path).unwrap();
+        let loaded = load_toml_from(&test_path).unwrap();
         assert_eq!(loaded.ui_font_family, "Microsoft YaHei UI");
         assert_eq!(loaded.ui_font_weight, 500);
         assert_eq!(loaded.data_line_spacing, 8.0);
+        assert_eq!(loaded.receive_mode, ReceiveMode::Terminal);
+        assert_eq!(loaded.send_mode, SendMode::Hex);
+        assert_eq!(
+            loaded.background_local_path,
+            r"C:\images\[send]\background.png"
+        );
         assert!(loaded.timestamps);
         assert_eq!(loaded.theme_preference, ThemePreference::System);
 
-        let json = fs::read_to_string(&test_path).unwrap();
-        assert!(!json.contains("port_name"));
-        assert!(!json.contains("send_history"));
+        let toml = fs::read_to_string(&test_path).unwrap();
+        for section in [
+            "[interface]",
+            "[fonts]",
+            "[receive]",
+            "[send]",
+            "[background]",
+        ] {
+            assert!(toml.contains(section), "missing {section}");
+        }
+        assert!(toml.contains("mode = \"terminal\""));
+        assert!(toml.contains("mode = \"hex\""));
+        assert!(!toml.contains("port_name"));
+        assert!(!toml.contains("send_history"));
         let _ = fs::remove_dir_all(test_dir);
     }
 
@@ -305,18 +702,47 @@ mod tests {
     }
 
     #[test]
-    fn terminal_mode_round_trips_through_preferences() {
-        let preferences = UiPreferences {
-            receive_mode: ReceiveMode::Terminal,
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&preferences).unwrap();
-        let loaded: UiPreferences = serde_json::from_str(&json).unwrap();
-        assert_eq!(loaded.receive_mode, ReceiveMode::Terminal);
+    fn partial_toml_uses_defaults_for_omitted_fields() {
+        let document: SettingsDocument = toml::from_str(
+            r#"
+schema_version = 6
+
+[receive]
+mode = "hex"
+"#,
+        )
+        .unwrap();
+        let preferences = UiPreferences::from(document);
+        assert_eq!(preferences.receive_mode, ReceiveMode::Hex);
+        assert_eq!(preferences.send_mode, SendMode::Text);
+        assert_eq!(preferences.text_encoding, TextEncoding::Utf8);
+        assert_eq!(preferences.theme_preference, ThemePreference::System);
     }
 
     #[test]
-    fn theme_preference_round_trips_through_preferences() {
+    fn invalid_manual_toml_returns_an_actionable_warning() {
+        let test_dir = unique_test_dir("invalid-toml");
+        fs::create_dir_all(&test_dir).unwrap();
+        let toml_path = test_dir.join(SETTINGS_FILE_NAME);
+        let json_path = test_dir.join(LEGACY_SETTINGS_FILE_NAME);
+        fs::write(
+            &toml_path,
+            "schema_version = 6\n[receive]\nmode = \"binary\"\n",
+        )
+        .unwrap();
+
+        let (preferences, warning) = load_at(&toml_path, &json_path);
+
+        assert_eq!(preferences.receive_mode, ReceiveMode::Text);
+        let warning = warning.expect("invalid TOML should produce a warning");
+        assert!(warning.contains("settings.toml"));
+        assert!(warning.contains("binary"));
+        assert!(toml_path.is_file());
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn theme_preference_round_trips_through_toml() {
         for theme_preference in [
             ThemePreference::System,
             ThemePreference::Light,
@@ -326,10 +752,41 @@ mod tests {
                 theme_preference,
                 ..Default::default()
             };
-            let json = serde_json::to_string(&preferences).unwrap();
-            let loaded: UiPreferences = serde_json::from_str(&json).unwrap();
+            let source = render_toml(&preferences).unwrap();
+            let document: SettingsDocument = toml::from_str(&source).unwrap();
+            let loaded = UiPreferences::from(document);
             assert_eq!(loaded.theme_preference, theme_preference);
         }
+    }
+
+    #[test]
+    fn legacy_json_is_migrated_and_archived() {
+        let test_dir = unique_test_dir("json-migration");
+        fs::create_dir_all(&test_dir).unwrap();
+        let toml_path = test_dir.join(SETTINGS_FILE_NAME);
+        let json_path = test_dir.join(LEGACY_SETTINGS_FILE_NAME);
+        let preferences = UiPreferences {
+            receive_mode: ReceiveMode::Terminal,
+            background_source: AppBackgroundSource::Online,
+            background_online_url: "https://example.com/background.png".into(),
+            ..Default::default()
+        };
+        fs::write(&json_path, serde_json::to_vec_pretty(&preferences).unwrap()).unwrap();
+
+        let (loaded, warning) = load_at(&toml_path, &json_path);
+
+        assert!(warning.is_none(), "{warning:?}");
+        assert_eq!(loaded.receive_mode, ReceiveMode::Terminal);
+        assert_eq!(loaded.background_source, AppBackgroundSource::Online);
+        assert!(toml_path.is_file());
+        assert!(!json_path.exists());
+        assert!(json_path.with_extension("json.migrated.bak").is_file());
+        assert!(
+            fs::read_to_string(toml_path)
+                .unwrap()
+                .contains("source = \"online\"")
+        );
+        let _ = fs::remove_dir_all(test_dir);
     }
 
     #[test]
