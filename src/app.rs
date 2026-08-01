@@ -168,6 +168,8 @@ pub struct EscomApp {
     settings_center_on_open: bool,
     settings_tab: SettingsTab,
     background_url_draft: String,
+    background_light_opacity_draft: String,
+    background_dark_opacity_draft: String,
     background_load_uri: Option<String>,
     background_load_state: BackgroundLoadState,
     preferences_dirty_since: Option<Instant>,
@@ -229,6 +231,10 @@ impl EscomApp {
         });
 
         let background_url_draft = preferences.background_online_url.clone();
+        let background_light_opacity_draft =
+            format_background_opacity(preferences.background_light_opacity);
+        let background_dark_opacity_draft =
+            format_background_opacity(preferences.background_dark_opacity);
         let serial_config = SerialConfig::default();
         let baud_rate_input = serial_config.baud_rate.to_string();
 
@@ -282,6 +288,8 @@ impl EscomApp {
             settings_center_on_open: false,
             settings_tab: SettingsTab::Fonts,
             background_url_draft,
+            background_light_opacity_draft,
+            background_dark_opacity_draft,
             background_load_uri: None,
             background_load_state: BackgroundLoadState::Idle,
             preferences_dirty_since: None,
@@ -302,6 +310,13 @@ impl EscomApp {
                 (!url.is_empty()).then(|| url.to_owned())
             }
         }
+    }
+
+    fn sync_background_opacity_drafts(&mut self) {
+        self.background_light_opacity_draft =
+            format_background_opacity(self.preferences.background_light_opacity);
+        self.background_dark_opacity_draft =
+            format_background_opacity(self.preferences.background_dark_opacity);
     }
 
     fn has_configured_background(&self) -> bool {
@@ -1084,6 +1099,7 @@ impl EscomApp {
                     {
                         self.background_url_draft
                             .clone_from(&self.preferences.background_online_url);
+                        self.sync_background_opacity_drafts();
                         self.settings_open = true;
                         self.settings_center_on_open = true;
                     }
@@ -2378,7 +2394,7 @@ impl EscomApp {
         settings_card(
             ui,
             "背景不透明度",
-            "亮色与暗色主题分别保存。",
+            "直接输入 0.0–1.0 的小数，亮色与暗色主题分别保存。",
             |ui| {
                 egui::Grid::new("background_opacity_grid")
                     .num_columns(2)
@@ -2388,6 +2404,7 @@ impl EscomApp {
                         settings_controls(ui, |ui| {
                             preferences_changed |= background_opacity_control(
                                 ui,
+                                &mut self.background_light_opacity_draft,
                                 &mut self.preferences.background_light_opacity,
                             );
                         });
@@ -2397,6 +2414,7 @@ impl EscomApp {
                         settings_controls(ui, |ui| {
                             preferences_changed |= background_opacity_control(
                                 ui,
+                                &mut self.background_dark_opacity_draft,
                                 &mut self.preferences.background_dark_opacity,
                             );
                         });
@@ -2425,6 +2443,7 @@ impl EscomApp {
                         self.preferences.background_light_opacity =
                             DEFAULT_BACKGROUND_LIGHT_OPACITY;
                         self.preferences.background_dark_opacity = DEFAULT_BACKGROUND_DARK_OPACITY;
+                        self.sync_background_opacity_drafts();
                         preferences_changed = true;
                     }
                 });
@@ -3044,25 +3063,85 @@ fn local_background_uri(path: &str) -> String {
     }
 }
 
-fn background_opacity_control(ui: &mut egui::Ui, opacity: &mut f32) -> bool {
+fn background_opacity_control(ui: &mut egui::Ui, draft: &mut String, opacity: &mut f32) -> bool {
     let control_height = toolbar_control_height(ui);
-    let value_width = label_width(ui, "100%", 60.0);
-    let slider_width =
-        (ui.available_width() - value_width - ui.spacing().item_spacing.x).clamp(80.0, 390.0);
-    let changed = ui
-        .add_sized(
-            [slider_width, control_height],
-            egui::Slider::new(opacity, 0.0..=1.0).show_value(false),
-        )
-        .changed();
-    ui.allocate_ui_with_layout(
-        egui::vec2(value_width, control_height),
-        Layout::right_to_left(Align::Center),
-        |ui| {
-            ui.label(RichText::new(format!("{:.0}%", *opacity * 100.0)).monospace());
-        },
+    let input_is_valid = parse_background_opacity(draft).is_ok();
+    let text_color = if input_is_valid {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().error_fg_color
+    };
+    let input_stroke = if input_is_valid {
+        ui.visuals().widgets.noninteractive.bg_stroke
+    } else {
+        egui::Stroke::new(1.0, ui.visuals().error_fg_color)
+    };
+    let input_frame = egui::Frame::new()
+        .fill(ui.visuals().text_edit_bg_color())
+        .stroke(input_stroke)
+        .corner_radius(4)
+        .inner_margin(egui::Margin::symmetric(8, 4));
+    let response = ui.add_sized(
+        [140.0, control_height],
+        egui::TextEdit::singleline(draft)
+            .char_limit(6)
+            .horizontal_align(Align::Center)
+            .vertical_align(Align::Center)
+            .text_color(text_color)
+            .frame(input_frame),
     );
+    let mut changed = false;
+    if response.changed()
+        && let Ok(value) = parse_background_opacity(draft)
+        && *opacity != value
+    {
+        *opacity = value;
+        changed = true;
+    }
+
+    if response.lost_focus() {
+        *draft = parse_background_opacity(draft)
+            .map(format_background_opacity)
+            .unwrap_or_else(|_| format_background_opacity(*opacity));
+    }
+
+    match parse_background_opacity(draft) {
+        Ok(_) => response.on_hover_text("输入 0.0 到 1.0 之间的小数"),
+        Err(message) => response.on_hover_text(message),
+    };
     changed
+}
+
+fn parse_background_opacity(input: &str) -> Result<f32, &'static str> {
+    let value = input.trim();
+    if value.is_empty() {
+        return Err("请输入不透明度小数");
+    }
+    if value.chars().filter(|character| *character == '.').count() > 1
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '.')
+    {
+        return Err("只能输入 0.0 到 1.0 之间的小数");
+    }
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|_| "请输入有效的不透明度小数")?;
+    if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
+        return Err("不透明度必须在 0.0 到 1.0 之间");
+    }
+    Ok(parsed)
+}
+
+fn format_background_opacity(opacity: f32) -> String {
+    let mut formatted = format!("{:.4}", opacity.clamp(0.0, 1.0));
+    while formatted.ends_with('0') {
+        formatted.pop();
+    }
+    if formatted.ends_with('.') {
+        formatted.push('0');
+    }
+    formatted
 }
 
 fn background_preview(
@@ -3135,7 +3214,10 @@ fn background_preview(
         ui.visuals().widgets.noninteractive.bg_stroke,
         egui::StrokeKind::Inside,
     );
-    response.on_hover_text(format!("背景不透明度 {:.0}%", opacity * 100.0));
+    response.on_hover_text(format!(
+        "背景不透明度 {}",
+        format_background_opacity(opacity)
+    ));
 }
 
 fn paint_texture_cover(
@@ -3340,6 +3422,25 @@ mod tests {
             centered_window_position(viewport, egui::vec2(660.0, 454.0)),
             egui::pos2(182.0, 93.0)
         );
+    }
+
+    #[test]
+    fn background_opacity_input_accepts_only_bounded_decimals() {
+        assert_eq!(parse_background_opacity("0.22"), Ok(0.22));
+        assert_eq!(parse_background_opacity(".5"), Ok(0.5));
+        assert_eq!(parse_background_opacity("1.0"), Ok(1.0));
+        assert!(parse_background_opacity("").is_err());
+        assert!(parse_background_opacity(".").is_err());
+        assert!(parse_background_opacity("1.01").is_err());
+        assert!(parse_background_opacity("20%").is_err());
+    }
+
+    #[test]
+    fn background_opacity_is_formatted_as_a_compact_decimal() {
+        assert_eq!(format_background_opacity(0.0), "0.0");
+        assert_eq!(format_background_opacity(0.22), "0.22");
+        assert_eq!(format_background_opacity(0.5), "0.5");
+        assert_eq!(format_background_opacity(1.0), "1.0");
     }
 
     #[test]
