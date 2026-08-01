@@ -6,8 +6,7 @@
 
 - **已解决（原高）：500 MiB 缓存不会再被完整物化为显示行。** 原始缓存容量保持不变；显示重建只读取尾部窗口，并限制为最多 100,000 行、16 MiB 文本和 512 KiB 单行。超过 128 KiB 的增量积压会转为后台尾部重建，避免阻塞 UI 线程。[receive.rs](D:/ESCOM/src/app/receive.rs) [formatting.rs](D:/ESCOM/src/formatting.rs) [store.rs](D:/ESCOM/src/store.rs)
 
-- **高：导出存在很高的瞬时内存峰值。** 当前流程同时保留原始快照、格式化行、完整 `String` 和完整输出 `Vec<u8>`。[app.rs:2670](D:/ESCOM/src/app.rs:2670) [formatting.rs:378](D:/ESCOM/src/formatting.rs:378)  
-  建议直接使用 `BufWriter` 流式解码和写文件。
+- **已解决（原高）：导出不再构造完整格式化行和输出缓冲。** 文本按最多 64 KiB 输入块增量解码，HEX 使用固定 47 字节行缓冲，并通过 64 KiB `BufWriter` 直接写文件；快照所有权随任务转移，已写 chunk 会立即释放。同一时间只允许运行一个导出任务。[receive.rs](D:/ESCOM/src/app/receive.rs) [formatting.rs](D:/ESCOM/src/formatting.rs)
 
 - **中高：搜索期间会暂停显示格式化。** 格式化等待搜索结束，搜索也等待格式化结束；大缓存、复杂正则或持续数据流下可能导致显示冻结、缓存断档，随后触发完整重建。[app.rs:531](D:/ESCOM/src/app.rs:531) [app.rs:710](D:/ESCOM/src/app.rs:710)  
   更好的方式是显示更新与搜索解耦：搜索针对不可变快照运行，结果只在 generation 仍匹配时启用，并合并或取消过期搜索任务。

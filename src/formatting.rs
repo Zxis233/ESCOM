@@ -1,5 +1,8 @@
 use std::collections::VecDeque;
 use std::fmt::Write as _;
+use std::fs::File;
+use std::io::{self, BufWriter, Write as _};
+use std::path::Path;
 
 use chrono::{DateTime, Local};
 use encoding_rs::{CoderResult, GBK, UTF_8};
@@ -13,6 +16,10 @@ pub const MAX_DISPLAY_LINE_BYTES: usize = 512 * 1024;
 pub const MAX_DISPLAY_INCREMENT_BYTES: usize = 128 * 1024;
 const MAX_TEXT_REBUILD_BYTES: usize = 16 * 1024 * 1024;
 const HEX_BYTES_PER_ROW: usize = 16;
+const EXPORT_BUFFER_BYTES: usize = 64 * 1024;
+const EXPORT_DECODE_INPUT_BYTES: usize = 64 * 1024;
+const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
 
 pub const fn display_snapshot_limit(mode: ReceiveMode) -> usize {
     match mode {
@@ -543,25 +550,33 @@ pub fn format_snapshot(
     }
 }
 
-pub fn render_export(rows: &[FormattedRow], timestamps: bool) -> Vec<u8> {
-    let estimated_len = rows.iter().map(|row| row.text.len() + 32).sum();
-    let mut output = String::with_capacity(estimated_len);
-    for row in rows {
-        if timestamps {
-            let _ = write!(
-                output,
-                "[{}] ",
-                row.received_at.format("%Y-%m-%d %H:%M:%S%.3f")
-            );
-        }
-        output.push_str(&row.text);
-        output.push_str("\r\n");
-    }
+pub fn export_snapshot_to_file(
+    path: &Path,
+    snapshot: ReceiveSnapshot,
+    mode: ReceiveMode,
+    encoding: TextEncoding,
+    timestamps: bool,
+) -> io::Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::with_capacity(EXPORT_BUFFER_BYTES, file);
+    write_export(&mut writer, snapshot, mode, encoding, timestamps)?;
+    writer.flush()
+}
 
-    let mut bytes = Vec::with_capacity(output.len() + 3);
-    bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
-    bytes.extend_from_slice(output.as_bytes());
-    bytes
+pub fn write_export<W: io::Write + ?Sized>(
+    writer: &mut W,
+    snapshot: ReceiveSnapshot,
+    mode: ReceiveMode,
+    encoding: TextEncoding,
+    timestamps: bool,
+) -> io::Result<()> {
+    writer.write_all(&UTF8_BOM)?;
+    match mode {
+        ReceiveMode::Text | ReceiveMode::Terminal => {
+            write_text_export(writer, snapshot, encoding, timestamps)
+        }
+        ReceiveMode::Hex => write_hex_export(writer, snapshot, timestamps),
+    }
 }
 
 pub fn display_text(row: &FormattedRow, timestamps: bool) -> String {
@@ -625,6 +640,212 @@ fn format_text(snapshot: &ReceiveSnapshot, encoding: TextEncoding) -> Vec<Format
         .unwrap_or_else(Local::now);
     decode_piece(&mut decoder, &[], true, flush_time, &mut builder);
     builder.finish()
+}
+
+fn write_text_export<W: io::Write + ?Sized>(
+    writer: &mut W,
+    snapshot: ReceiveSnapshot,
+    encoding: TextEncoding,
+    timestamps: bool,
+) -> io::Result<()> {
+    let selected_encoding = match encoding {
+        TextEncoding::Utf8 => UTF_8,
+        TextEncoding::Gbk => GBK,
+    };
+    let mut decoder = selected_encoding.new_decoder_without_bom_handling();
+    let mut decoded = String::with_capacity(EXPORT_DECODE_INPUT_BYTES * 3);
+    let mut exporter = StreamingTextExporter::new(writer, timestamps);
+
+    let flush_time = snapshot
+        .chunks
+        .last()
+        .map(|chunk| chunk.received_at)
+        .unwrap_or_else(Local::now);
+    for chunk in snapshot.chunks {
+        if !chunk.bytes.is_empty() {
+            exporter.note_input(chunk.received_at);
+        }
+        for input in chunk.bytes.chunks(EXPORT_DECODE_INPUT_BYTES) {
+            decode_export_piece(
+                &mut decoder,
+                input,
+                false,
+                chunk.received_at,
+                &mut decoded,
+                &mut exporter,
+            )?;
+        }
+    }
+
+    decode_export_piece(
+        &mut decoder,
+        &[],
+        true,
+        flush_time,
+        &mut decoded,
+        &mut exporter,
+    )?;
+    exporter.finish()
+}
+
+fn decode_export_piece<W: io::Write + ?Sized>(
+    decoder: &mut encoding_rs::Decoder,
+    mut input: &[u8],
+    last: bool,
+    received_at: DateTime<Local>,
+    decoded: &mut String,
+    exporter: &mut StreamingTextExporter<'_, W>,
+) -> io::Result<()> {
+    loop {
+        let capacity = input.len().saturating_mul(3).max(32);
+        decoded.clear();
+        if decoded.capacity() < capacity {
+            decoded.reserve(capacity);
+        }
+        let (result, read, _) = decoder.decode_to_string(input, decoded, last);
+        exporter.push_decoded(decoded, received_at)?;
+        input = &input[read..];
+
+        match result {
+            CoderResult::InputEmpty => return Ok(()),
+            CoderResult::OutputFull => {}
+        }
+    }
+}
+
+struct StreamingTextExporter<'a, W: io::Write + ?Sized> {
+    writer: &'a mut W,
+    timestamps: bool,
+    line_open: bool,
+    line_started_at: Option<DateTime<Local>>,
+    skip_lf_after_cr: bool,
+}
+
+impl<'a, W: io::Write + ?Sized> StreamingTextExporter<'a, W> {
+    fn new(writer: &'a mut W, timestamps: bool) -> Self {
+        Self {
+            writer,
+            timestamps,
+            line_open: false,
+            line_started_at: None,
+            skip_lf_after_cr: false,
+        }
+    }
+
+    fn note_input(&mut self, received_at: DateTime<Local>) {
+        if !self.line_open && self.line_started_at.is_none() && !self.skip_lf_after_cr {
+            self.line_started_at = Some(received_at);
+        }
+    }
+
+    fn push_decoded(&mut self, text: &str, received_at: DateTime<Local>) -> io::Result<()> {
+        let bytes = text.as_bytes();
+        let mut cursor = 0;
+        if self.skip_lf_after_cr && !bytes.is_empty() {
+            self.skip_lf_after_cr = false;
+            if bytes[0] == b'\n' {
+                cursor = 1;
+            }
+        }
+
+        let mut segment_start = cursor;
+        while cursor < bytes.len() {
+            let newline = bytes[cursor];
+            if newline != b'\r' && newline != b'\n' {
+                cursor += 1;
+                continue;
+            }
+
+            self.write_segment(&text[segment_start..cursor], received_at)?;
+            self.finish_row(received_at)?;
+            cursor += 1;
+            if newline == b'\r' {
+                if cursor == bytes.len() {
+                    self.skip_lf_after_cr = true;
+                } else if bytes[cursor] == b'\n' {
+                    cursor += 1;
+                }
+            }
+            segment_start = cursor;
+        }
+
+        self.write_segment(&text[segment_start..], received_at)
+    }
+
+    fn write_segment(&mut self, text: &str, received_at: DateTime<Local>) -> io::Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.start_row(received_at)?;
+        self.writer.write_all(text.as_bytes())
+    }
+
+    fn start_row(&mut self, received_at: DateTime<Local>) -> io::Result<()> {
+        if self.line_open {
+            return Ok(());
+        }
+        if self.timestamps {
+            let timestamp = self.line_started_at.unwrap_or(received_at);
+            write!(
+                self.writer,
+                "[{}] ",
+                timestamp.format("%Y-%m-%d %H:%M:%S%.3f")
+            )?;
+        }
+        self.line_open = true;
+        Ok(())
+    }
+
+    fn finish_row(&mut self, received_at: DateTime<Local>) -> io::Result<()> {
+        self.start_row(received_at)?;
+        self.writer.write_all(b"\r\n")?;
+        self.line_open = false;
+        self.line_started_at = None;
+        Ok(())
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        if self.line_open {
+            self.writer.write_all(b"\r\n")?;
+            self.line_open = false;
+        }
+        Ok(())
+    }
+}
+
+fn write_hex_export<W: io::Write + ?Sized>(
+    writer: &mut W,
+    snapshot: ReceiveSnapshot,
+    timestamps: bool,
+) -> io::Result<()> {
+    for chunk in snapshot.chunks {
+        for bytes in chunk.bytes.chunks(HEX_BYTES_PER_ROW) {
+            write_export_timestamp(writer, chunk.received_at, timestamps)?;
+            let mut encoded = [0_u8; HEX_BYTES_PER_ROW * 3 - 1];
+            for (index, byte) in bytes.iter().copied().enumerate() {
+                let offset = index * 3;
+                if index != 0 {
+                    encoded[offset - 1] = b' ';
+                }
+                encoded[offset] = HEX_DIGITS[usize::from(byte >> 4)];
+                encoded[offset + 1] = HEX_DIGITS[usize::from(byte & 0x0F)];
+            }
+            writer.write_all(&encoded[..bytes.len() * 3 - 1])?;
+            writer.write_all(b"\r\n")?;
+        }
+    }
+    Ok(())
+}
+
+fn write_export_timestamp<W: io::Write + ?Sized>(
+    writer: &mut W,
+    received_at: DateTime<Local>,
+    timestamps: bool,
+) -> io::Result<()> {
+    if timestamps {
+        write!(writer, "[{}] ", received_at.format("%Y-%m-%d %H:%M:%S%.3f"))?;
+    }
+    Ok(())
 }
 
 fn decode_piece(
@@ -1028,13 +1249,273 @@ mod tests {
 
     #[test]
     fn export_is_utf8_bom_and_crlf() {
-        let rows = vec![FormattedRow {
-            received_at: timestamp(1),
-            text: "数据".into(),
-        }];
-        let bytes = render_export(&rows, false);
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), "数据".as_bytes().to_vec());
+        let mut bytes = Vec::new();
+
+        write_export(
+            &mut bytes,
+            store.snapshot(),
+            ReceiveMode::Text,
+            TextEncoding::Utf8,
+            false,
+        )
+        .unwrap();
+
         assert!(bytes.starts_with(&[0xEF, 0xBB, 0xBF]));
         assert_eq!(std::str::from_utf8(&bytes[3..]).unwrap(), "数据\r\n");
+    }
+
+    #[test]
+    fn streaming_text_export_handles_split_utf8_and_crlf() {
+        let mut store = ReceiveStore::new(1024);
+        let input = "第一行\r\n第二行".as_bytes();
+        store.append(timestamp(1), input[..4].to_vec());
+        store.append(timestamp(2), input[4..10].to_vec());
+        store.append(timestamp(3), input[10..].to_vec());
+        let mut output = Vec::new();
+
+        write_export(
+            &mut output,
+            store.snapshot(),
+            ReceiveMode::Text,
+            TextEncoding::Utf8,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::str::from_utf8(&output[UTF8_BOM.len()..]).unwrap(),
+            "第一行\r\n第二行\r\n"
+        );
+    }
+
+    #[test]
+    fn streaming_text_export_timestamps_a_split_character_from_its_first_byte() {
+        let mut store = ReceiveStore::new(1024);
+        let input = "中".as_bytes();
+        store.append(timestamp(1), input[..1].to_vec());
+        store.append(timestamp(2), input[1..].to_vec());
+        let mut output = Vec::new();
+
+        write_export(
+            &mut output,
+            store.snapshot(),
+            ReceiveMode::Text,
+            TextEncoding::Utf8,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::str::from_utf8(&output[UTF8_BOM.len()..]).unwrap(),
+            "[2026-07-31 12:00:01.000] 中\r\n"
+        );
+    }
+
+    #[test]
+    fn streaming_text_export_preserves_line_and_blank_line_timestamps() {
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), b"first".to_vec());
+        store.append(timestamp(2), b" line\r".to_vec());
+        store.append(timestamp(3), b"\n\nlast".to_vec());
+        let mut output = Vec::new();
+
+        write_export(
+            &mut output,
+            store.snapshot(),
+            ReceiveMode::Text,
+            TextEncoding::Utf8,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::str::from_utf8(&output[UTF8_BOM.len()..]).unwrap(),
+            concat!(
+                "[2026-07-31 12:00:01.000] first line\r\n",
+                "[2026-07-31 12:00:03.000] \r\n",
+                "[2026-07-31 12:00:03.000] last\r\n"
+            )
+        );
+    }
+
+    #[test]
+    fn streaming_text_export_decodes_split_gbk() {
+        let (encoded, _, _) = GBK.encode("中文\r\n完成");
+        let input = encoded.into_owned();
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), input[..1].to_vec());
+        store.append(timestamp(2), input[1..3].to_vec());
+        store.append(timestamp(3), input[3..].to_vec());
+        let mut output = Vec::new();
+
+        write_export(
+            &mut output,
+            store.snapshot(),
+            ReceiveMode::Text,
+            TextEncoding::Gbk,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::str::from_utf8(&output[UTF8_BOM.len()..]).unwrap(),
+            "中文\r\n完成\r\n"
+        );
+    }
+
+    #[test]
+    fn streaming_hex_export_preserves_chunk_timestamps() {
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), vec![0x00, 0x01, 0xAB]);
+        store.append(timestamp(2), vec![0xFF]);
+        let mut output = Vec::new();
+
+        write_export(
+            &mut output,
+            store.snapshot(),
+            ReceiveMode::Hex,
+            TextEncoding::Utf8,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::str::from_utf8(&output[UTF8_BOM.len()..]).unwrap(),
+            "[2026-07-31 12:00:01.000] 00 01 AB\r\n[2026-07-31 12:00:02.000] FF\r\n"
+        );
+    }
+
+    #[test]
+    fn streaming_export_propagates_write_failures() {
+        struct FailingWriter {
+            remaining: usize,
+        }
+
+        impl io::Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(io::Error::other("disk full"));
+                }
+                let written = bytes.len().min(self.remaining);
+                self.remaining -= written;
+                Ok(written)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), b"payload".to_vec());
+        let error = write_export(
+            &mut FailingWriter { remaining: 5 },
+            store.snapshot(),
+            ReceiveMode::Text,
+            TextEncoding::Utf8,
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn streaming_export_releases_chunks_after_writing_them() {
+        struct ReleaseProbe {
+            first_chunk: std::sync::Weak<[u8]>,
+            observed_release: bool,
+        }
+
+        impl io::Write for ReleaseProbe {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.observed_release |= self.first_chunk.upgrade().is_none();
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let first_bytes: std::sync::Arc<[u8]> = vec![0xAA].into();
+        let first_chunk = std::sync::Arc::downgrade(&first_bytes);
+        let snapshot = ReceiveSnapshot {
+            generation: 0,
+            stream_id: 0,
+            first_sequence: 0,
+            next_sequence: 2,
+            chunks: vec![
+                RxChunk {
+                    sequence: 0,
+                    received_at: timestamp(1),
+                    bytes: first_bytes,
+                },
+                RxChunk {
+                    sequence: 1,
+                    received_at: timestamp(2),
+                    bytes: vec![0xBB].into(),
+                },
+            ],
+            bytes_len: 2,
+            omitted_bytes: 0,
+            dropped_bytes: 0,
+        };
+        let mut probe = ReleaseProbe {
+            first_chunk,
+            observed_release: false,
+        };
+
+        write_export(
+            &mut probe,
+            snapshot,
+            ReceiveMode::Hex,
+            TextEncoding::Utf8,
+            false,
+        )
+        .unwrap();
+
+        assert!(probe.observed_release);
+    }
+
+    #[test]
+    fn streaming_text_export_bounds_each_write_for_a_long_line() {
+        #[derive(Default)]
+        struct WriteProbe {
+            largest_write: usize,
+            total: usize,
+        }
+
+        impl io::Write for WriteProbe {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.largest_write = self.largest_write.max(bytes.len());
+                self.total += bytes.len();
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let input_len = 1024 * 1024;
+        let mut store = ReceiveStore::new(input_len);
+        store.append(timestamp(1), vec![b'x'; input_len]);
+        let mut probe = WriteProbe::default();
+
+        write_export(
+            &mut probe,
+            store.snapshot(),
+            ReceiveMode::Text,
+            TextEncoding::Utf8,
+            false,
+        )
+        .unwrap();
+
+        assert!(probe.largest_write <= EXPORT_DECODE_INPUT_BYTES);
+        assert_eq!(probe.total, UTF8_BOM.len() + input_len + 2);
     }
 
     #[test]

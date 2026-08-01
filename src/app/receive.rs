@@ -237,12 +237,15 @@ impl EscomApp {
                         self.send_error = None;
                     }
                     if ui
-                        .add_enabled_ui(self.receive_bytes_len() > 0, |ui| {
-                            ui.add(
-                                egui::Button::new("导出 TXT")
-                                    .min_size(egui::vec2(80.0, control_height)),
-                            )
-                        })
+                        .add_enabled_ui(
+                            self.receive_bytes_len() > 0 && !self.export_in_progress,
+                            |ui| {
+                                ui.add(
+                                    egui::Button::new("导出 TXT")
+                                        .min_size(egui::vec2(80.0, control_height)),
+                                )
+                            },
+                        )
                         .inner
                         .clicked()
                     {
@@ -411,18 +414,20 @@ impl EscomApp {
         let timestamps = self.preferences.timestamps;
         let sender = self.background_tx.clone();
         let repaint_context = context.clone();
-        thread::Builder::new()
+        self.export_in_progress = true;
+        let spawn_result = thread::Builder::new()
             .name("escom-export".into())
             .spawn(move || {
-                let rows = format_snapshot(&snapshot, mode, encoding);
-                let bytes = render_export(&rows, timestamps);
-                let result = std::fs::write(&path, bytes)
+                let result = export_snapshot_to_file(&path, snapshot, mode, encoding, timestamps)
                     .map(|()| path)
                     .map_err(|error| format!("导出失败：{error}"));
                 let _ = sender.send(BackgroundEvent::Exported(result));
                 repaint_context.request_repaint();
-            })
-            .expect("failed to start export task");
+            });
+        if let Err(error) = spawn_result {
+            self.export_in_progress = false;
+            self.set_notice(format!("无法启动导出任务：{error}"), true);
+        }
     }
 
     pub(super) fn receive_bytes_len(&self) -> usize {

@@ -9,6 +9,7 @@ use super::widgets::{
     framed_control_height, status_control_height_from_metrics, toolbar_control_height_from_metrics,
 };
 use super::*;
+use crate::formatting::format_snapshot;
 
 fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
     egui::Event::Key {

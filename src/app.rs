@@ -12,8 +12,8 @@ use serialport::{DataBits, FlowControl, Parity, StopBits};
 use crate::fonts::{FontCatalog, data_font_family};
 use crate::formatting::{
     DisplayFormatter, DisplayUpdate, FormattedRow, MAX_DISPLAY_INCREMENT_BYTES, MAX_DISPLAY_ROWS,
-    MAX_DISPLAY_TEXT_BYTES, display_snapshot_limit, display_text, encode_text, format_snapshot,
-    parse_send_input, render_export,
+    MAX_DISPLAY_TEXT_BYTES, display_snapshot_limit, display_text, encode_text,
+    export_snapshot_to_file, parse_send_input,
 };
 use crate::highlight::{self, HighlightRules, HighlightStyle};
 use crate::icon;
@@ -147,6 +147,7 @@ pub struct EscomApp {
     display_formatter: Option<DisplayFormatter>,
     format_token: u64,
     format_in_progress: bool,
+    export_in_progress: bool,
     force_format: bool,
     last_format_started: Instant,
     paused: bool,
@@ -272,6 +273,7 @@ impl EscomApp {
             display_formatter: None,
             format_token: 0,
             format_in_progress: false,
+            export_in_progress: false,
             force_format: true,
             last_format_started: Instant::now() - FORMAT_DEBOUNCE,
             paused: false,
@@ -419,12 +421,15 @@ impl EscomApp {
                         self.search_index_generation = None;
                     }
                 }
-                BackgroundEvent::Exported(result) => match result {
-                    Ok(path) => {
-                        self.set_notice(format!("已导出到 {}", path.display()), false);
+                BackgroundEvent::Exported(result) => {
+                    self.export_in_progress = false;
+                    match result {
+                        Ok(path) => {
+                            self.set_notice(format!("已导出到 {}", path.display()), false);
+                        }
+                        Err(message) => self.set_notice(message, true),
                     }
-                    Err(message) => self.set_notice(message, true),
-                },
+                }
             }
         }
     }

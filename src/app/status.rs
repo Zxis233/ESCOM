@@ -64,6 +64,9 @@ impl EscomApp {
                             if self.format_in_progress {
                                 ui.label("正在整理显示...");
                             }
+                            if self.export_in_progress {
+                                ui.label("正在导出...");
+                            }
 
                             if let Some(notice) = &self.notice
                                 && Instant::now() < notice.expires_at
