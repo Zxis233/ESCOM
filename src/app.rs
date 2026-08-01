@@ -37,7 +37,6 @@ const PORT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const NOTICE_DURATION: Duration = Duration::from_secs(6);
 const MAX_HISTORY: usize = 50;
 const MIN_CONTROL_HEIGHT: f32 = 32.0;
-const SEARCH_BAR_RIGHT_PADDING: f32 = 8.0;
 const CONFIG_LABEL_WIDTH: f32 = 48.0;
 const CONFIG_COMBO_WIDTH: f32 = 100.0;
 const SETTINGS_LABEL_WIDTH: f32 = 76.0;
@@ -1356,171 +1355,161 @@ impl EscomApp {
         let mut navigation = 0_isize;
         let mut highlight_action = None;
         let search_current = self.search_index_is_current();
+        let highlight_rules = Arc::clone(&self.highlight_rules);
+        let highlight_config_error = self.highlight_config_error.clone();
         let control_height = toolbar_control_height(ui);
-        ui.horizontal_wrapped(|ui| {
-            toolbar_label(ui, "查找", 38.0);
-            let search_width = (ui.available_width() - 520.0 - SEARCH_BAR_RIGHT_PADDING).max(160.0);
-            let search_id = ui.make_persistent_id("receive_search_input");
-            let response = ui.add_sized(
-                [search_width, control_height],
-                egui::TextEdit::singleline(&mut self.search_query)
-                    .id(search_id)
-                    .hint_text("输入文本或正则表达式（Ctrl+F）")
-                    .vertical_align(Align::Center),
-            );
-            if self.focus_search {
-                response.request_focus();
-                self.focus_search = false;
-            }
-            search_changed |= response.changed();
-            if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-                navigation = if ui.input(|input| input.modifiers.shift) {
-                    -1
-                } else {
-                    1
-                };
-            }
+        egui::containers::Sides::new()
+            .height(control_height)
+            .shrink_left()
+            .show(
+                ui,
+                |ui| {
+                    toolbar_label(ui, "查找", 38.0);
+                    let status_width = label_width(ui, "表达式错误", 88.0);
+                    let trailing_width = 32.0
+                        + 44.0
+                        + 44.0
+                        + 64.0
+                        + 56.0
+                        + 56.0
+                        + status_width
+                        + ui.spacing().item_spacing.x * 7.0;
+                    let search_width = (ui.available_width() - trailing_width).max(160.0);
+                    let search_id = ui.make_persistent_id("receive_search_input");
+                    let response = ui.add_sized(
+                        [search_width, control_height],
+                        egui::TextEdit::singleline(&mut self.search_query)
+                            .id(search_id)
+                            .hint_text("输入文本或正则表达式（Ctrl+F）")
+                            .vertical_align(Align::Center),
+                    );
+                    if self.focus_search {
+                        response.request_focus();
+                        self.focus_search = false;
+                    }
+                    search_changed |= response.changed();
+                    if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                    {
+                        navigation = if ui.input(|input| input.modifiers.shift) {
+                            -1
+                        } else {
+                            1
+                        };
+                    }
 
-            if ui
-                .add_enabled(
-                    !self.search_query.is_empty(),
-                    egui::Button::new("×").min_size(egui::vec2(32.0, control_height)),
-                )
-                .on_hover_text("清除搜索")
-                .clicked()
-            {
-                self.search_query.clear();
-                search_changed = true;
-            }
+                    if ui
+                        .add_enabled(
+                            !self.search_query.is_empty(),
+                            egui::Button::new("×").min_size(egui::vec2(32.0, control_height)),
+                        )
+                        .on_hover_text("清除搜索")
+                        .clicked()
+                    {
+                        self.search_query.clear();
+                        search_changed = true;
+                    }
 
-            if ui
-                .add(
-                    egui::Button::selectable(self.search_case_sensitive, "Aa")
-                        .min_size(egui::vec2(44.0, control_height)),
-                )
-                .on_hover_text("区分大小写")
-                .clicked()
-            {
-                self.search_case_sensitive = !self.search_case_sensitive;
-                search_changed = true;
-            }
-            if ui
-                .add(
-                    egui::Button::selectable(self.search_regex, ".*")
-                        .min_size(egui::vec2(44.0, control_height)),
-                )
-                .on_hover_text("使用正则表达式")
-                .clicked()
-            {
-                self.search_regex = !self.search_regex;
-                search_changed = true;
-            }
+                    if ui
+                        .add(
+                            egui::Button::selectable(self.search_case_sensitive, "Aa")
+                                .min_size(egui::vec2(44.0, control_height)),
+                        )
+                        .on_hover_text("区分大小写")
+                        .clicked()
+                    {
+                        self.search_case_sensitive = !self.search_case_sensitive;
+                        search_changed = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::selectable(self.search_regex, ".*")
+                                .min_size(egui::vec2(44.0, control_height)),
+                        )
+                        .on_hover_text("使用正则表达式")
+                        .clicked()
+                    {
+                        self.search_regex = !self.search_regex;
+                        search_changed = true;
+                    }
 
-            let filter_response = ui
-                .add_enabled(
-                    !self.search_query.is_empty()
-                        && search_current
+                    let filter_response = ui
+                        .add_enabled(
+                            !self.search_query.is_empty()
+                                && search_current
+                                && !self.search_pending
+                                && !self.search_in_progress
+                                && self.search_index.error.is_none(),
+                            egui::Button::selectable(self.search_filter, "过滤")
+                                .min_size(egui::vec2(64.0, control_height)),
+                        )
+                        .on_hover_text("只显示包含匹配项的行");
+                    if filter_response.clicked() {
+                        self.search_filter = !self.search_filter;
+                        self.queue_selected_search_scroll();
+                    }
+
+                    let can_navigate = search_current
                         && !self.search_pending
                         && !self.search_in_progress
-                        && self.search_index.error.is_none(),
-                    egui::Button::selectable(self.search_filter, "过滤")
-                        .min_size(egui::vec2(64.0, control_height)),
-                )
-                .on_hover_text("只显示包含匹配项的行");
-            if filter_response.clicked() {
-                self.search_filter = !self.search_filter;
-                self.queue_selected_search_scroll();
-            }
+                        && !self.search_index.matches.is_empty();
+                    if ui
+                        .add_enabled(
+                            can_navigate,
+                            egui::Button::new("上一处").min_size(egui::vec2(56.0, control_height)),
+                        )
+                        .clicked()
+                    {
+                        navigation = -1;
+                    }
+                    if ui
+                        .add_enabled(
+                            can_navigate,
+                            egui::Button::new("下一处").min_size(egui::vec2(56.0, control_height)),
+                        )
+                        .clicked()
+                    {
+                        navigation = 1;
+                    }
 
-            let can_navigate = search_current
-                && !self.search_pending
-                && !self.search_in_progress
-                && !self.search_index.matches.is_empty();
-            if ui
-                .add_enabled(
-                    can_navigate,
-                    egui::Button::new("上一处").min_size(egui::vec2(56.0, control_height)),
-                )
-                .clicked()
-            {
-                navigation = -1;
-            }
-            if ui
-                .add_enabled(
-                    can_navigate,
-                    egui::Button::new("下一处").min_size(egui::vec2(56.0, control_height)),
-                )
-                .clicked()
-            {
-                navigation = 1;
-            }
-
-            let status_error = search_current
-                .then(|| self.search_index.error.clone())
-                .flatten();
-            let status = if self.search_pending
-                || self.search_in_progress
-                || (!self.search_query.is_empty() && !search_current)
-            {
-                RichText::new("搜索中…").color(ui.visuals().weak_text_color())
-            } else if status_error.is_some() {
-                RichText::new("表达式错误")
-                    .color(ui.visuals().error_fg_color)
-                    .underline()
-            } else if self.search_query.is_empty() {
-                RichText::new("—").color(ui.visuals().weak_text_color())
-            } else {
-                let selected = self.search_selected_match.map_or(0, |index| index + 1);
-                let suffix = if self.search_index.truncated { "+" } else { "" };
-                RichText::new(format!(
-                    "{selected}/{}{suffix}",
-                    self.search_index.matches.len()
-                ))
-            };
-            let status_width = label_width(ui, "表达式错误", 88.0);
-            let status_response = ui.add_sized(
-                [status_width, control_height],
-                egui::Label::new(status).truncate(),
+                    let status_error = search_current
+                        .then(|| self.search_index.error.clone())
+                        .flatten();
+                    let status = if self.search_pending
+                        || self.search_in_progress
+                        || (!self.search_query.is_empty() && !search_current)
+                    {
+                        RichText::new("搜索中…").color(ui.visuals().weak_text_color())
+                    } else if status_error.is_some() {
+                        RichText::new("表达式错误")
+                            .color(ui.visuals().error_fg_color)
+                            .underline()
+                    } else if self.search_query.is_empty() {
+                        RichText::new("—").color(ui.visuals().weak_text_color())
+                    } else {
+                        let selected = self.search_selected_match.map_or(0, |index| index + 1);
+                        let suffix = if self.search_index.truncated { "+" } else { "" };
+                        RichText::new(format!(
+                            "{selected}/{}{suffix}",
+                            self.search_index.matches.len()
+                        ))
+                    };
+                    let status_response = ui.add_sized(
+                        [status_width, control_height],
+                        egui::Label::new(status).truncate(),
+                    );
+                    if let Some(error) = status_error {
+                        status_response.on_hover_text(error);
+                    }
+                },
+                |ui| {
+                    Self::show_highlight_menu(
+                        ui,
+                        &highlight_rules,
+                        highlight_config_error.as_deref(),
+                        &mut highlight_action,
+                    )
+                },
             );
-            if let Some(error) = status_error {
-                status_response.on_hover_text(error);
-            }
-
-            let path = self.highlight_rules.path().to_path_buf();
-            let path_display = path.display().to_string();
-            let button_text = if self.highlight_config_error.is_some() {
-                "高亮 !".to_owned()
-            } else {
-                format!("高亮 {}", self.highlight_rules.len())
-            };
-            ui.menu_button(button_text, |ui| {
-                ui.set_min_width(360.0);
-                ui.label(
-                    RichText::new(&path_display)
-                        .small()
-                        .color(ui.visuals().weak_text_color()),
-                );
-                if let Some(error) = &self.highlight_config_error {
-                    ui.label(RichText::new(error).color(ui.visuals().error_fg_color));
-                }
-                ui.separator();
-                if ui.button("重新加载").clicked() {
-                    highlight_action = Some(HighlightConfigAction::Reload);
-                    ui.close();
-                }
-                if ui.button("打开配置文件").clicked() {
-                    highlight_action = Some(HighlightConfigAction::Open);
-                    ui.close();
-                }
-                if ui.button("复制配置路径").clicked() {
-                    highlight_action = Some(HighlightConfigAction::CopyPath);
-                    ui.close();
-                }
-            })
-            .response
-            .on_hover_text("高亮规则由 highlight.toml 管理");
-            ui.add_space(SEARCH_BAR_RIGHT_PADDING);
-        });
 
         if search_changed {
             self.request_search(true);
@@ -1529,6 +1518,54 @@ impl EscomApp {
         if navigation != 0 {
             self.navigate_search(navigation);
         }
+        self.handle_highlight_action(highlight_action, context);
+    }
+
+    fn show_highlight_menu(
+        ui: &mut egui::Ui,
+        highlight_rules: &HighlightRules,
+        highlight_config_error: Option<&str>,
+        highlight_action: &mut Option<HighlightConfigAction>,
+    ) {
+        let path_display = highlight_rules.path().display().to_string();
+        let button_text = if highlight_config_error.is_some() {
+            "高亮 !".to_owned()
+        } else {
+            format!("高亮 {}", highlight_rules.len())
+        };
+        ui.menu_button(button_text, |ui| {
+            ui.set_min_width(360.0);
+            ui.label(
+                RichText::new(&path_display)
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+            if let Some(error) = highlight_config_error {
+                ui.label(RichText::new(error).color(ui.visuals().error_fg_color));
+            }
+            ui.separator();
+            if ui.button("重新加载").clicked() {
+                *highlight_action = Some(HighlightConfigAction::Reload);
+                ui.close();
+            }
+            if ui.button("打开配置文件").clicked() {
+                *highlight_action = Some(HighlightConfigAction::Open);
+                ui.close();
+            }
+            if ui.button("复制配置路径").clicked() {
+                *highlight_action = Some(HighlightConfigAction::CopyPath);
+                ui.close();
+            }
+        })
+        .response
+        .on_hover_text("高亮规则由 highlight.toml 管理");
+    }
+
+    fn handle_highlight_action(
+        &mut self,
+        highlight_action: Option<HighlightConfigAction>,
+        context: &egui::Context,
+    ) {
         match highlight_action {
             Some(HighlightConfigAction::Reload) => self.reload_highlight_rules(),
             Some(HighlightConfigAction::Open) => {
