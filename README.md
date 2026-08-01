@@ -21,7 +21,7 @@ ESCOM 是一款使用 Rust 和 `eframe/egui` 编写的 Windows 串口查看器�
 
 - 文本、HEX 和终端三种接收模式。
 - 文本模式支持 UTF-8、GBK 编码。
-- 支持时间戳、暂停显示、自动滚动和收发字节计数。
+- 支持可配置格式的时间戳、暂停显示、自动滚动和收发字节计数。
 - 提供 5、20、100、500 MiB 可选原始数据缓存；显示窗口最多保留最近 100,000 行或 16 MiB 文本，避免大缓存被完整物化为 UI 对象。
 - 支持普通文本或正则表达式搜索、大小写匹配、结果导航和过滤显示。
 - 支持通过 TOML 配置整行高亮规则。
@@ -152,6 +152,7 @@ data_line_spacing = 3.0 # 0-24
 mode = "text" # text、hex 或 terminal
 encoding = "utf8" # utf8 或 gbk
 timestamps = false
+timestamp_format = "%Y-%m-%d %H:%M:%S%.3f" # chrono/strftime 格式
 auto_scroll = true
 buffer_limit_mib = 20 # 5、20、100 或 500
 

@@ -25,6 +25,21 @@ pub struct SearchMatcher {
     matcher: Regex,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SearchDisplayOptions<'a> {
+    pub timestamps: bool,
+    pub timestamp_format: &'a str,
+}
+
+impl<'a> SearchDisplayOptions<'a> {
+    pub const fn new(timestamps: bool, timestamp_format: &'a str) -> Self {
+        Self {
+            timestamps,
+            timestamp_format,
+        }
+    }
+}
+
 impl SearchMatcher {
     pub fn new(
         query: &str,
@@ -71,7 +86,7 @@ impl SearchIndex {
         replace_tail: usize,
         rows: &[FormattedRow],
         matcher: &SearchMatcher,
-        timestamps: bool,
+        display_options: SearchDisplayOptions<'_>,
     ) {
         debug_assert!(remove_prefix <= old_row_count);
         let rows_after_prefix = old_row_count.saturating_sub(remove_prefix);
@@ -108,7 +123,7 @@ impl SearchIndex {
         }
 
         if !self.truncated {
-            append_matches(self, rows, append_start, matcher, timestamps);
+            append_matches(self, rows, append_start, matcher, display_options);
         }
     }
 }
@@ -118,7 +133,7 @@ pub fn search_rows(
     query: &str,
     case_sensitive: bool,
     regex_mode: bool,
-    timestamps: bool,
+    display_options: SearchDisplayOptions<'_>,
 ) -> SearchIndex {
     let matcher = match SearchMatcher::new(query, case_sensitive, regex_mode) {
         Ok(Some(matcher)) => matcher,
@@ -131,16 +146,16 @@ pub fn search_rows(
         }
     };
 
-    search_rows_with_matcher(rows, &matcher, timestamps)
+    search_rows_with_matcher(rows, &matcher, display_options)
 }
 
 pub fn search_rows_with_matcher(
     rows: &[FormattedRow],
     matcher: &SearchMatcher,
-    timestamps: bool,
+    display_options: SearchDisplayOptions<'_>,
 ) -> SearchIndex {
     let mut index = SearchIndex::default();
-    append_matches(&mut index, rows, 0, matcher, timestamps);
+    append_matches(&mut index, rows, 0, matcher, display_options);
     index
 }
 
@@ -149,11 +164,15 @@ fn append_matches(
     rows: &[FormattedRow],
     row_offset: usize,
     matcher: &SearchMatcher,
-    timestamps: bool,
+    display_options: SearchDisplayOptions<'_>,
 ) {
     'rows: for (local_row_index, row) in rows.iter().enumerate() {
         let row_index = row_offset + local_row_index;
-        let text = display_text(row, timestamps);
+        let text = display_text(
+            row,
+            display_options.timestamps,
+            display_options.timestamp_format,
+        );
         let mut row_matched = false;
         for found in matcher.matcher.find_iter(&text) {
             if found.is_empty() {
@@ -180,6 +199,10 @@ mod tests {
     use chrono::Local;
 
     use super::*;
+    use crate::formatting::DEFAULT_TIMESTAMP_FORMAT;
+
+    const DISPLAY_OPTIONS: SearchDisplayOptions<'static> =
+        SearchDisplayOptions::new(false, DEFAULT_TIMESTAMP_FORMAT);
 
     fn row(text: &str) -> FormattedRow {
         FormattedRow {
@@ -191,7 +214,7 @@ mod tests {
     #[test]
     fn literal_search_is_case_insensitive_by_default() {
         let rows = vec![row("Ready READY"), row("idle"), row("ready")];
-        let index = search_rows(&rows, "ready", false, false, false);
+        let index = search_rows(&rows, "ready", false, false, DISPLAY_OPTIONS);
 
         assert_eq!(index.matches.len(), 3);
         assert_eq!(index.matched_rows, [0, 2]);
@@ -204,10 +227,10 @@ mod tests {
     #[test]
     fn regex_search_and_errors_are_reported() {
         let rows = vec![row("value=12"), row("value=x")];
-        let index = search_rows(&rows, r"value=\d+", true, true, false);
+        let index = search_rows(&rows, r"value=\d+", true, true, DISPLAY_OPTIONS);
         assert_eq!(index.matched_rows, [0]);
 
-        let invalid = search_rows(&rows, "(", true, true, false);
+        let invalid = search_rows(&rows, "(", true, true, DISPLAY_OPTIONS);
         assert!(invalid.error.is_some());
         assert!(invalid.matches.is_empty());
     }
@@ -216,9 +239,9 @@ mod tests {
     fn incremental_update_shifts_rows_and_indexes_appended_matches() {
         let matcher = SearchMatcher::new("ready", false, false).unwrap().unwrap();
         let initial = vec![row("ready 0"), row("idle"), row("ready 2")];
-        let mut index = search_rows_with_matcher(&initial, &matcher, false);
+        let mut index = search_rows_with_matcher(&initial, &matcher, DISPLAY_OPTIONS);
 
-        index.apply_display_update(3, 1, 0, &[row("ready 3")], &matcher, false);
+        index.apply_display_update(3, 1, 0, &[row("ready 3")], &matcher, DISPLAY_OPTIONS);
         assert_eq!(index.matched_rows, [1, 2]);
         assert_eq!(
             index
@@ -234,9 +257,9 @@ mod tests {
     fn incremental_update_replaces_tail_matches() {
         let matcher = SearchMatcher::new("ok", false, false).unwrap().unwrap();
         let initial = vec![row("first"), row("not yet")];
-        let mut index = search_rows_with_matcher(&initial, &matcher, false);
+        let mut index = search_rows_with_matcher(&initial, &matcher, DISPLAY_OPTIONS);
 
-        index.apply_display_update(2, 0, 1, &[row("now ok")], &matcher, false);
+        index.apply_display_update(2, 0, 1, &[row("now ok")], &matcher, DISPLAY_OPTIONS);
         assert_eq!(index.matched_rows, [1]);
         assert_eq!(index.matches[0].byte_range, 4..6);
     }

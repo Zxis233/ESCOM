@@ -7,6 +7,7 @@ use eframe::egui::ThemePreference;
 use serde::{Deserialize, Serialize};
 
 use crate::fonts::DEFAULT_FONT_WEIGHT;
+use crate::formatting::{DEFAULT_TIMESTAMP_FORMAT, is_valid_timestamp_format};
 use crate::model::{LineEnding, ReceiveMode, SendMode, TextEncoding};
 
 pub const SETTINGS_SCHEMA_VERSION: u32 = 6;
@@ -55,6 +56,7 @@ pub struct UiPreferences {
     pub send_mode: SendMode,
     pub text_encoding: TextEncoding,
     pub timestamps: bool,
+    pub timestamp_format: String,
     pub auto_scroll: bool,
     pub line_ending: LineEnding,
     pub repeat_interval_ms: u64,
@@ -82,6 +84,7 @@ impl Default for UiPreferences {
             send_mode: SendMode::Text,
             text_encoding: TextEncoding::Utf8,
             timestamps: false,
+            timestamp_format: DEFAULT_TIMESTAMP_FORMAT.to_owned(),
             auto_scroll: true,
             line_ending: LineEnding::CrLf,
             repeat_interval_ms: 1_000,
@@ -116,6 +119,9 @@ impl UiPreferences {
         self.repeat_interval_ms = self.repeat_interval_ms.clamp(20, 3_600_000);
         if !BUFFER_LIMIT_OPTIONS_MIB.contains(&self.buffer_limit_mib) {
             self.buffer_limit_mib = 20;
+        }
+        if !is_valid_timestamp_format(&self.timestamp_format) {
+            self.timestamp_format = DEFAULT_TIMESTAMP_FORMAT.to_owned();
         }
         self.background_light_opacity = sanitized_opacity(
             self.background_light_opacity,
@@ -177,6 +183,7 @@ impl From<&UiPreferences> for SettingsDocument {
                 mode: preferences.receive_mode.into(),
                 encoding: preferences.text_encoding.into(),
                 timestamps: preferences.timestamps,
+                timestamp_format: preferences.timestamp_format.clone(),
                 auto_scroll: preferences.auto_scroll,
                 buffer_limit_mib: preferences.buffer_limit_mib,
             },
@@ -211,6 +218,7 @@ impl From<SettingsDocument> for UiPreferences {
             send_mode: settings.send.mode.into(),
             text_encoding: settings.receive.encoding.into(),
             timestamps: settings.receive.timestamps,
+            timestamp_format: settings.receive.timestamp_format,
             auto_scroll: settings.receive.auto_scroll,
             line_ending: settings.send.line_ending.into(),
             repeat_interval_ms: settings.send.repeat_interval_ms,
@@ -272,6 +280,7 @@ struct ReceiveSettings {
     mode: ReceiveModeValue,
     encoding: TextEncodingValue,
     timestamps: bool,
+    timestamp_format: String,
     auto_scroll: bool,
     buffer_limit_mib: usize,
 }
@@ -283,6 +292,7 @@ impl Default for ReceiveSettings {
             mode: preferences.receive_mode.into(),
             encoding: preferences.text_encoding.into(),
             timestamps: preferences.timestamps,
+            timestamp_format: preferences.timestamp_format,
             auto_scroll: preferences.auto_scroll,
             buffer_limit_mib: preferences.buffer_limit_mib,
         }
@@ -611,7 +621,7 @@ fn render_toml(preferences: &UiPreferences) -> Result<String, toml::ser::Error> 
             "[interface]" => Some("# theme: system、light 或 dark"),
             "[fonts]" => Some("# family 留空表示自动选择；weight 范围 1-1000"),
             "[receive]" => Some(
-                "# mode: text、hex 或 terminal；encoding: utf8 或 gbk\n# buffer_limit_mib: 5、20、100 或 500",
+                "# mode: text、hex 或 terminal；encoding: utf8 或 gbk\n# timestamp_format: chrono/strftime 格式\n# buffer_limit_mib: 5、20、100 或 500",
             ),
             "[send]" => Some("# mode: text 或 hex；line_ending: none、cr、lf 或 crlf"),
             "[background]" => Some("# source: none、local 或 online；opacity 范围 0.0-1.0"),
@@ -644,6 +654,7 @@ mod tests {
             receive_mode: ReceiveMode::Terminal,
             send_mode: SendMode::Hex,
             timestamps: true,
+            timestamp_format: "%H:%M:%S%.6f".into(),
             background_local_path: r"C:\images\[send]\background.png".into(),
             ..Default::default()
         };
@@ -660,6 +671,7 @@ mod tests {
             r"C:\images\[send]\background.png"
         );
         assert!(loaded.timestamps);
+        assert_eq!(loaded.timestamp_format, "%H:%M:%S%.6f");
         assert_eq!(loaded.theme_preference, ThemePreference::System);
 
         let toml = fs::read_to_string(&test_path).unwrap();
@@ -689,6 +701,7 @@ mod tests {
             data_font_weight: 1001,
             repeat_interval_ms: 1,
             buffer_limit_mib: 7,
+            timestamp_format: "%Q".into(),
             ..Default::default()
         };
         preferences.sanitize();
@@ -699,6 +712,7 @@ mod tests {
         assert_eq!(preferences.data_font_weight, DEFAULT_FONT_WEIGHT);
         assert_eq!(preferences.repeat_interval_ms, 20);
         assert_eq!(preferences.buffer_limit_mib, 20);
+        assert_eq!(preferences.timestamp_format, DEFAULT_TIMESTAMP_FORMAT);
     }
 
     #[test]
@@ -716,6 +730,7 @@ mode = "hex"
         assert_eq!(preferences.receive_mode, ReceiveMode::Hex);
         assert_eq!(preferences.send_mode, SendMode::Text);
         assert_eq!(preferences.text_encoding, TextEncoding::Utf8);
+        assert_eq!(preferences.timestamp_format, DEFAULT_TIMESTAMP_FORMAT);
         assert_eq!(preferences.theme_preference, ThemePreference::System);
     }
 

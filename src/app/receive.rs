@@ -111,7 +111,10 @@ impl EscomApp {
                     replace_tail,
                     &rows,
                     matcher,
-                    self.preferences.timestamps,
+                    SearchDisplayOptions::new(
+                        self.preferences.timestamps,
+                        &self.preferences.timestamp_format,
+                    ),
                 );
             }
             self.search_index_generation = Some(generation);
@@ -293,6 +296,7 @@ impl EscomApp {
         let data_font = FontId::new(self.preferences.data_font_size, data_font_family());
         let rows = Arc::clone(&self.display_rows);
         let timestamps = self.preferences.timestamps;
+        let timestamp_format = self.preferences.timestamp_format.clone();
         let terminal_cursor = (self.preferences.receive_mode == ReceiveMode::Terminal)
             .then_some(self.terminal_cursor)
             .flatten();
@@ -348,7 +352,7 @@ impl EscomApp {
                     let Some(row) = rows.get(row_index) else {
                         continue;
                     };
-                    let text = display_text(row, timestamps);
+                    let text = display_text(row, timestamps, &timestamp_format);
                     let line_style = highlight_rules.style_for(&row.text);
                     let (match_offset, row_matches) = if search_current {
                         search_index.matches_for_row(row_index)
@@ -373,7 +377,13 @@ impl EscomApp {
                         && cursor_row == row_index
                     {
                         paint_terminal_cursor(
-                            ui, &response, row, &data_font, cursor_col, timestamps,
+                            ui,
+                            &response,
+                            row,
+                            &data_font,
+                            cursor_col,
+                            timestamps,
+                            &timestamp_format,
                         );
                     }
                 }
@@ -427,15 +437,23 @@ impl EscomApp {
         let mode = self.preferences.receive_mode;
         let encoding = self.preferences.text_encoding;
         let timestamps = self.preferences.timestamps;
+        let timestamp_format = self.preferences.timestamp_format.clone();
         let sender = self.background_tx.clone();
         let repaint_context = context.clone();
         self.export_in_progress = true;
         let spawn_result = thread::Builder::new()
             .name("escom-export".into())
             .spawn(move || {
-                let result = export_snapshot_to_file(&path, snapshot, mode, encoding, timestamps)
-                    .map(|()| path)
-                    .map_err(|error| format!("导出失败：{error}"));
+                let result = export_snapshot_to_file(
+                    &path,
+                    snapshot,
+                    mode,
+                    encoding,
+                    timestamps,
+                    &timestamp_format,
+                )
+                .map(|()| path)
+                .map_err(|error| format!("导出失败：{error}"));
                 let _ = sender.send(BackgroundEvent::Exported(result));
                 repaint_context.request_repaint();
             });
@@ -460,9 +478,9 @@ fn paint_terminal_cursor(
     font: &FontId,
     column: usize,
     timestamps: bool,
+    timestamp_format: &str,
 ) {
-    let timestamp_prefix =
-        timestamps.then(|| format!("[{}] ", row.received_at.format("%Y-%m-%d %H:%M:%S%.3f")));
+    let timestamp_prefix = timestamps.then(|| timestamp_prefix(row.received_at, timestamp_format));
     let (prefix_width, cell_width) = ui.fonts_mut(|fonts| {
         let prefix_width = timestamp_prefix.as_ref().map_or(0.0, |prefix| {
             fonts

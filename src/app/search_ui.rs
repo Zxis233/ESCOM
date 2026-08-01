@@ -86,6 +86,7 @@ impl EscomApp {
         let generation = self.display_generation;
         let rows = Arc::clone(&self.display_rows);
         let timestamps = self.preferences.timestamps;
+        let timestamp_format = self.preferences.timestamp_format.clone();
         let sender = self.background_tx.clone();
         let repaint_context = context.clone();
         self.search_pending = false;
@@ -95,7 +96,11 @@ impl EscomApp {
         thread::Builder::new()
             .name("escom-search".into())
             .spawn(move || {
-                let index = search::search_rows_with_matcher(&rows, &matcher, timestamps);
+                let index = search::search_rows_with_matcher(
+                    &rows,
+                    &matcher,
+                    SearchDisplayOptions::new(timestamps, &timestamp_format),
+                );
                 drop(rows);
                 let _ = sender.send(BackgroundEvent::Searched {
                     token,

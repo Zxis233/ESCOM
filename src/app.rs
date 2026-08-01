@@ -11,9 +11,10 @@ use serialport::{DataBits, FlowControl, Parity, StopBits};
 
 use crate::fonts::{FontCatalog, data_font_family};
 use crate::formatting::{
-    DisplayFormatter, DisplayUpdate, FormattedRow, MAX_DISPLAY_INCREMENT_BYTES, MAX_DISPLAY_ROWS,
-    MAX_DISPLAY_TEXT_BYTES, display_snapshot_limit, display_text, encode_text,
-    export_snapshot_to_file, parse_send_input,
+    DEFAULT_TIMESTAMP_FORMAT, DisplayFormatter, DisplayUpdate, FormattedRow,
+    MAX_DISPLAY_INCREMENT_BYTES, MAX_DISPLAY_ROWS, MAX_DISPLAY_TEXT_BYTES, display_snapshot_limit,
+    display_text, encode_text, export_snapshot_to_file, format_timestamp,
+    is_valid_timestamp_format, parse_send_input, timestamp_prefix,
 };
 use crate::highlight::{self, HighlightRules, HighlightStyle};
 use crate::icon;
@@ -21,7 +22,7 @@ use crate::model::{
     HistoryItem, LineEnding, ReceiveMode, SendMode, SerialConfig, TextEncoding, data_bits_label,
     flow_control_label, parity_label, parse_baud_rate, stop_bits_label,
 };
-use crate::search::{self, SearchIndex, SearchMatch, SearchMatcher};
+use crate::search::{self, SearchDisplayOptions, SearchIndex, SearchMatch, SearchMatcher};
 use crate::serial_worker::{WorkerEvent, WorkerHandle};
 use crate::settings::{
     self, AppBackgroundSource, BUFFER_LIMIT_OPTIONS_MIB, DEFAULT_BACKGROUND_DARK_OPACITY,
@@ -63,6 +64,7 @@ const COMMON_BAUD_RATES: [u32; 18] = [
 enum SettingsTab {
     Fonts,
     Background,
+    Misc,
 }
 
 enum BackgroundLoadState {
@@ -177,6 +179,7 @@ pub struct EscomApp {
     settings_open: bool,
     settings_center_on_open: bool,
     settings_tab: SettingsTab,
+    timestamp_format_draft: String,
     background_url_draft: String,
     background_light_opacity_draft: String,
     background_dark_opacity_draft: String,
@@ -245,6 +248,7 @@ impl EscomApp {
         });
 
         let background_url_draft = preferences.background_online_url.clone();
+        let timestamp_format_draft = preferences.timestamp_format.clone();
         let background_light_opacity_draft =
             settings_ui::format_background_opacity(preferences.background_light_opacity);
         let background_dark_opacity_draft =
@@ -303,6 +307,7 @@ impl EscomApp {
             settings_open: false,
             settings_center_on_open: false,
             settings_tab: SettingsTab::Fonts,
+            timestamp_format_draft,
             background_url_draft,
             background_light_opacity_draft,
             background_dark_opacity_draft,

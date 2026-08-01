@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write as _};
 use std::path::Path;
 
+use chrono::format::{Item, StrftimeItems};
 use chrono::{DateTime, Local};
 use encoding_rs::{CoderResult, GBK, UTF_8};
 
@@ -15,6 +16,7 @@ pub const MAX_DISPLAY_ROWS: usize = 100_000;
 pub const MAX_DISPLAY_TEXT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_DISPLAY_LINE_BYTES: usize = 512 * 1024;
 pub const MAX_DISPLAY_INCREMENT_BYTES: usize = 128 * 1024;
+pub const DEFAULT_TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
 const MAX_TEXT_REBUILD_BYTES: usize = 16 * 1024 * 1024;
 const HEX_BYTES_PER_ROW: usize = 16;
 const EXPORT_BUFFER_BYTES: usize = 64 * 1024;
@@ -611,10 +613,18 @@ pub fn export_snapshot_to_file(
     mode: ReceiveMode,
     encoding: TextEncoding,
     timestamps: bool,
+    timestamp_format: &str,
 ) -> io::Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::with_capacity(EXPORT_BUFFER_BYTES, file);
-    write_export(&mut writer, snapshot, mode, encoding, timestamps)?;
+    write_export(
+        &mut writer,
+        snapshot,
+        mode,
+        encoding,
+        timestamps,
+        timestamp_format,
+    )?;
     writer.flush()
 }
 
@@ -624,21 +634,40 @@ pub fn write_export<W: io::Write + ?Sized>(
     mode: ReceiveMode,
     encoding: TextEncoding,
     timestamps: bool,
+    timestamp_format: &str,
 ) -> io::Result<()> {
     writer.write_all(&UTF8_BOM)?;
     match mode {
         ReceiveMode::Text | ReceiveMode::Terminal => {
-            write_text_export(writer, snapshot, encoding, timestamps)
+            write_text_export(writer, snapshot, encoding, timestamps, timestamp_format)
         }
-        ReceiveMode::Hex => write_hex_export(writer, snapshot, timestamps),
+        ReceiveMode::Hex => write_hex_export(writer, snapshot, timestamps, timestamp_format),
     }
 }
 
-pub fn display_text(row: &FormattedRow, timestamps: bool) -> String {
+pub fn is_valid_timestamp_format(timestamp_format: &str) -> bool {
+    !timestamp_format.is_empty()
+        && !StrftimeItems::new(timestamp_format).any(|item| matches!(item, Item::Error))
+}
+
+pub fn format_timestamp(received_at: DateTime<Local>, timestamp_format: &str) -> String {
+    let timestamp_format = if is_valid_timestamp_format(timestamp_format) {
+        timestamp_format
+    } else {
+        DEFAULT_TIMESTAMP_FORMAT
+    };
+    received_at.format(timestamp_format).to_string()
+}
+
+pub fn timestamp_prefix(received_at: DateTime<Local>, timestamp_format: &str) -> String {
+    format!("[{}] ", format_timestamp(received_at, timestamp_format))
+}
+
+pub fn display_text(row: &FormattedRow, timestamps: bool, timestamp_format: &str) -> String {
     if timestamps {
         format!(
-            "[{}] {}",
-            row.received_at.format("%Y-%m-%d %H:%M:%S%.3f"),
+            "{}{}",
+            timestamp_prefix(row.received_at, timestamp_format),
             row.text
         )
     } else {
@@ -702,6 +731,7 @@ fn write_text_export<W: io::Write + ?Sized>(
     snapshot: ReceiveSnapshot,
     encoding: TextEncoding,
     timestamps: bool,
+    timestamp_format: &str,
 ) -> io::Result<()> {
     let selected_encoding = match encoding {
         TextEncoding::Utf8 => UTF_8,
@@ -709,7 +739,7 @@ fn write_text_export<W: io::Write + ?Sized>(
     };
     let mut decoder = selected_encoding.new_decoder_without_bom_handling();
     let mut decoded = String::with_capacity(EXPORT_DECODE_INPUT_BYTES * 3);
-    let mut exporter = StreamingTextExporter::new(writer, timestamps);
+    let mut exporter = StreamingTextExporter::new(writer, timestamps, timestamp_format);
 
     let flush_time = snapshot
         .chunks
@@ -771,16 +801,18 @@ fn decode_export_piece<W: io::Write + ?Sized>(
 struct StreamingTextExporter<'a, W: io::Write + ?Sized> {
     writer: &'a mut W,
     timestamps: bool,
+    timestamp_format: &'a str,
     line_open: bool,
     line_started_at: Option<DateTime<Local>>,
     skip_lf_after_cr: bool,
 }
 
 impl<'a, W: io::Write + ?Sized> StreamingTextExporter<'a, W> {
-    fn new(writer: &'a mut W, timestamps: bool) -> Self {
+    fn new(writer: &'a mut W, timestamps: bool, timestamp_format: &'a str) -> Self {
         Self {
             writer,
             timestamps,
+            timestamp_format,
             line_open: false,
             line_started_at: None,
             skip_lf_after_cr: false,
@@ -841,11 +873,8 @@ impl<'a, W: io::Write + ?Sized> StreamingTextExporter<'a, W> {
         }
         if self.timestamps {
             let timestamp = self.line_started_at.unwrap_or(received_at);
-            write!(
-                self.writer,
-                "[{}] ",
-                timestamp.format("%Y-%m-%d %H:%M:%S%.3f")
-            )?;
+            self.writer
+                .write_all(timestamp_prefix(timestamp, self.timestamp_format).as_bytes())?;
         }
         self.line_open = true;
         Ok(())
@@ -872,10 +901,11 @@ fn write_hex_export<W: io::Write + ?Sized>(
     writer: &mut W,
     snapshot: ReceiveSnapshot,
     timestamps: bool,
+    timestamp_format: &str,
 ) -> io::Result<()> {
     for chunk in snapshot.chunks {
         for bytes in chunk.bytes.chunks(HEX_BYTES_PER_ROW) {
-            write_export_timestamp(writer, chunk.received_at, timestamps)?;
+            write_export_timestamp(writer, chunk.received_at, timestamps, timestamp_format)?;
             let mut encoded = [0_u8; HEX_BYTES_PER_ROW * 3 - 1];
             for (index, byte) in bytes.iter().copied().enumerate() {
                 let offset = index * 3;
@@ -896,9 +926,10 @@ fn write_export_timestamp<W: io::Write + ?Sized>(
     writer: &mut W,
     received_at: DateTime<Local>,
     timestamps: bool,
+    timestamp_format: &str,
 ) -> io::Result<()> {
     if timestamps {
-        write!(writer, "[{}] ", received_at.format("%Y-%m-%d %H:%M:%S%.3f"))?;
+        writer.write_all(timestamp_prefix(received_at, timestamp_format).as_bytes())?;
     }
     Ok(())
 }
@@ -1314,11 +1345,30 @@ mod tests {
             ReceiveMode::Text,
             TextEncoding::Utf8,
             false,
+            DEFAULT_TIMESTAMP_FORMAT,
         )
         .unwrap();
 
         assert!(bytes.starts_with(&[0xEF, 0xBB, 0xBF]));
         assert_eq!(std::str::from_utf8(&bytes[3..]).unwrap(), "数据\r\n");
+    }
+
+    #[test]
+    fn timestamp_format_is_validated_and_applied_to_display_text() {
+        let row = FormattedRow {
+            received_at: timestamp(1),
+            text: "ready".to_owned(),
+        };
+
+        assert!(is_valid_timestamp_format(DEFAULT_TIMESTAMP_FORMAT));
+        assert!(is_valid_timestamp_format("%H:%M:%S"));
+        assert!(!is_valid_timestamp_format(""));
+        assert!(!is_valid_timestamp_format("%Q"));
+        assert_eq!(display_text(&row, true, "%H:%M:%S"), "[12:00:01] ready");
+        assert_eq!(
+            format_timestamp(row.received_at, "%Q"),
+            "2026-07-31 12:00:01.000"
+        );
     }
 
     #[test]
@@ -1336,6 +1386,7 @@ mod tests {
             ReceiveMode::Text,
             TextEncoding::Utf8,
             false,
+            DEFAULT_TIMESTAMP_FORMAT,
         )
         .unwrap();
 
@@ -1359,6 +1410,7 @@ mod tests {
             ReceiveMode::Text,
             TextEncoding::Utf8,
             true,
+            DEFAULT_TIMESTAMP_FORMAT,
         )
         .unwrap();
 
@@ -1382,6 +1434,7 @@ mod tests {
             ReceiveMode::Text,
             TextEncoding::Utf8,
             true,
+            DEFAULT_TIMESTAMP_FORMAT,
         )
         .unwrap();
 
@@ -1411,6 +1464,7 @@ mod tests {
             ReceiveMode::Text,
             TextEncoding::Gbk,
             false,
+            DEFAULT_TIMESTAMP_FORMAT,
         )
         .unwrap();
 
@@ -1421,7 +1475,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_hex_export_preserves_chunk_timestamps() {
+    fn streaming_hex_export_uses_custom_timestamp_format() {
         let mut store = ReceiveStore::new(1024);
         store.append(timestamp(1), vec![0x00, 0x01, 0xAB]);
         store.append(timestamp(2), vec![0xFF]);
@@ -1433,12 +1487,13 @@ mod tests {
             ReceiveMode::Hex,
             TextEncoding::Utf8,
             true,
+            "%H:%M:%S",
         )
         .unwrap();
 
         assert_eq!(
             std::str::from_utf8(&output[UTF8_BOM.len()..]).unwrap(),
-            "[2026-07-31 12:00:01.000] 00 01 AB\r\n[2026-07-31 12:00:02.000] FF\r\n"
+            "[12:00:01] 00 01 AB\r\n[12:00:02] FF\r\n"
         );
     }
 
@@ -1471,6 +1526,7 @@ mod tests {
             ReceiveMode::Text,
             TextEncoding::Utf8,
             false,
+            DEFAULT_TIMESTAMP_FORMAT,
         )
         .unwrap_err();
 
@@ -1529,6 +1585,7 @@ mod tests {
             ReceiveMode::Hex,
             TextEncoding::Utf8,
             false,
+            DEFAULT_TIMESTAMP_FORMAT,
         )
         .unwrap();
 
@@ -1566,6 +1623,7 @@ mod tests {
             ReceiveMode::Text,
             TextEncoding::Utf8,
             false,
+            DEFAULT_TIMESTAMP_FORMAT,
         )
         .unwrap();
 

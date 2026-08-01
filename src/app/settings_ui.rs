@@ -141,6 +141,7 @@ impl EscomApp {
             match self.settings_tab {
                 SettingsTab::Fonts => self.show_font_settings_tab(ui, context),
                 SettingsTab::Background => self.show_background_settings_tab(ui, context),
+                SettingsTab::Misc => self.show_misc_settings_tab(ui),
             }
         });
         self.settings_center_on_open = false;
@@ -149,12 +150,13 @@ impl EscomApp {
 
     pub(super) fn show_settings_tabs(&mut self, ui: &mut egui::Ui) {
         let gap = ui.spacing().item_spacing.x;
-        let tab_width = (ui.available_width() - gap) * 0.5;
+        let tab_width = (ui.available_width() - gap * 2.0) / 3.0;
         let control_height = toolbar_control_height(ui).max(38.0);
         ui.horizontal(|ui| {
             for (tab, label) in [
                 (SettingsTab::Fonts, "字体与显示"),
                 (SettingsTab::Background, "应用背景"),
+                (SettingsTab::Misc, "杂项"),
             ] {
                 if ui
                     .add(
@@ -172,7 +174,6 @@ impl EscomApp {
     pub(super) fn show_font_settings_tab(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         let mut font_changed = false;
         let mut preferences_changed = false;
-        let mut buffer_changed = false;
 
         settings_card(
             ui,
@@ -312,6 +313,143 @@ impl EscomApp {
             },
         );
 
+        ui.add_space(9.0);
+        ui.label(
+            RichText::new(
+                "字体来自 Windows 已安装字体；不支持的字重会自动恢复为该字体的默认字重。",
+            )
+            .small()
+            .color(ui.visuals().weak_text_color()),
+        );
+
+        if font_changed {
+            let applied = self.font_catalog.apply(
+                context,
+                &self.preferences.ui_font_family,
+                &self.preferences.data_font_family,
+                self.preferences.ui_font_weight,
+                self.preferences.data_font_weight,
+                self.preferences.ui_font_size,
+            );
+            self.preferences.ui_font_family = applied.ui_family;
+            self.preferences.data_font_family = applied.data_family;
+            self.preferences.ui_font_weight = applied.ui_weight;
+            self.preferences.data_font_weight = applied.data_weight;
+            if !applied.warnings.is_empty() {
+                self.set_notice(applied.warnings.join("；"), true);
+            }
+            preferences_changed = true;
+        }
+        if preferences_changed {
+            self.mark_preferences_dirty();
+        }
+    }
+
+    pub(super) fn show_misc_settings_tab(&mut self, ui: &mut egui::Ui) {
+        let mut timestamp_format_changed = false;
+        let mut buffer_changed = false;
+
+        settings_card(
+            ui,
+            "时间戳",
+            "设置接收区和导出文件使用的时间戳格式。",
+            |ui| {
+                let compact = ui.available_width() < 420.0;
+                if compact {
+                    ui.label("格式");
+                    ui.add_space(3.0);
+                }
+                ui.horizontal(|ui| {
+                    if !compact {
+                        settings_row_label(ui, "格式");
+                    }
+                    let valid = is_valid_timestamp_format(&self.timestamp_format_draft);
+                    let text_color = if valid {
+                        ui.visuals().text_color()
+                    } else {
+                        ui.visuals().error_fg_color
+                    };
+                    let control_height = toolbar_control_height(ui);
+                    let button_width = text_field_width(ui, "恢复默认", 96.0);
+                    let gap = ui.spacing().item_spacing.x;
+                    let field_width = (ui.available_width() - button_width - gap).max(48.0);
+                    let response = ui.add_sized(
+                        [field_width, control_height],
+                        egui::TextEdit::singleline(&mut self.timestamp_format_draft)
+                            .char_limit(128)
+                            .vertical_align(Align::Center)
+                            .text_color(text_color),
+                    );
+                    if response.changed()
+                        && is_valid_timestamp_format(&self.timestamp_format_draft)
+                        && self.preferences.timestamp_format != self.timestamp_format_draft
+                    {
+                        self.preferences
+                            .timestamp_format
+                            .clone_from(&self.timestamp_format_draft);
+                        timestamp_format_changed = true;
+                    }
+                    response.on_hover_text("strftime 格式，例如 %Y-%m-%d %H:%M:%S%.3f");
+
+                    if ui
+                        .add_sized(
+                            [button_width, control_height],
+                            egui::Button::new("恢复默认"),
+                        )
+                        .clicked()
+                    {
+                        self.timestamp_format_draft = DEFAULT_TIMESTAMP_FORMAT.to_owned();
+                        if self.preferences.timestamp_format != self.timestamp_format_draft {
+                            self.preferences
+                                .timestamp_format
+                                .clone_from(&self.timestamp_format_draft);
+                            timestamp_format_changed = true;
+                        }
+                    }
+                });
+
+                ui.add_space(10.0);
+                if compact {
+                    ui.label("预览");
+                    ui.add_space(3.0);
+                }
+                ui.horizontal(|ui| {
+                    if !compact {
+                        settings_row_label(ui, "预览");
+                    }
+                    ui.add_space(4.0);
+                    if is_valid_timestamp_format(&self.timestamp_format_draft) {
+                        ui.label(format!(
+                            "[{}]",
+                            format_timestamp(Local::now(), &self.timestamp_format_draft)
+                        ));
+                    } else {
+                        ui.label(
+                            RichText::new("格式无效，请检查 % 指令")
+                                .color(ui.visuals().error_fg_color),
+                        );
+                    }
+                });
+
+                ui.add_space(4.0);
+                let instruction_indent = if compact {
+                    4.0
+                } else {
+                    SETTINGS_LABEL_WIDTH + ui.spacing().item_spacing.x + 4.0
+                };
+                ui.horizontal(|ui| {
+                    ui.add_space(instruction_indent);
+                    ui.label(
+                        RichText::new(
+                            "常用指令：%Y 年、%m 月、%d 日、%H 时、%M 分、%S 秒、%.3f 毫秒。",
+                        )
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                });
+            },
+        );
+
         ui.add_space(10.0);
         settings_card(
             ui,
@@ -344,41 +482,15 @@ impl EscomApp {
             },
         );
 
-        ui.add_space(9.0);
-        ui.label(
-            RichText::new(
-                "字体来自 Windows 已安装字体；不支持的字重会自动恢复为该字体的默认字重。",
-            )
-            .small()
-            .color(ui.visuals().weak_text_color()),
-        );
-
-        if font_changed {
-            let applied = self.font_catalog.apply(
-                context,
-                &self.preferences.ui_font_family,
-                &self.preferences.data_font_family,
-                self.preferences.ui_font_weight,
-                self.preferences.data_font_weight,
-                self.preferences.ui_font_size,
-            );
-            self.preferences.ui_font_family = applied.ui_family;
-            self.preferences.data_font_family = applied.data_family;
-            self.preferences.ui_font_weight = applied.ui_weight;
-            self.preferences.data_font_weight = applied.data_weight;
-            if !applied.warnings.is_empty() {
-                self.set_notice(applied.warnings.join("；"), true);
-            }
-            preferences_changed = true;
+        if timestamp_format_changed {
+            self.request_search(true);
+            self.mark_preferences_dirty();
         }
         if buffer_changed {
             if let Ok(mut store) = self.store.lock() {
                 store.set_limit(self.preferences.buffer_limit_bytes());
             }
             self.invalidate_format();
-            preferences_changed = true;
-        }
-        if preferences_changed {
             self.mark_preferences_dirty();
         }
     }
