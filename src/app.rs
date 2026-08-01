@@ -25,8 +25,8 @@ use crate::search::{self, SearchIndex, SearchMatch, SearchMatcher};
 use crate::serial_worker::{WorkerEvent, WorkerHandle};
 use crate::settings::{
     self, AppBackgroundSource, BUFFER_LIMIT_OPTIONS_MIB, DEFAULT_BACKGROUND_DARK_OPACITY,
-    DEFAULT_BACKGROUND_LIGHT_OPACITY, MAX_DATA_LINE_SPACING, MAX_FONT_SIZE, MIN_DATA_LINE_SPACING,
-    MIN_FONT_SIZE, UiPreferences,
+    DEFAULT_BACKGROUND_LIGHT_OPACITY, MAX_DATA_FONT_SIZE, MAX_DATA_LINE_SPACING, MAX_UI_FONT_SIZE,
+    MIN_DATA_LINE_SPACING, MIN_FONT_SIZE, UiPreferences,
 };
 use crate::store::ReceiveStore;
 use crate::window_chrome;
@@ -36,14 +36,14 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 const PORT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const NOTICE_DURATION: Duration = Duration::from_secs(6);
 const MAX_HISTORY: usize = 50;
-const CONNECTION_CONTROL_HEIGHT: f32 = 32.0;
+const MIN_CONTROL_HEIGHT: f32 = 32.0;
 const SEARCH_BAR_RIGHT_PADDING: f32 = 8.0;
 const CONFIG_LABEL_WIDTH: f32 = 48.0;
 const CONFIG_COMBO_WIDTH: f32 = 100.0;
 const SETTINGS_LABEL_WIDTH: f32 = 76.0;
-const SETTINGS_CONTROLS_WIDTH: f32 = 476.0;
 const SETTINGS_WINDOW_WIDTH: f32 = 660.0;
 const SETTINGS_WINDOW_HEIGHT: f32 = 454.0;
+const SETTINGS_VIEWPORT_MARGIN: f32 = 16.0;
 const SEND_EDITOR_LIGHT_ALPHA: u8 = 120;
 const SEND_EDITOR_DARK_ALPHA: u8 = 104;
 const COMMON_BAUD_RATES: [u32; 18] = [
@@ -165,6 +165,7 @@ pub struct EscomApp {
     background_rx: Receiver<BackgroundEvent>,
 
     settings_open: bool,
+    settings_center_on_open: bool,
     settings_tab: SettingsTab,
     background_url_draft: String,
     background_load_uri: Option<String>,
@@ -278,6 +279,7 @@ impl EscomApp {
             background_tx,
             background_rx,
             settings_open: false,
+            settings_center_on_open: false,
             settings_tab: SettingsTab::Fonts,
             background_url_draft,
             background_load_uri: None,
@@ -936,6 +938,8 @@ impl EscomApp {
     fn show_baud_rate_control(&mut self, ui: &mut egui::Ui) {
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
+            let control_height = toolbar_control_height(ui);
+            let input_width = text_field_width(ui, "4000000", 96.0);
 
             let input_color = if parse_baud_rate(&self.baud_rate_input).is_err() {
                 ui.visuals().error_fg_color
@@ -943,7 +947,7 @@ impl EscomApp {
                 ui.visuals().text_color()
             };
             let response = ui.add_sized(
-                [96.0, CONNECTION_CONTROL_HEIGHT],
+                [input_width, control_height],
                 egui::TextEdit::singleline(&mut self.baud_rate_input)
                     .char_limit(10)
                     .text_color(input_color)
@@ -972,7 +976,7 @@ impl EscomApp {
             let mut selected_rate = None;
             let combo_response = egui::ComboBox::from_id_salt("baud_rate_presets")
                 .selected_text("常用")
-                .width(58.0)
+                .width(combo_width(ui, "常用", 58.0))
                 .height(300.0)
                 .show_ui(ui, |ui| {
                     ui.set_min_width(116.0);
@@ -1007,10 +1011,11 @@ impl EscomApp {
             .frame(panel_frame)
             .show(root_ui, |ui| {
                 ui.add_space(4.0);
-                ui.spacing_mut().interact_size.y = CONNECTION_CONTROL_HEIGHT;
-                ui.horizontal(|ui| {
+                let control_height = toolbar_control_height(ui);
+                ui.spacing_mut().interact_size.y = control_height;
+                ui.horizontal_wrapped(|ui| {
                     ui.allocate_ui_with_layout(
-                        egui::vec2(76.0, CONNECTION_CONTROL_HEIGHT),
+                        egui::vec2(76.0, control_height),
                         Layout::left_to_right(Align::Center),
                         |ui| {
                             ui.label(RichText::new("ESCOM").size(20.0).strong());
@@ -1022,7 +1027,7 @@ impl EscomApp {
                     ui.add_enabled_ui(editable, |ui| {
                         egui::ComboBox::from_id_salt("serial_port")
                             .selected_text(self.port_display_name())
-                            .width(112.0)
+                            .width(combo_width(ui, &self.port_display_name(), 112.0))
                             .show_ui(ui, |ui| {
                                 for port in &self.ports {
                                     ui.selectable_value(
@@ -1033,7 +1038,10 @@ impl EscomApp {
                                 }
                             });
                         if ui
-                            .add_sized([56.0, CONNECTION_CONTROL_HEIGHT], egui::Button::new("刷新"))
+                            .add(
+                                egui::Button::new("刷新")
+                                    .min_size(egui::vec2(56.0, control_height)),
+                            )
                             .on_hover_text("重新扫描可用串口")
                             .clicked()
                         {
@@ -1047,45 +1055,42 @@ impl EscomApp {
                         self.show_baud_rate_control(ui);
                     });
 
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let button_text = match self.connection {
-                            ConnectionState::Disconnected => "打开串口",
-                            ConnectionState::Connecting => "正在连接...",
-                            ConnectionState::Connected(_) => "关闭串口",
-                        };
-                        let enabled = !matches!(self.connection, ConnectionState::Connecting);
-                        if ui
-                            .add_enabled_ui(enabled, |ui| {
-                                ui.add_sized(
-                                    [88.0, CONNECTION_CONTROL_HEIGHT],
-                                    egui::Button::new(button_text),
-                                )
-                            })
-                            .inner
-                            .clicked()
-                        {
-                            if self.connection.is_connected() {
-                                self.repeat = None;
-                                if let Err(message) = self.worker.close() {
-                                    self.set_notice(message, true);
-                                }
-                            } else {
-                                self.open_selected_port();
+                    let button_text = match self.connection {
+                        ConnectionState::Disconnected => "打开串口",
+                        ConnectionState::Connecting => "正在连接...",
+                        ConnectionState::Connected(_) => "关闭串口",
+                    };
+                    let enabled = !matches!(self.connection, ConnectionState::Connecting);
+                    if ui
+                        .add_enabled(
+                            enabled,
+                            egui::Button::new(button_text)
+                                .min_size(egui::vec2(88.0, control_height)),
+                        )
+                        .clicked()
+                    {
+                        if self.connection.is_connected() {
+                            self.repeat = None;
+                            if let Err(message) = self.worker.close() {
+                                self.set_notice(message, true);
                             }
+                        } else {
+                            self.open_selected_port();
                         }
-                        if ui
-                            .add_sized([60.0, CONNECTION_CONTROL_HEIGHT], egui::Button::new("设置"))
-                            .clicked()
-                        {
-                            self.background_url_draft
-                                .clone_from(&self.preferences.background_online_url);
-                            self.settings_open = true;
-                        }
-                    });
+                    }
+                    if ui
+                        .add(egui::Button::new("设置").min_size(egui::vec2(60.0, control_height)))
+                        .clicked()
+                    {
+                        self.background_url_draft
+                            .clone_from(&self.preferences.background_online_url);
+                        self.settings_open = true;
+                        self.settings_center_on_open = true;
+                    }
                 });
 
-                ui.horizontal(|ui| {
-                    ui.set_min_height(CONNECTION_CONTROL_HEIGHT);
+                ui.horizontal_wrapped(|ui| {
+                    ui.set_min_height(control_height);
                     let editable = self.connection.is_disconnected();
                     ui.add_enabled_ui(editable, |ui| {
                         config_combo(
@@ -1194,8 +1199,9 @@ impl EscomApp {
             .show(root_ui, |ui| {
                 let mut preferences_changed = false;
                 let mut display_changed = false;
-                ui.spacing_mut().interact_size.y = CONNECTION_CONTROL_HEIGHT;
-                ui.horizontal(|ui| {
+                let control_height = toolbar_control_height(ui);
+                ui.spacing_mut().interact_size.y = control_height;
+                ui.horizontal_wrapped(|ui| {
                     toolbar_label(ui, "接收", 38.0);
                     for mode in [ReceiveMode::Text, ReceiveMode::Hex, ReceiveMode::Terminal] {
                         let width = if mode == ReceiveMode::Terminal {
@@ -1204,12 +1210,12 @@ impl EscomApp {
                             50.0
                         };
                         if ui
-                            .add_sized(
-                                [width, CONNECTION_CONTROL_HEIGHT],
+                            .add(
                                 egui::Button::selectable(
                                     self.preferences.receive_mode == mode,
                                     mode.label(),
-                                ),
+                                )
+                                .min_size(egui::vec2(width, control_height)),
                             )
                             .clicked()
                             && self.preferences.receive_mode != mode
@@ -1223,9 +1229,10 @@ impl EscomApp {
                             preferences_changed = true;
                         }
                     }
+                    let encoding_label = self.preferences.text_encoding.label();
                     egui::ComboBox::from_id_salt("text_encoding")
-                        .selected_text(self.preferences.text_encoding.label())
-                        .width(92.0)
+                        .selected_text(encoding_label)
+                        .width(combo_width(ui, encoding_label, 92.0))
                         .show_ui(ui, |ui| {
                             for encoding in [TextEncoding::Utf8, TextEncoding::Gbk] {
                                 if ui
@@ -1242,20 +1249,14 @@ impl EscomApp {
                             }
                         });
                     let timestamps_changed = ui
-                        .add_sized(
-                            [76.0, CONNECTION_CONTROL_HEIGHT],
-                            egui::Checkbox::new(&mut self.preferences.timestamps, "时间戳"),
-                        )
+                        .checkbox(&mut self.preferences.timestamps, "时间戳")
                         .changed();
                     preferences_changed |= timestamps_changed;
                     if timestamps_changed {
                         self.request_search(true);
                     }
                     preferences_changed |= ui
-                        .add_sized(
-                            [88.0, CONNECTION_CONTROL_HEIGHT],
-                            egui::Checkbox::new(&mut self.preferences.auto_scroll, "自动滚动"),
-                        )
+                        .checkbox(&mut self.preferences.auto_scroll, "自动滚动")
                         .changed();
 
                     let pause_label = if self.paused {
@@ -1264,9 +1265,9 @@ impl EscomApp {
                         "暂停显示"
                     };
                     if ui
-                        .add_sized(
-                            [80.0, CONNECTION_CONTROL_HEIGHT],
-                            egui::Button::new(pause_label),
+                        .add(
+                            egui::Button::new(pause_label)
+                                .min_size(egui::vec2(80.0, control_height)),
                         )
                         .clicked()
                     {
@@ -1274,10 +1275,7 @@ impl EscomApp {
                         self.invalidate_format();
                     }
                     if ui
-                        .add_sized(
-                            [64.0, CONNECTION_CONTROL_HEIGHT],
-                            egui::Button::new("到底部"),
-                        )
+                        .add(egui::Button::new("到底部").min_size(egui::vec2(64.0, control_height)))
                         .clicked()
                     {
                         self.force_scroll_bottom = true;
@@ -1287,18 +1285,15 @@ impl EscomApp {
 
                     toolbar_separator(ui);
                     if ui
-                        .add_sized(
-                            [64.0, CONNECTION_CONTROL_HEIGHT],
-                            egui::Button::new("清接收"),
-                        )
+                        .add(egui::Button::new("清接收").min_size(egui::vec2(64.0, control_height)))
                         .clicked()
                     {
                         self.clear_receive();
                     }
                     if ui
-                        .add_sized(
-                            [80.0, CONNECTION_CONTROL_HEIGHT],
-                            egui::Button::new("全部清空"),
+                        .add(
+                            egui::Button::new("全部清空")
+                                .min_size(egui::vec2(80.0, control_height)),
                         )
                         .clicked()
                     {
@@ -1308,9 +1303,9 @@ impl EscomApp {
                     }
                     if ui
                         .add_enabled_ui(self.receive_bytes_len() > 0, |ui| {
-                            ui.add_sized(
-                                [80.0, CONNECTION_CONTROL_HEIGHT],
-                                egui::Button::new("导出 TXT"),
+                            ui.add(
+                                egui::Button::new("导出 TXT")
+                                    .min_size(egui::vec2(80.0, control_height)),
                             )
                         })
                         .inner
@@ -1345,12 +1340,13 @@ impl EscomApp {
         let mut navigation = 0_isize;
         let mut highlight_action = None;
         let search_current = self.search_index_is_current();
-        ui.horizontal(|ui| {
+        let control_height = toolbar_control_height(ui);
+        ui.horizontal_wrapped(|ui| {
             toolbar_label(ui, "查找", 38.0);
             let search_width = (ui.available_width() - 520.0 - SEARCH_BAR_RIGHT_PADDING).max(160.0);
             let search_id = ui.make_persistent_id("receive_search_input");
             let response = ui.add_sized(
-                [search_width, CONNECTION_CONTROL_HEIGHT],
+                [search_width, control_height],
                 egui::TextEdit::singleline(&mut self.search_query)
                     .id(search_id)
                     .hint_text("输入文本或正则表达式（Ctrl+F）")
@@ -1372,7 +1368,7 @@ impl EscomApp {
             if ui
                 .add_enabled(
                     !self.search_query.is_empty(),
-                    egui::Button::new("×").min_size(egui::vec2(32.0, CONNECTION_CONTROL_HEIGHT)),
+                    egui::Button::new("×").min_size(egui::vec2(32.0, control_height)),
                 )
                 .on_hover_text("清除搜索")
                 .clicked()
@@ -1382,9 +1378,9 @@ impl EscomApp {
             }
 
             if ui
-                .add_sized(
-                    [44.0, CONNECTION_CONTROL_HEIGHT],
-                    egui::Button::selectable(self.search_case_sensitive, "Aa"),
+                .add(
+                    egui::Button::selectable(self.search_case_sensitive, "Aa")
+                        .min_size(egui::vec2(44.0, control_height)),
                 )
                 .on_hover_text("区分大小写")
                 .clicked()
@@ -1393,9 +1389,9 @@ impl EscomApp {
                 search_changed = true;
             }
             if ui
-                .add_sized(
-                    [44.0, CONNECTION_CONTROL_HEIGHT],
-                    egui::Button::selectable(self.search_regex, ".*"),
+                .add(
+                    egui::Button::selectable(self.search_regex, ".*")
+                        .min_size(egui::vec2(44.0, control_height)),
                 )
                 .on_hover_text("使用正则表达式")
                 .clicked()
@@ -1412,7 +1408,7 @@ impl EscomApp {
                         && !self.search_in_progress
                         && self.search_index.error.is_none(),
                     egui::Button::selectable(self.search_filter, "过滤")
-                        .min_size(egui::vec2(64.0, CONNECTION_CONTROL_HEIGHT)),
+                        .min_size(egui::vec2(64.0, control_height)),
                 )
                 .on_hover_text("只显示包含匹配项的行");
             if filter_response.clicked() {
@@ -1427,8 +1423,7 @@ impl EscomApp {
             if ui
                 .add_enabled(
                     can_navigate,
-                    egui::Button::new("上一处")
-                        .min_size(egui::vec2(56.0, CONNECTION_CONTROL_HEIGHT)),
+                    egui::Button::new("上一处").min_size(egui::vec2(56.0, control_height)),
                 )
                 .clicked()
             {
@@ -1437,8 +1432,7 @@ impl EscomApp {
             if ui
                 .add_enabled(
                     can_navigate,
-                    egui::Button::new("下一处")
-                        .min_size(egui::vec2(56.0, CONNECTION_CONTROL_HEIGHT)),
+                    egui::Button::new("下一处").min_size(egui::vec2(56.0, control_height)),
                 )
                 .clicked()
             {
@@ -1467,8 +1461,9 @@ impl EscomApp {
                     self.search_index.matches.len()
                 ))
             };
+            let status_width = label_width(ui, "表达式错误", 88.0);
             let status_response = ui.add_sized(
-                [88.0, CONNECTION_CONTROL_HEIGHT],
+                [status_width, control_height],
                 egui::Label::new(status).truncate(),
             );
             if let Some(error) = status_error {
@@ -1692,6 +1687,8 @@ impl EscomApp {
 
     fn show_send_panel(&mut self, root_ui: &mut egui::Ui) {
         let context = root_ui.ctx().clone();
+        let root_control_height = toolbar_control_height(root_ui);
+        let min_panel_height = (root_control_height * 2.0 + 72.0).max(150.0);
         let toolbar_gap = root_ui.spacing().item_spacing.y.round() as i8;
         let panel_frame = egui::Frame::side_top_panel(root_ui.style())
             .inner_margin(egui::Margin {
@@ -1703,25 +1700,26 @@ impl EscomApp {
             .fill(self.surface_fill(root_ui.visuals().panel_fill, 112));
         egui::Panel::bottom("send_panel")
             .resizable(true)
-            .size_range(150.0..=280.0)
+            .size_range(min_panel_height..=280.0_f32.max(min_panel_height + 48.0))
             .frame(panel_frame)
             .show(root_ui, |ui| {
                 let repeat_running = self.repeat.is_some();
                 let mut send_requested = false;
-                ui.spacing_mut().interact_size.y = CONNECTION_CONTROL_HEIGHT;
-                ui.horizontal(|ui| {
+                let control_height = toolbar_control_height(ui);
+                ui.spacing_mut().interact_size.y = control_height;
+                ui.horizontal_wrapped(|ui| {
                     toolbar_label(ui, "发送", 38.0);
                     ui.scope(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         ui.add_enabled_ui(!repeat_running, |ui| {
                             for mode in [SendMode::Text, SendMode::Hex] {
                                 if ui
-                                    .add_sized(
-                                        [50.0, CONNECTION_CONTROL_HEIGHT],
+                                    .add(
                                         egui::Button::selectable(
                                             self.preferences.send_mode == mode,
                                             mode.label(),
-                                        ),
+                                        )
+                                        .min_size(egui::vec2(50.0, control_height)),
                                     )
                                     .clicked()
                                     && self.preferences.send_mode != mode
@@ -1740,9 +1738,10 @@ impl EscomApp {
                     ui.add_enabled_ui(
                         !repeat_running && self.preferences.send_mode == SendMode::Text,
                         |ui| {
+                            let ending_label = self.preferences.line_ending.label();
                             egui::ComboBox::from_id_salt("line_ending")
-                                .selected_text(self.preferences.line_ending.label())
-                                .width(92.0)
+                                .selected_text(ending_label)
+                                .width(combo_width(ui, ending_label, 92.0))
                                 .show_ui(ui, |ui| {
                                     for ending in [
                                         LineEnding::None,
@@ -1779,8 +1778,7 @@ impl EscomApp {
                     if ui
                         .add_enabled(
                             can_clear,
-                            egui::Button::new("清发送")
-                                .min_size(egui::vec2(72.0, CONNECTION_CONTROL_HEIGHT)),
+                            egui::Button::new("清发送").min_size(egui::vec2(72.0, control_height)),
                         )
                         .clicked()
                     {
@@ -1793,7 +1791,7 @@ impl EscomApp {
                     if ui
                         .add_enabled_ui(!repeat_running, |ui| {
                             ui.add_sized(
-                                [92.0, CONNECTION_CONTROL_HEIGHT],
+                                [92.0, control_height],
                                 egui::DragValue::new(&mut self.preferences.repeat_interval_ms)
                                     .range(20..=3_600_000)
                                     .speed(10.0)
@@ -1809,10 +1807,7 @@ impl EscomApp {
                     let repeat_available = self.connection.is_connected() || repeat_running;
                     let repeat_response = ui
                         .add_enabled_ui(repeat_available, |ui| {
-                            ui.add_sized(
-                                [96.0, CONNECTION_CONTROL_HEIGHT],
-                                egui::Checkbox::new(&mut repeat_checkbox, "循环发送"),
-                            )
+                            ui.checkbox(&mut repeat_checkbox, "循环发送")
                         })
                         .inner
                         .on_disabled_hover_text("请先打开串口");
@@ -1824,19 +1819,14 @@ impl EscomApp {
                         }
                     }
 
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let can_send = self.connection.is_connected() && !repeat_running;
-                        let mut button = egui::Button::new(RichText::new("发送").strong());
-                        if can_send {
-                            button = button.fill(ui.visuals().selection.bg_fill);
-                        }
-                        send_requested = ui
-                            .add_enabled(
-                                can_send,
-                                button.min_size(egui::vec2(72.0, CONNECTION_CONTROL_HEIGHT)),
-                            )
-                            .clicked();
-                    });
+                    let can_send = self.connection.is_connected() && !repeat_running;
+                    let mut button = egui::Button::new(RichText::new("发送").strong());
+                    if can_send {
+                        button = button.fill(ui.visuals().selection.bg_fill);
+                    }
+                    send_requested = ui
+                        .add_enabled(can_send, button.min_size(egui::vec2(72.0, control_height)))
+                        .clicked();
                 });
 
                 let editor_id = ui.make_persistent_id("send_input_editor");
@@ -1890,14 +1880,15 @@ impl EscomApp {
         let context = root_ui.ctx().clone();
         let mut theme_preference = self.preferences.theme_preference;
         let mut theme_changed = false;
+        let control_height = toolbar_control_height(root_ui);
         let panel_frame = egui::Frame::side_top_panel(root_ui.style())
             .fill(self.surface_fill(root_ui.visuals().panel_fill, 210));
         egui::Panel::bottom("status_panel")
             .resizable(false)
-            .exact_size(30.0)
+            .exact_size(control_height)
             .frame(panel_frame)
             .show(root_ui, |ui| {
-                ui.spacing_mut().interact_size.y = CONNECTION_CONTROL_HEIGHT;
+                ui.spacing_mut().interact_size.y = control_height;
                 egui::containers::Sides::new().shrink_left().show(
                     ui,
                     |ui| {
@@ -1966,48 +1957,63 @@ impl EscomApp {
             return;
         }
         let mut open = self.settings_open;
-        let max_window_height = context.input(|input| {
-            (input.viewport_rect().height() - 32.0).max(SETTINGS_WINDOW_HEIGHT + 48.0)
-        });
-        egui::Window::new("设置")
+        let viewport =
+            context.input(|input| input.viewport_rect().shrink(SETTINGS_VIEWPORT_MARGIN));
+        let settings_window_width =
+            preferred_settings_window_width(viewport.width(), self.preferences.ui_font_size);
+        let max_window_height = viewport.height().max(160.0);
+        let default_window_height = SETTINGS_WINDOW_HEIGHT.min(max_window_height);
+        let default_position = centered_window_position(
+            viewport,
+            egui::vec2(settings_window_width, default_window_height),
+        );
+        let mut window = egui::Window::new("设置")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(SETTINGS_WINDOW_WIDTH)
-            .min_width(SETTINGS_WINDOW_WIDTH)
+            .default_width(settings_window_width)
+            .min_width(settings_window_width)
+            .max_width(settings_window_width)
             .max_height(max_window_height)
-            .vscroll(true)
-            .show(context, |ui| {
-                ui.spacing_mut().interact_size.y = CONNECTION_CONTROL_HEIGHT;
-                ui.set_min_size(egui::vec2(
-                    SETTINGS_WINDOW_WIDTH - 32.0,
-                    SETTINGS_WINDOW_HEIGHT,
-                ));
-                self.show_settings_tabs(ui);
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(10.0);
+            .vscroll(true);
+        if self.settings_center_on_open {
+            window = window.fixed_pos(default_position);
+        } else {
+            window = window.default_pos(default_position);
+        }
+        window.show(context, |ui| {
+            ui.spacing_mut().interact_size.y = toolbar_control_height(ui);
+            ui.set_min_size(egui::vec2(
+                (settings_window_width - 32.0).max(240.0),
+                (default_window_height - 64.0).max(240.0),
+            ));
+            self.show_settings_tabs(ui);
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(6.0);
 
-                match self.settings_tab {
-                    SettingsTab::Fonts => self.show_font_settings_tab(ui, context),
-                    SettingsTab::Background => self.show_background_settings_tab(ui, context),
-                }
-            });
+            match self.settings_tab {
+                SettingsTab::Fonts => self.show_font_settings_tab(ui, context),
+                SettingsTab::Background => self.show_background_settings_tab(ui, context),
+            }
+        });
+        self.settings_center_on_open = false;
         self.settings_open = open;
     }
 
     fn show_settings_tabs(&mut self, ui: &mut egui::Ui) {
         let gap = ui.spacing().item_spacing.x;
         let tab_width = (ui.available_width() - gap) * 0.5;
+        let control_height = toolbar_control_height(ui).max(38.0);
         ui.horizontal(|ui| {
             for (tab, label) in [
                 (SettingsTab::Fonts, "字体与显示"),
                 (SettingsTab::Background, "应用背景"),
             ] {
                 if ui
-                    .add_sized(
-                        [tab_width, 38.0],
-                        egui::Button::selectable(self.settings_tab == tab, label),
+                    .add(
+                        egui::Button::selectable(self.settings_tab == tab, label)
+                            .min_size(egui::vec2(tab_width, control_height)),
                     )
                     .clicked()
                 {
@@ -2033,9 +2039,11 @@ impl EscomApp {
                     .show(ui, |ui| {
                         settings_row_label(ui, "界面字体");
                         settings_controls(ui, |ui| {
+                            let family_width =
+                                combo_width(ui, &self.preferences.ui_font_family, 292.0);
                             egui::ComboBox::from_id_salt("ui_font")
                                 .selected_text(&self.preferences.ui_font_family)
-                                .width(292.0)
+                                .width(family_width)
                                 .show_ui(ui, |ui| {
                                     for family in self.font_catalog.ui_families() {
                                         font_changed |= ui
@@ -2050,12 +2058,14 @@ impl EscomApp {
                             let options = self
                                 .font_catalog
                                 .weight_options(&self.preferences.ui_font_family);
+                            let weight_label = self.font_catalog.weight_label(
+                                &self.preferences.ui_font_family,
+                                self.preferences.ui_font_weight,
+                            );
+                            let weight_width = combo_width(ui, &weight_label, 118.0);
                             egui::ComboBox::from_id_salt("ui_font_weight")
-                                .selected_text(self.font_catalog.weight_label(
-                                    &self.preferences.ui_font_family,
-                                    self.preferences.ui_font_weight,
-                                ))
-                                .width(118.0)
+                                .selected_text(weight_label)
+                                .width(weight_width)
                                 .show_ui(ui, |ui| {
                                     for option in options {
                                         font_changed |= ui
@@ -2076,15 +2086,18 @@ impl EscomApp {
                                 ui,
                                 "ui_font_size",
                                 &mut self.preferences.ui_font_size,
+                                MAX_UI_FONT_SIZE,
                             );
                         });
                         ui.end_row();
 
                         settings_row_label(ui, "数据字体");
                         settings_controls(ui, |ui| {
+                            let family_width =
+                                combo_width(ui, &self.preferences.data_font_family, 292.0);
                             egui::ComboBox::from_id_salt("data_font")
                                 .selected_text(&self.preferences.data_font_family)
-                                .width(292.0)
+                                .width(family_width)
                                 .show_ui(ui, |ui| {
                                     for family in self.font_catalog.mono_families() {
                                         font_changed |= ui
@@ -2099,12 +2112,14 @@ impl EscomApp {
                             let options = self
                                 .font_catalog
                                 .weight_options(&self.preferences.data_font_family);
+                            let weight_label = self.font_catalog.weight_label(
+                                &self.preferences.data_font_family,
+                                self.preferences.data_font_weight,
+                            );
+                            let weight_width = combo_width(ui, &weight_label, 118.0);
                             egui::ComboBox::from_id_salt("data_font_weight")
-                                .selected_text(self.font_catalog.weight_label(
-                                    &self.preferences.data_font_family,
-                                    self.preferences.data_font_weight,
-                                ))
-                                .width(118.0)
+                                .selected_text(weight_label)
+                                .width(weight_width)
                                 .show_ui(ui, |ui| {
                                     for option in options {
                                         font_changed |= ui
@@ -2125,15 +2140,17 @@ impl EscomApp {
                                 ui,
                                 "data_font_size",
                                 &mut self.preferences.data_font_size,
+                                MAX_DATA_FONT_SIZE,
                             );
                         });
                         ui.end_row();
 
                         settings_row_label(ui, "行距");
                         settings_controls(ui, |ui| {
+                            let control_height = toolbar_control_height(ui);
                             preferences_changed |= ui
                                 .add_sized(
-                                    [220.0, CONNECTION_CONTROL_HEIGHT],
+                                    [220.0, control_height],
                                     egui::Slider::new(
                                         &mut self.preferences.data_line_spacing,
                                         MIN_DATA_LINE_SPACING..=MAX_DATA_LINE_SPACING,
@@ -2227,23 +2244,24 @@ impl EscomApp {
         settings_card(
             ui,
             "背景来源",
-            "背景会居中裁剪并铺满整个应用窗口。",
+            "选择纯色、本地图片或在线图片。",
             |ui| {
                 let gap = ui.spacing().item_spacing.x;
                 let option_width = (ui.available_width() - gap * 2.0) / 3.0;
-                ui.horizontal(|ui| {
+                let control_height = toolbar_control_height(ui);
+                ui.horizontal_wrapped(|ui| {
                     for source in [
                         AppBackgroundSource::None,
                         AppBackgroundSource::Local,
                         AppBackgroundSource::Online,
                     ] {
                         if ui
-                            .add_sized(
-                                [option_width, CONNECTION_CONTROL_HEIGHT],
+                            .add(
                                 egui::Button::selectable(
                                     self.preferences.background_source == source,
                                     source.label(),
-                                ),
+                                )
+                                .min_size(egui::vec2(option_width, control_height)),
                             )
                             .clicked()
                             && self.preferences.background_source != source
@@ -2255,7 +2273,7 @@ impl EscomApp {
                     }
                 });
 
-                ui.add_space(10.0);
+                ui.add_space(6.0);
                 match self.preferences.background_source {
                     AppBackgroundSource::None => {
                         ui.label(
@@ -2264,7 +2282,8 @@ impl EscomApp {
                         );
                     }
                     AppBackgroundSource::Local => {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            let control_height = toolbar_control_height(ui);
                             let mut path_display =
                                 if self.preferences.background_local_path.trim().is_empty() {
                                     "尚未选择图片".to_owned()
@@ -2273,14 +2292,14 @@ impl EscomApp {
                                 };
                             let field_width = (ui.available_width() - 184.0).max(220.0);
                             ui.add_sized(
-                                [field_width, CONNECTION_CONTROL_HEIGHT],
+                                [field_width, control_height],
                                 egui::TextEdit::singleline(&mut path_display).interactive(false),
                             )
                             .on_hover_text(&path_display);
                             if ui
-                                .add_sized(
-                                    [88.0, CONNECTION_CONTROL_HEIGHT],
-                                    egui::Button::new("选择图片"),
+                                .add(
+                                    egui::Button::new("选择图片")
+                                        .min_size(egui::vec2(88.0, control_height)),
                                 )
                                 .clicked()
                                 && let Some(path) = rfd::FileDialog::new()
@@ -2304,7 +2323,7 @@ impl EscomApp {
                                 .add_enabled(
                                     !self.preferences.background_local_path.trim().is_empty(),
                                     egui::Button::new("重新加载")
-                                        .min_size(egui::vec2(80.0, CONNECTION_CONTROL_HEIGHT)),
+                                        .min_size(egui::vec2(80.0, control_height)),
                                 )
                                 .clicked()
                             {
@@ -2314,19 +2333,20 @@ impl EscomApp {
                         self.show_background_load_status(ui, false);
                     }
                     AppBackgroundSource::Online => {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            let control_height = toolbar_control_height(ui);
                             let field_width = (ui.available_width() - 92.0).max(260.0);
                             let response = ui.add_sized(
-                                [field_width, CONNECTION_CONTROL_HEIGHT],
+                                [field_width, control_height],
                                 egui::TextEdit::singleline(&mut self.background_url_draft)
                                     .hint_text("https://example.com/background.jpg"),
                             );
                             let enter_pressed = response.lost_focus()
                                 && ui.input(|input| input.key_pressed(egui::Key::Enter));
                             let apply_clicked = ui
-                                .add_sized(
-                                    [84.0, CONNECTION_CONTROL_HEIGHT],
-                                    egui::Button::new("应用地址"),
+                                .add(
+                                    egui::Button::new("应用地址")
+                                        .min_size(egui::vec2(84.0, control_height)),
                                 )
                                 .clicked();
                             if apply_clicked || enter_pressed {
@@ -2354,11 +2374,11 @@ impl EscomApp {
             },
         );
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
         settings_card(
             ui,
             "背景不透明度",
-            "为亮色与暗色主题分别设置，切换主题时自动使用对应数值。",
+            "亮色与暗色主题分别保存。",
             |ui| {
                 egui::Grid::new("background_opacity_grid")
                     .num_columns(2)
@@ -2384,6 +2404,7 @@ impl EscomApp {
                     });
 
                 ui.horizontal(|ui| {
+                    let control_height = toolbar_control_height(ui);
                     let is_default = (self.preferences.background_light_opacity
                         - DEFAULT_BACKGROUND_LIGHT_OPACITY)
                         .abs()
@@ -2397,7 +2418,7 @@ impl EscomApp {
                         .add_enabled(
                             !is_default,
                             egui::Button::new("恢复推荐值")
-                                .min_size(egui::vec2(104.0, CONNECTION_CONTROL_HEIGHT)),
+                                .min_size(egui::vec2(104.0, control_height)),
                         )
                         .clicked()
                     {
@@ -2410,15 +2431,10 @@ impl EscomApp {
             },
         );
 
-        ui.add_space(10.0);
-        settings_card(
-            ui,
-            "效果预览",
-            "预览亮色与暗色模式下的实际透明度。",
-            |ui| {
-                self.show_background_previews(ui);
-            },
-        );
+        ui.add_space(8.0);
+        settings_card(ui, "效果预览", "", |ui| {
+            self.show_background_previews(ui);
+        });
 
         if reload_requested {
             self.reload_background_image(context);
@@ -2459,7 +2475,7 @@ impl EscomApp {
                 }
             }
         };
-        ui.add_space(5.0);
+        ui.add_space(3.0);
         ui.label(RichText::new(message).small().color(color));
     }
 
@@ -2502,8 +2518,9 @@ impl EscomApp {
 
     fn history_menu(&mut self, ui: &mut egui::Ui) -> Option<HistoryItem> {
         let mut selected = None;
+        let control_height = toolbar_control_height(ui);
         let button = egui::Button::new(format!("历史 ({})", self.history.len()))
-            .min_size(egui::vec2(82.0, CONNECTION_CONTROL_HEIGHT));
+            .min_size(egui::vec2(82.0, control_height));
         egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
             if self.history.is_empty() {
                 ui.label("暂无成功发送记录");
@@ -2771,13 +2788,15 @@ fn config_combo(
     toolbar_label(ui, label, CONFIG_LABEL_WIDTH);
     egui::ComboBox::from_id_salt(id)
         .selected_text(selected_text)
-        .width(CONFIG_COMBO_WIDTH)
+        .width(combo_width(ui, selected_text, CONFIG_COMBO_WIDTH))
         .show_ui(ui, contents);
 }
 
 fn toolbar_label(ui: &mut egui::Ui, text: &'static str, width: f32) {
+    let width = label_width(ui, text, width);
+    let control_height = toolbar_control_height(ui);
     ui.allocate_ui_with_layout(
-        egui::vec2(width, CONNECTION_CONTROL_HEIGHT),
+        egui::vec2(width, control_height),
         Layout::left_to_right(Align::Center),
         |ui| {
             ui.label(text);
@@ -2786,12 +2805,68 @@ fn toolbar_label(ui: &mut egui::Ui, text: &'static str, width: f32) {
 }
 
 fn toolbar_separator(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 22.0), egui::Sense::hover());
+    let height = (toolbar_control_height(ui) - 10.0).max(22.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, height), egui::Sense::hover());
     ui.painter().vline(
         rect.center().x,
         rect.y_range(),
         ui.visuals().widgets.noninteractive.bg_stroke,
     );
+}
+
+fn toolbar_control_height(ui: &mut egui::Ui) -> f32 {
+    let font_id = egui::TextStyle::Button.resolve(ui.style());
+    let text_height = ui.fonts_mut(|fonts| fonts.row_height(&font_id));
+    toolbar_control_height_from_metrics(text_height, ui.spacing().button_padding.y)
+}
+
+fn toolbar_control_height_from_metrics(text_height: f32, vertical_padding: f32) -> f32 {
+    (text_height + vertical_padding * 2.0)
+        .ceil()
+        .max(MIN_CONTROL_HEIGHT)
+}
+
+fn styled_text_width(ui: &mut egui::Ui, text: &str, style: egui::TextStyle) -> f32 {
+    let font_id = style.resolve(ui.style());
+    ui.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(text.to_owned(), font_id, Color32::WHITE)
+            .size()
+            .x
+    })
+}
+
+fn label_width(ui: &mut egui::Ui, text: &str, minimum: f32) -> f32 {
+    styled_text_width(ui, text, egui::TextStyle::Body)
+        .ceil()
+        .max(minimum)
+}
+
+fn text_field_width(ui: &mut egui::Ui, sample: &str, minimum: f32) -> f32 {
+    (styled_text_width(ui, sample, egui::TextStyle::Body) + 20.0)
+        .ceil()
+        .max(minimum)
+}
+
+fn combo_width(ui: &mut egui::Ui, selected_text: &str, minimum: f32) -> f32 {
+    (styled_text_width(ui, selected_text, egui::TextStyle::Button)
+        + ui.spacing().button_padding.x * 2.0
+        + ui.spacing().icon_width
+        + ui.spacing().icon_spacing)
+        .ceil()
+        .max(minimum)
+}
+
+fn preferred_settings_window_width(available_width: f32, ui_font_size: f32) -> f32 {
+    let large_font_extra = (ui_font_size - 15.0).max(0.0) * 10.0;
+    (SETTINGS_WINDOW_WIDTH + large_font_extra).min(available_width.max(0.0))
+}
+
+fn centered_window_position(viewport: egui::Rect, window_size: egui::Vec2) -> egui::Pos2 {
+    egui::pos2(
+        viewport.left() + (viewport.width() - window_size.x).max(0.0) * 0.5,
+        viewport.top() + (viewport.height() - window_size.y).max(0.0) * 0.5,
+    )
 }
 
 fn terminal_bytes_from_events(
@@ -2916,17 +2991,19 @@ fn settings_card<R>(
         .fill(ui.visuals().faint_bg_color)
         .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
         .corner_radius(8)
-        .inner_margin(egui::Margin::same(12));
+        .inner_margin(egui::Margin::same(10));
     frame
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.label(RichText::new(title).strong().size(16.0));
-            ui.label(
-                RichText::new(description)
-                    .small()
-                    .color(ui.visuals().weak_text_color()),
-            );
-            ui.add_space(8.0);
+            ui.label(RichText::new(title).strong());
+            if !description.is_empty() {
+                ui.label(
+                    RichText::new(description)
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
+                ui.add_space(6.0);
+            }
             contents(ui)
         })
         .inner
@@ -2968,14 +3045,18 @@ fn local_background_uri(path: &str) -> String {
 }
 
 fn background_opacity_control(ui: &mut egui::Ui, opacity: &mut f32) -> bool {
+    let control_height = toolbar_control_height(ui);
+    let value_width = label_width(ui, "100%", 60.0);
+    let slider_width =
+        (ui.available_width() - value_width - ui.spacing().item_spacing.x).clamp(80.0, 390.0);
     let changed = ui
         .add_sized(
-            [390.0, CONNECTION_CONTROL_HEIGHT],
+            [slider_width, control_height],
             egui::Slider::new(opacity, 0.0..=1.0).show_value(false),
         )
         .changed();
     ui.allocate_ui_with_layout(
-        egui::vec2(60.0, CONNECTION_CONTROL_HEIGHT),
+        egui::vec2(value_width, control_height),
         Layout::right_to_left(Align::Center),
         |ui| {
             ui.label(RichText::new(format!("{:.0}%", *opacity * 100.0)).monospace());
@@ -3094,8 +3175,10 @@ fn cover_uv(image_size: egui::Vec2, target_size: egui::Vec2) -> egui::Rect {
 }
 
 fn settings_row_label(ui: &mut egui::Ui, text: &str) {
+    let control_height = toolbar_control_height(ui);
+    let label_width = label_width(ui, text, SETTINGS_LABEL_WIDTH);
     ui.allocate_ui_with_layout(
-        egui::vec2(SETTINGS_LABEL_WIDTH, CONNECTION_CONTROL_HEIGHT),
+        egui::vec2(label_width, control_height),
         Layout::right_to_left(Align::Center),
         |ui| {
             ui.label(text);
@@ -3152,28 +3235,36 @@ fn theme_preference_label(preference: egui::ThemePreference) -> &'static str {
 }
 
 fn settings_controls<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let control_height = toolbar_control_height(ui);
+    let controls_width = ui.available_width().max(0.0);
     ui.allocate_ui_with_layout(
-        egui::vec2(SETTINGS_CONTROLS_WIDTH, CONNECTION_CONTROL_HEIGHT),
-        Layout::left_to_right(Align::Center),
+        egui::vec2(controls_width, control_height),
+        Layout::left_to_right(Align::Center).with_main_wrap(true),
         contents,
     )
     .inner
 }
 
-fn font_size_combo(ui: &mut egui::Ui, id: &'static str, font_size: &mut f32) -> bool {
+fn font_size_combo(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    font_size: &mut f32,
+    max_font_size: f32,
+) -> bool {
     let mut changed = false;
+    let widest_label = format!("{max_font_size:.0} pt");
     egui::ComboBox::from_id_salt(id)
         .selected_text(format!("{font_size:.0} pt"))
-        .width(120.0)
+        .width(combo_width(ui, &widest_label, 120.0))
         .show_ui(ui, |ui| {
-            for size in MIN_FONT_SIZE as u16..=MAX_FONT_SIZE as u16 {
+            for size in MIN_FONT_SIZE as u16..=max_font_size as u16 {
                 changed |= ui
                     .selectable_value(font_size, f32::from(size), format!("{size} pt"))
                     .changed();
             }
         })
         .response
-        .on_hover_text("选择字号（10–48 pt）");
+        .on_hover_text(format!("选择字号（10–{max_font_size:.0} pt）"));
     changed
 }
 
@@ -3227,6 +3318,28 @@ mod tests {
         assert_eq!(human_bytes(7), "7 B");
         assert_eq!(human_bytes(2048), "2.0 KiB");
         assert_eq!(human_bytes(2 * 1024 * 1024), "2.0 MiB");
+    }
+
+    #[test]
+    fn toolbar_control_height_expands_with_large_text_metrics() {
+        assert_eq!(toolbar_control_height_from_metrics(13.0, 3.0), 32.0);
+        assert_eq!(toolbar_control_height_from_metrics(50.0, 4.0), 58.0);
+    }
+
+    #[test]
+    fn settings_window_width_is_font_aware_and_viewport_bounded() {
+        assert_eq!(preferred_settings_window_width(1248.0, 15.0), 660.0);
+        assert_eq!(preferred_settings_window_width(992.0, 18.0), 690.0);
+        assert_eq!(preferred_settings_window_width(608.0, 15.0), 608.0);
+    }
+
+    #[test]
+    fn settings_window_default_position_is_centered() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(16.0, 16.0), egui::vec2(992.0, 608.0));
+        assert_eq!(
+            centered_window_position(viewport, egui::vec2(660.0, 454.0)),
+            egui::pos2(182.0, 93.0)
+        );
     }
 
     #[test]
