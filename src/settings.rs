@@ -67,6 +67,7 @@ pub struct UiPreferences {
     pub background_online_url: String,
     pub background_light_opacity: f32,
     pub background_dark_opacity: f32,
+    pub background_dynamic_accent: bool,
 }
 
 impl Default for UiPreferences {
@@ -95,6 +96,7 @@ impl Default for UiPreferences {
             background_online_url: String::new(),
             background_light_opacity: DEFAULT_BACKGROUND_LIGHT_OPACITY,
             background_dark_opacity: DEFAULT_BACKGROUND_DARK_OPACITY,
+            background_dynamic_accent: true,
         }
     }
 }
@@ -198,6 +200,7 @@ impl From<&UiPreferences> for SettingsDocument {
                 online_url: preferences.background_online_url.clone(),
                 light_opacity: preferences.background_light_opacity,
                 dark_opacity: preferences.background_dark_opacity,
+                dynamic_accent: preferences.background_dynamic_accent,
             },
         }
     }
@@ -229,6 +232,7 @@ impl From<SettingsDocument> for UiPreferences {
             background_online_url: settings.background.online_url,
             background_light_opacity: settings.background.light_opacity,
             background_dark_opacity: settings.background.dark_opacity,
+            background_dynamic_accent: settings.background.dynamic_accent,
         }
     }
 }
@@ -326,6 +330,7 @@ struct BackgroundSettings {
     online_url: String,
     light_opacity: f32,
     dark_opacity: f32,
+    dynamic_accent: bool,
 }
 
 impl Default for BackgroundSettings {
@@ -337,6 +342,7 @@ impl Default for BackgroundSettings {
             online_url: preferences.background_online_url,
             light_opacity: preferences.background_light_opacity,
             dark_opacity: preferences.background_dark_opacity,
+            dynamic_accent: preferences.background_dynamic_accent,
         }
     }
 }
@@ -624,7 +630,9 @@ fn render_toml(preferences: &UiPreferences) -> Result<String, toml::ser::Error> 
                 "# mode: text、hex 或 terminal；encoding: utf8 或 gbk\n# timestamp_format: chrono/strftime 格式\n# buffer_limit_mib: 5、20、100 或 500",
             ),
             "[send]" => Some("# mode: text 或 hex；line_ending: none、cr、lf 或 crlf"),
-            "[background]" => Some("# source: none、local 或 online；opacity 范围 0.0-1.0"),
+            "[background]" => Some(
+                "# source: none、local 或 online；opacity 范围 0.0-1.0\n# dynamic_accent: 是否根据背景图片自动生成强调色",
+            ),
             _ => None,
         };
         if let Some(comment) = comment {
@@ -656,6 +664,7 @@ mod tests {
             timestamps: true,
             timestamp_format: "%H:%M:%S%.6f".into(),
             background_local_path: r"C:\images\[send]\background.png".into(),
+            background_dynamic_accent: false,
             ..Default::default()
         };
 
@@ -673,6 +682,7 @@ mod tests {
         assert!(loaded.timestamps);
         assert_eq!(loaded.timestamp_format, "%H:%M:%S%.6f");
         assert_eq!(loaded.theme_preference, ThemePreference::System);
+        assert!(!loaded.background_dynamic_accent);
 
         let toml = fs::read_to_string(&test_path).unwrap();
         for section in [
@@ -732,6 +742,7 @@ mode = "hex"
         assert_eq!(preferences.text_encoding, TextEncoding::Utf8);
         assert_eq!(preferences.timestamp_format, DEFAULT_TIMESTAMP_FORMAT);
         assert_eq!(preferences.theme_preference, ThemePreference::System);
+        assert!(preferences.background_dynamic_accent);
     }
 
     #[test]
@@ -822,6 +833,7 @@ mode = "hex"
             loaded.background_dark_opacity,
             DEFAULT_BACKGROUND_DARK_OPACITY
         );
+        assert!(loaded.background_dynamic_accent);
     }
 
     #[test]

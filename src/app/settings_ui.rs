@@ -45,19 +45,21 @@ impl EscomApp {
         let rect = root_ui.max_rect();
         let base_fill = root_ui.visuals().panel_fill;
         root_ui.painter().rect_filled(rect, 0.0, base_fill);
+        let context = root_ui.ctx().clone();
 
         let Some(uri) = self.background_image_uri() else {
             self.background_load_uri = None;
             self.background_load_state = BackgroundLoadState::Idle;
+            self.dynamic_theme.clear(&context);
             return;
         };
 
         if self.background_load_uri.as_deref() != Some(uri.as_str()) {
             self.background_load_uri = Some(uri.clone());
             self.background_load_state = BackgroundLoadState::Loading;
+            self.dynamic_theme.clear(&context);
         }
 
-        let context = root_ui.ctx().clone();
         match context.try_load_texture(
             &uri,
             egui::TextureOptions::LINEAR,
@@ -65,6 +67,16 @@ impl EscomApp {
         ) {
             Ok(egui::load::TexturePoll::Ready { texture }) => {
                 self.background_load_state = BackgroundLoadState::Ready;
+                if self.preferences.background_dynamic_accent {
+                    if let Ok(egui::load::ImagePoll::Ready { image }) =
+                        context.try_load_image(&uri, egui::load::SizeHint::default())
+                    {
+                        self.dynamic_theme
+                            .update_from_image(&context, &uri, image.as_ref());
+                    }
+                } else {
+                    self.dynamic_theme.clear(&context);
+                }
                 paint_texture_cover(
                     root_ui.painter(),
                     rect,
@@ -94,6 +106,7 @@ impl EscomApp {
         if let Some(uri) = self.background_load_uri.take() {
             context.forget_image(&uri);
         }
+        self.dynamic_theme.clear(context);
         self.background_load_state = BackgroundLoadState::Idle;
         context.request_repaint();
     }
@@ -502,6 +515,7 @@ impl EscomApp {
     ) {
         let mut preferences_changed = false;
         let mut reload_requested = false;
+        let mut dynamic_accent_changed = false;
 
         settings_card(
             ui,
@@ -639,6 +653,49 @@ impl EscomApp {
         ui.add_space(8.0);
         settings_card(
             ui,
+            "动态主题",
+            "从背景图片提取代表色，并自动调整亮色与暗色主题中的控件强调色。",
+            |ui| {
+                let has_background = self.has_configured_background();
+                let response = ui
+                    .add_enabled_ui(has_background, |ui| {
+                        ui.checkbox(
+                            &mut self.preferences.background_dynamic_accent,
+                            "根据背景图片自动生成强调色",
+                        )
+                    })
+                    .inner;
+                if response.changed() {
+                    preferences_changed = true;
+                    dynamic_accent_changed = true;
+                }
+
+                let hint = if has_background {
+                    if self.preferences.background_dynamic_accent {
+                        if self.dynamic_theme.accent().is_some() {
+                            "已应用背景图片的动态强调色。"
+                        } else if matches!(self.background_load_state, BackgroundLoadState::Ready) {
+                            "图片中没有合适的彩色区域，已使用默认蓝色。"
+                        } else {
+                            "图片加载后自动取色；黑白图片会使用默认蓝色。"
+                        }
+                    } else {
+                        "当前使用主题的默认蓝色强调色。"
+                    }
+                } else {
+                    "选择本地或在线背景图片后可用。"
+                };
+                ui.label(
+                    RichText::new(hint)
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
+            },
+        );
+
+        ui.add_space(8.0);
+        settings_card(
+            ui,
             "背景不透明度",
             "直接输入 0.0–1.0 的小数，亮色与暗色主题分别保存。",
             |ui| {
@@ -703,6 +760,9 @@ impl EscomApp {
 
         if reload_requested {
             self.reload_background_image(context);
+        }
+        if dynamic_accent_changed {
+            self.dynamic_theme.clear(context);
         }
         if preferences_changed {
             self.mark_preferences_dirty();

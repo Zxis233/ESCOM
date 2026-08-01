@@ -30,6 +30,7 @@ use crate::settings::{
     MIN_DATA_LINE_SPACING, MIN_FONT_SIZE, UiPreferences,
 };
 use crate::store::ReceiveStore;
+use crate::theme::DynamicTheme;
 use crate::window_chrome;
 
 mod connection;
@@ -185,6 +186,7 @@ pub struct EscomApp {
     background_dark_opacity_draft: String,
     background_load_uri: Option<String>,
     background_load_state: BackgroundLoadState,
+    dynamic_theme: DynamicTheme,
     preferences_dirty_since: Option<Instant>,
     last_port_refresh: Instant,
     notice: Option<Notice>,
@@ -313,6 +315,7 @@ impl EscomApp {
             background_dark_opacity_draft,
             background_load_uri: None,
             background_load_state: BackgroundLoadState::Idle,
+            dynamic_theme: DynamicTheme::default(),
             preferences_dirty_since: None,
             last_port_refresh: Instant::now() - PORT_REFRESH_INTERVAL,
             notice,

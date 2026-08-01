@@ -9,4 +9,5 @@ pub mod serial_worker;
 pub mod settings;
 pub mod store;
 mod terminal;
+pub mod theme;
 pub mod window_chrome;
