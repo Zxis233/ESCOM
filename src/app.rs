@@ -178,6 +178,7 @@ pub struct EscomApp {
 
 impl EscomApp {
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
+        window_chrome::disable_native_window_border(creation_context);
         let (mut preferences, settings_warning) = settings::load();
         preferences.sanitize();
         egui_extras::install_image_loaders(&creation_context.egui_ctx);

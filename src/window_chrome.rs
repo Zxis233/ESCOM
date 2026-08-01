@@ -13,6 +13,42 @@ enum TitleBarControl {
     Close,
 }
 
+/// Windows 11 can retain a one-pixel DWM accent border even when decorations and
+/// the undecorated-window shadow are disabled. The application paints its own
+/// theme-aware border, so suppress the native one to avoid a doubled top edge.
+pub fn disable_native_window_border(creation_context: &eframe::CreationContext<'_>) {
+    #[cfg(target_os = "windows")]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use windows_sys::Win32::Graphics::Dwm::{
+            DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DwmSetWindowAttribute,
+        };
+
+        let Ok(window_handle) = creation_context.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(window_handle) = window_handle.as_raw() else {
+            return;
+        };
+        let hwnd = window_handle.hwnd.get() as *mut std::ffi::c_void;
+        let border_color = DWMWA_COLOR_NONE;
+
+        // SAFETY: the HWND comes from the live eframe CreationContext, and the
+        // attribute payload points to a u32 for the duration of this call.
+        let _ = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_BORDER_COLOR as u32,
+                std::ptr::from_ref(&border_color).cast(),
+                std::mem::size_of_val(&border_color) as u32,
+            )
+        };
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = creation_context;
+}
+
 pub fn show_title_bar(root_ui: &mut egui::Ui, title_icon: &egui::TextureHandle, fill: Color32) {
     let context = root_ui.ctx().clone();
     let (maximized, focused) = context.input(|input| {
@@ -141,16 +177,19 @@ pub fn paint_window_border(context: &egui::Context) {
         return;
     }
 
-    let mut stroke = context.style_of(context.theme()).visuals.window_stroke;
-    if !focused {
-        stroke.color = stroke.color.gamma_multiply(0.65);
-    }
+    let dark_mode = context.style_of(context.theme()).visuals.dark_mode;
+    let border_gray = if dark_mode { 72 } else { 196 };
+    let border_alpha = if focused { 255 } else { 150 };
+    let stroke = egui::Stroke::new(
+        1.0,
+        Color32::from_rgba_unmultiplied(border_gray, border_gray, border_gray, border_alpha),
+    );
     context
         .layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             egui::Id::new("custom_window_border"),
         ))
-        .rect_stroke(rect.shrink(0.5), 0.0, stroke, egui::StrokeKind::Inside);
+        .rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
 }
 
 fn show_title_bar_menu(response: &egui::Response, context: &egui::Context, maximized: bool) {
