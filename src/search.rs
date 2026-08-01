@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 
 use crate::formatting::{FormattedRow, display_text};
 
@@ -12,12 +12,40 @@ pub struct SearchMatch {
     pub byte_range: Range<usize>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SearchIndex {
     pub matches: Vec<SearchMatch>,
     pub matched_rows: Vec<usize>,
     pub error: Option<String>,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchMatcher {
+    matcher: Regex,
+}
+
+impl SearchMatcher {
+    pub fn new(
+        query: &str,
+        case_sensitive: bool,
+        regex_mode: bool,
+    ) -> Result<Option<Self>, String> {
+        if query.is_empty() {
+            return Ok(None);
+        }
+
+        let expression = if regex_mode {
+            query.to_owned()
+        } else {
+            regex::escape(query)
+        };
+        RegexBuilder::new(&expression)
+            .case_insensitive(!case_sensitive)
+            .build()
+            .map(|matcher| Some(Self { matcher }))
+            .map_err(|error| format!("正则表达式无效：{error}"))
+    }
 }
 
 impl SearchIndex {
@@ -35,6 +63,54 @@ impl SearchIndex {
         self.matched_rows
             .partition_point(|row_index| *row_index < total_rows)
     }
+
+    pub fn apply_display_update(
+        &mut self,
+        old_row_count: usize,
+        remove_prefix: usize,
+        replace_tail: usize,
+        rows: &[FormattedRow],
+        matcher: &SearchMatcher,
+        timestamps: bool,
+    ) {
+        debug_assert!(remove_prefix <= old_row_count);
+        let rows_after_prefix = old_row_count.saturating_sub(remove_prefix);
+        debug_assert!(replace_tail <= rows_after_prefix);
+
+        if remove_prefix != 0 {
+            let first_match = self
+                .matches
+                .partition_point(|item| item.row_index < remove_prefix);
+            self.matches.drain(..first_match);
+            for item in &mut self.matches {
+                item.row_index -= remove_prefix;
+            }
+
+            let first_row = self
+                .matched_rows
+                .partition_point(|row_index| *row_index < remove_prefix);
+            self.matched_rows.drain(..first_row);
+            for row_index in &mut self.matched_rows {
+                *row_index -= remove_prefix;
+            }
+        }
+
+        let append_start = rows_after_prefix.saturating_sub(replace_tail);
+        if replace_tail != 0 {
+            let match_end = self
+                .matches
+                .partition_point(|item| item.row_index < append_start);
+            self.matches.truncate(match_end);
+            let row_end = self
+                .matched_rows
+                .partition_point(|row_index| *row_index < append_start);
+            self.matched_rows.truncate(row_end);
+        }
+
+        if !self.truncated {
+            append_matches(self, rows, append_start, matcher, timestamps);
+        }
+    }
 }
 
 pub fn search_rows(
@@ -44,33 +120,42 @@ pub fn search_rows(
     regex_mode: bool,
     timestamps: bool,
 ) -> SearchIndex {
-    if query.is_empty() {
-        return SearchIndex::default();
-    }
-
-    let expression = if regex_mode {
-        query.to_owned()
-    } else {
-        regex::escape(query)
-    };
-    let matcher = match RegexBuilder::new(&expression)
-        .case_insensitive(!case_sensitive)
-        .build()
-    {
-        Ok(matcher) => matcher,
+    let matcher = match SearchMatcher::new(query, case_sensitive, regex_mode) {
+        Ok(Some(matcher)) => matcher,
+        Ok(None) => return SearchIndex::default(),
         Err(error) => {
             return SearchIndex {
-                error: Some(format!("正则表达式无效：{error}")),
+                error: Some(error),
                 ..Default::default()
             };
         }
     };
 
+    search_rows_with_matcher(rows, &matcher, timestamps)
+}
+
+pub fn search_rows_with_matcher(
+    rows: &[FormattedRow],
+    matcher: &SearchMatcher,
+    timestamps: bool,
+) -> SearchIndex {
     let mut index = SearchIndex::default();
-    'rows: for (row_index, row) in rows.iter().enumerate() {
+    append_matches(&mut index, rows, 0, matcher, timestamps);
+    index
+}
+
+fn append_matches(
+    index: &mut SearchIndex,
+    rows: &[FormattedRow],
+    row_offset: usize,
+    matcher: &SearchMatcher,
+    timestamps: bool,
+) {
+    'rows: for (local_row_index, row) in rows.iter().enumerate() {
+        let row_index = row_offset + local_row_index;
         let text = display_text(row, timestamps);
         let mut row_matched = false;
-        for found in matcher.find_iter(&text) {
+        for found in matcher.matcher.find_iter(&text) {
             if found.is_empty() {
                 continue;
             }
@@ -88,7 +173,6 @@ pub fn search_rows(
             }
         }
     }
-    index
 }
 
 #[cfg(test)]
@@ -126,5 +210,34 @@ mod tests {
         let invalid = search_rows(&rows, "(", true, true, false);
         assert!(invalid.error.is_some());
         assert!(invalid.matches.is_empty());
+    }
+
+    #[test]
+    fn incremental_update_shifts_rows_and_indexes_appended_matches() {
+        let matcher = SearchMatcher::new("ready", false, false).unwrap().unwrap();
+        let initial = vec![row("ready 0"), row("idle"), row("ready 2")];
+        let mut index = search_rows_with_matcher(&initial, &matcher, false);
+
+        index.apply_display_update(3, 1, 0, &[row("ready 3")], &matcher, false);
+        assert_eq!(index.matched_rows, [1, 2]);
+        assert_eq!(
+            index
+                .matches
+                .iter()
+                .map(|item| item.row_index)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+    }
+
+    #[test]
+    fn incremental_update_replaces_tail_matches() {
+        let matcher = SearchMatcher::new("ok", false, false).unwrap().unwrap();
+        let initial = vec![row("first"), row("not yet")];
+        let mut index = search_rows_with_matcher(&initial, &matcher, false);
+
+        index.apply_display_update(2, 0, 1, &[row("now ok")], &matcher, false);
+        assert_eq!(index.matched_rows, [1]);
+        assert_eq!(index.matches[0].byte_range, 4..6);
     }
 }

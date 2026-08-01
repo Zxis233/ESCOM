@@ -12,7 +12,8 @@ use serialport::{DataBits, FlowControl, Parity, StopBits};
 
 use crate::fonts::{FontCatalog, data_font_family};
 use crate::formatting::{
-    FormattedRow, display_text, encode_text, format_snapshot, parse_send_input, render_export,
+    DisplayFormatter, DisplayUpdate, FormattedRow, display_text, encode_text, format_snapshot,
+    parse_send_input, render_export,
 };
 use crate::highlight::{self, HighlightRules, HighlightStyle};
 use crate::icon;
@@ -20,7 +21,7 @@ use crate::model::{
     HistoryItem, LineEnding, ReceiveMode, SendMode, SerialConfig, TextEncoding, data_bits_label,
     flow_control_label, parity_label, parse_baud_rate, stop_bits_label,
 };
-use crate::search::{self, SearchIndex, SearchMatch};
+use crate::search::{self, SearchIndex, SearchMatch, SearchMatcher};
 use crate::serial_worker::{WorkerEvent, WorkerHandle};
 use crate::settings::{
     self, AppBackgroundSource, BUFFER_LIMIT_OPTIONS_MIB, DEFAULT_BACKGROUND_DARK_OPACITY,
@@ -97,9 +98,11 @@ enum BackgroundEvent {
         token: u64,
         generation: u64,
         rows: Vec<FormattedRow>,
+        formatter: DisplayFormatter,
     },
     Searched {
         token: u64,
+        generation: u64,
         index: SearchIndex,
     },
     Exported(Result<PathBuf, String>),
@@ -133,6 +136,7 @@ pub struct EscomApp {
 
     display_rows: Arc<Vec<FormattedRow>>,
     display_generation: u64,
+    display_formatter: Option<DisplayFormatter>,
     format_token: u64,
     format_in_progress: bool,
     force_format: bool,
@@ -144,9 +148,12 @@ pub struct EscomApp {
     search_regex: bool,
     search_filter: bool,
     search_index: Arc<SearchIndex>,
+    search_matcher: Option<SearchMatcher>,
+    search_index_generation: Option<u64>,
     search_token: u64,
     search_pending: bool,
     search_in_progress: bool,
+    search_wait_for_debounce: bool,
     search_reset_selection: bool,
     search_last_changed: Instant,
     search_selected_match: Option<usize>,
@@ -243,6 +250,7 @@ impl EscomApp {
             repeat: None,
             display_rows: Arc::new(Vec::new()),
             display_generation: u64::MAX,
+            display_formatter: None,
             format_token: 0,
             format_in_progress: false,
             force_format: true,
@@ -254,9 +262,12 @@ impl EscomApp {
             search_regex: false,
             search_filter: false,
             search_index: Arc::new(SearchIndex::default()),
+            search_matcher: None,
+            search_index_generation: None,
             search_token: 0,
             search_pending: false,
             search_in_progress: false,
+            search_wait_for_debounce: false,
             search_reset_selection: false,
             search_last_changed: Instant::now() - SEARCH_DEBOUNCE,
             search_selected_match: None,
@@ -435,21 +446,28 @@ impl EscomApp {
                     token,
                     generation,
                     rows,
+                    formatter,
                 } => {
                     self.format_in_progress = false;
                     if token == self.format_token && !self.paused {
                         self.display_rows = Arc::new(rows);
                         self.display_generation = generation;
+                        self.display_formatter = Some(formatter);
                         self.force_format = false;
-                        self.request_search(false);
+                        self.request_search_for_display();
                     } else {
                         self.force_format = true;
                     }
                 }
-                BackgroundEvent::Searched { token, index } => {
+                BackgroundEvent::Searched {
+                    token,
+                    generation,
+                    index,
+                } => {
                     self.search_in_progress = false;
-                    if token == self.search_token {
+                    if token == self.search_token && generation == self.display_generation {
                         self.search_index = Arc::new(index);
+                        self.search_index_generation = Some(generation);
                         if self.search_index.error.is_some() || self.search_index.matches.is_empty()
                         {
                             self.search_selected_match = None;
@@ -462,6 +480,10 @@ impl EscomApp {
                                 Some(selected.min(self.search_index.matches.len() - 1));
                         }
                         self.search_reset_selection = false;
+                    } else if token == self.search_token && self.search_matcher.is_some() {
+                        self.search_pending = true;
+                        self.search_wait_for_debounce = false;
+                        self.search_index_generation = None;
                     }
                 }
                 BackgroundEvent::Exported(result) => match result {
@@ -486,7 +508,7 @@ impl EscomApp {
     }
 
     fn maybe_start_format(&mut self, context: &egui::Context) {
-        if self.paused || self.format_in_progress {
+        if self.paused || self.format_in_progress || self.search_in_progress {
             return;
         }
         let generation = self
@@ -502,13 +524,48 @@ impl EscomApp {
             return;
         }
 
+        let mode = self.preferences.receive_mode;
+        let encoding = self.preferences.text_encoding;
+        let can_apply_delta = !self.force_format
+            && self
+                .display_formatter
+                .as_ref()
+                .is_some_and(|formatter| formatter.is_compatible(mode, encoding));
+        if can_apply_delta {
+            let cursor = self
+                .display_formatter
+                .as_ref()
+                .expect("delta formatting requires an initialized formatter")
+                .cursor();
+            let delta = self
+                .store
+                .lock()
+                .ok()
+                .map(|store| store.delta_since(cursor));
+            let Some(delta) = delta else {
+                self.set_notice("接收缓存不可用", true);
+                return;
+            };
+            if !delta.reset_or_gap {
+                let update = self
+                    .display_formatter
+                    .as_mut()
+                    .expect("delta formatting requires an initialized formatter")
+                    .apply_delta(&delta);
+                if let Ok(update) = update {
+                    self.apply_display_update(update);
+                    self.last_format_started = Instant::now();
+                    return;
+                }
+            }
+            self.force_format = true;
+        }
+
         let snapshot = self.store.lock().ok().map(|store| store.snapshot());
         let Some(snapshot) = snapshot else {
             self.set_notice("接收缓存不可用", true);
             return;
         };
-        let mode = self.preferences.receive_mode;
-        let encoding = self.preferences.text_encoding;
         let token = self.format_token;
         let sender = self.background_tx.clone();
         let repaint_context = context.clone();
@@ -520,65 +577,175 @@ impl EscomApp {
             .name("escom-format".into())
             .spawn(move || {
                 let generation = snapshot.generation;
-                let rows = format_snapshot(&snapshot, mode, encoding);
+                let (formatter, rows) = DisplayFormatter::rebuild(&snapshot, mode, encoding);
                 let _ = sender.send(BackgroundEvent::Formatted {
                     token,
                     generation,
                     rows,
+                    formatter,
                 });
                 repaint_context.request_repaint();
             })
             .expect("failed to start formatting task");
     }
 
+    fn apply_display_update(&mut self, update: DisplayUpdate) {
+        let DisplayUpdate {
+            generation,
+            remove_prefix,
+            replace_tail,
+            rows,
+        } = update;
+        let old_generation = self.display_generation;
+        let old_row_count = self.display_rows.len();
+        let search_was_current = self.search_index_generation == Some(old_generation);
+
+        if search_was_current {
+            if let Some(matcher) = &self.search_matcher {
+                Arc::make_mut(&mut self.search_index).apply_display_update(
+                    old_row_count,
+                    remove_prefix,
+                    replace_tail,
+                    &rows,
+                    matcher,
+                    self.preferences.timestamps,
+                );
+            }
+            self.search_index_generation = Some(generation);
+        }
+
+        let display_rows = Arc::make_mut(&mut self.display_rows);
+        display_rows.drain(..remove_prefix);
+        display_rows.truncate(display_rows.len().saturating_sub(replace_tail));
+        display_rows.extend(rows);
+        self.display_generation = generation;
+        self.force_format = false;
+
+        if search_was_current {
+            self.clamp_search_selection();
+        }
+    }
+
     fn request_search(&mut self, reset_selection: bool) {
         self.search_token = self.search_token.wrapping_add(1);
         self.search_last_changed = Instant::now();
-        self.search_pending = !self.search_query.is_empty();
+        self.search_wait_for_debounce = true;
         self.search_reset_selection |= reset_selection;
+        self.search_index_generation = None;
         if reset_selection {
             self.search_index = Arc::new(SearchIndex::default());
             self.search_selected_match = None;
             self.search_scroll_to_row = None;
         }
+
+        match SearchMatcher::new(
+            &self.search_query,
+            self.search_case_sensitive,
+            self.search_regex,
+        ) {
+            Ok(Some(matcher)) => {
+                self.search_matcher = Some(matcher);
+                self.search_pending = true;
+            }
+            Ok(None) => {
+                self.search_matcher = None;
+                self.search_pending = false;
+                self.search_wait_for_debounce = false;
+                self.search_reset_selection = false;
+                self.search_index = Arc::new(SearchIndex::default());
+                self.search_index_generation = Some(self.display_generation);
+            }
+            Err(error) => {
+                self.search_matcher = None;
+                self.search_pending = false;
+                self.search_wait_for_debounce = false;
+                self.search_reset_selection = false;
+                self.search_index = Arc::new(SearchIndex {
+                    error: Some(error),
+                    ..Default::default()
+                });
+                self.search_index_generation = Some(self.display_generation);
+                self.search_selected_match = None;
+                self.search_scroll_to_row = None;
+            }
+        }
+    }
+
+    fn request_search_for_display(&mut self) {
+        self.search_index_generation = None;
         if self.search_query.is_empty() {
+            self.search_index = Arc::new(SearchIndex::default());
             self.search_pending = false;
-            self.search_reset_selection = false;
+            self.search_wait_for_debounce = false;
+            self.search_index_generation = Some(self.display_generation);
+        } else if self.search_matcher.is_some() {
+            self.search_token = self.search_token.wrapping_add(1);
+            self.search_pending = true;
+        } else if self.search_index.error.is_some() {
+            self.search_index_generation = Some(self.display_generation);
         }
     }
 
     fn maybe_start_search(&mut self, context: &egui::Context) {
-        if !self.search_pending || self.search_in_progress || self.search_query.is_empty() {
+        if !self.search_pending
+            || self.search_in_progress
+            || self.format_in_progress
+            || self.search_query.is_empty()
+        {
             return;
         }
-        if self.search_last_changed.elapsed() < SEARCH_DEBOUNCE {
+        if self.search_wait_for_debounce && self.search_last_changed.elapsed() < SEARCH_DEBOUNCE {
             context.request_repaint_after(SEARCH_DEBOUNCE - self.search_last_changed.elapsed());
             return;
         }
 
+        let Some(matcher) = self.search_matcher.clone() else {
+            self.search_pending = false;
+            return;
+        };
         let token = self.search_token;
+        let generation = self.display_generation;
         let rows = Arc::clone(&self.display_rows);
-        let query = self.search_query.clone();
-        let case_sensitive = self.search_case_sensitive;
-        let regex_mode = self.search_regex;
         let timestamps = self.preferences.timestamps;
         let sender = self.background_tx.clone();
         let repaint_context = context.clone();
         self.search_pending = false;
         self.search_in_progress = true;
+        self.search_wait_for_debounce = false;
 
         thread::Builder::new()
             .name("escom-search".into())
             .spawn(move || {
-                let index =
-                    search::search_rows(&rows, &query, case_sensitive, regex_mode, timestamps);
-                let _ = sender.send(BackgroundEvent::Searched { token, index });
+                let index = search::search_rows_with_matcher(&rows, &matcher, timestamps);
+                drop(rows);
+                let _ = sender.send(BackgroundEvent::Searched {
+                    token,
+                    generation,
+                    index,
+                });
                 repaint_context.request_repaint();
             })
             .expect("failed to start search task");
     }
 
+    fn search_index_is_current(&self) -> bool {
+        self.search_query.is_empty()
+            || self.search_index_generation == Some(self.display_generation)
+    }
+
+    fn clamp_search_selection(&mut self) {
+        if self.search_index.matches.is_empty() {
+            self.search_selected_match = None;
+            self.search_scroll_to_row = None;
+        } else if let Some(selected) = self.search_selected_match {
+            self.search_selected_match = Some(selected.min(self.search_index.matches.len() - 1));
+        }
+    }
+
     fn navigate_search(&mut self, direction: isize) {
+        if !self.search_index_is_current() || self.search_pending || self.search_in_progress {
+            return;
+        }
         let count = self.search_index.matches.len();
         if count == 0 {
             return;
@@ -594,6 +761,10 @@ impl EscomApp {
     }
 
     fn queue_selected_search_scroll(&mut self) {
+        if !self.search_index_is_current() {
+            self.search_scroll_to_row = None;
+            return;
+        }
         let Some(selected) = self.search_selected_match else {
             return;
         };
@@ -1173,6 +1344,7 @@ impl EscomApp {
         let mut search_changed = false;
         let mut navigation = 0_isize;
         let mut highlight_action = None;
+        let search_current = self.search_index_is_current();
         ui.horizontal(|ui| {
             toolbar_label(ui, "查找", 38.0);
             let search_width = (ui.available_width() - 520.0 - SEARCH_BAR_RIGHT_PADDING).max(160.0);
@@ -1234,7 +1406,11 @@ impl EscomApp {
 
             let filter_response = ui
                 .add_enabled(
-                    !self.search_query.is_empty() && self.search_index.error.is_none(),
+                    !self.search_query.is_empty()
+                        && search_current
+                        && !self.search_pending
+                        && !self.search_in_progress
+                        && self.search_index.error.is_none(),
                     egui::Button::selectable(self.search_filter, "过滤")
                         .min_size(egui::vec2(64.0, CONNECTION_CONTROL_HEIGHT)),
                 )
@@ -1244,7 +1420,10 @@ impl EscomApp {
                 self.queue_selected_search_scroll();
             }
 
-            let can_navigate = !self.search_index.matches.is_empty();
+            let can_navigate = search_current
+                && !self.search_pending
+                && !self.search_in_progress
+                && !self.search_index.matches.is_empty();
             if ui
                 .add_enabled(
                     can_navigate,
@@ -1266,8 +1445,13 @@ impl EscomApp {
                 navigation = 1;
             }
 
-            let status_error = self.search_index.error.clone();
-            let status = if self.search_pending || self.search_in_progress {
+            let status_error = search_current
+                .then(|| self.search_index.error.clone())
+                .flatten();
+            let status = if self.search_pending
+                || self.search_in_progress
+                || (!self.search_query.is_empty() && !search_current)
+            {
                 RichText::new("搜索中…").color(ui.visuals().weak_text_color())
             } else if status_error.is_some() {
                 RichText::new("表达式错误")
@@ -1371,9 +1555,14 @@ impl EscomApp {
         let timestamps = self.preferences.timestamps;
         let search_index = Arc::clone(&self.search_index);
         let highlight_rules = Arc::clone(&self.highlight_rules);
-        let selected_match = self.search_selected_match;
-        let filter_active =
-            self.search_filter && !self.search_query.is_empty() && search_index.error.is_none();
+        let search_current = self.search_index_is_current();
+        let selected_match = search_current
+            .then_some(self.search_selected_match)
+            .flatten();
+        let filter_active = self.search_filter
+            && !self.search_query.is_empty()
+            && search_current
+            && search_index.error.is_none();
         let visible_row_count = if filter_active {
             search_index.matched_row_count(rows.len())
         } else {
@@ -1418,7 +1607,11 @@ impl EscomApp {
                     };
                     let text = display_text(row, timestamps);
                     let line_style = highlight_rules.style_for(&row.text);
-                    let (match_offset, row_matches) = search_index.matches_for_row(row_index);
+                    let (match_offset, row_matches) = if search_current {
+                        search_index.matches_for_row(row_index)
+                    } else {
+                        (0, &[] as &[SearchMatch])
+                    };
                     let layout_job = receive_row_layout_job(
                         ui,
                         &text,
@@ -2367,14 +2560,22 @@ impl EscomApp {
     }
 
     fn clear_receive(&mut self) {
-        if let Ok(mut store) = self.store.lock() {
+        let generation = if let Ok(mut store) = self.store.lock() {
             store.clear();
-        }
+            store.generation()
+        } else {
+            self.display_generation
+        };
         self.invalidate_format();
         self.display_rows = Arc::new(Vec::new());
+        self.display_generation = generation;
+        self.display_formatter = None;
         self.search_token = self.search_token.wrapping_add(1);
         self.search_pending = false;
+        self.search_wait_for_debounce = false;
+        self.search_reset_selection = false;
         self.search_index = Arc::new(SearchIndex::default());
+        self.search_index_generation = Some(generation);
         self.search_selected_match = None;
         self.search_scroll_to_row = None;
     }
