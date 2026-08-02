@@ -1,6 +1,6 @@
 [package]
 name = "escom"
-version = "0.2.5"
+version = "0.3.0"
 edition = "2024"
 build = "build.rs"
 description = "A practical Windows serial-port viewer"

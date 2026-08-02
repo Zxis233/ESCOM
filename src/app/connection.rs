@@ -90,6 +90,7 @@ impl EscomApp {
             .resizable(false)
             .frame(panel_frame)
             .show(root_ui, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                 ui.add_space(4.0);
                 let control_height = toolbar_control_height(ui);
                 ui.spacing_mut().interact_size.y = control_height;
@@ -112,7 +113,10 @@ impl EscomApp {
                             ui.add_enabled_ui(editable, |ui| {
                                 egui::ComboBox::from_id_salt("serial_port")
                                     .selected_text(self.port_display_name())
-                                    .width(combo_width(ui, &self.port_display_name(), 112.0))
+                                    .width(
+                                        combo_width(ui, &self.port_display_name(), 112.0)
+                                            .min(240.0),
+                                    )
                                     .show_ui(ui, |ui| {
                                         for port in &self.ports {
                                             ui.selectable_value(
@@ -122,11 +126,9 @@ impl EscomApp {
                                             );
                                         }
                                     });
+                                let refresh_button = toolbar_button(ui, "刷新", 56.0);
                                 if ui
-                                    .add(
-                                        egui::Button::new("刷新")
-                                            .min_size(egui::vec2(56.0, control_height)),
-                                    )
+                                    .add(refresh_button)
                                     .on_hover_text("重新扫描可用串口")
                                     .clicked()
                                 {
@@ -146,14 +148,8 @@ impl EscomApp {
                                 ConnectionState::Connected(_) => "关闭串口",
                             };
                             let enabled = !matches!(self.connection, ConnectionState::Connecting);
-                            if ui
-                                .add_enabled(
-                                    enabled,
-                                    egui::Button::new(button_text)
-                                        .min_size(egui::vec2(88.0, control_height)),
-                                )
-                                .clicked()
-                            {
+                            let connection_button = toolbar_button(ui, button_text, 88.0);
+                            if ui.add_enabled(enabled, connection_button).clicked() {
                                 if self.connection.is_connected() {
                                     self.repeat = None;
                                     if let Err(message) = self.worker.close() {
@@ -165,11 +161,8 @@ impl EscomApp {
                             }
                         },
                         |ui| {
-                            ui.add(
-                                egui::Button::new("设置")
-                                    .min_size(egui::vec2(60.0, control_height)),
-                            )
-                            .clicked()
+                            let settings_button = toolbar_button(ui, "设置", 60.0);
+                            ui.add(settings_button).clicked()
                         },
                     );
                 if settings_clicked {

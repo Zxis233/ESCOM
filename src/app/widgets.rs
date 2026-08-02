@@ -48,6 +48,49 @@ pub(super) fn toolbar_control_height_from_metrics(text_height: f32, vertical_pad
         .max(MIN_CONTROL_HEIGHT)
 }
 
+pub(super) fn toolbar_button_width(ui: &mut egui::Ui, text: &str, minimum: f32) -> f32 {
+    (styled_text_width(ui, text, egui::TextStyle::Button) + ui.spacing().button_padding.x * 2.0)
+        .ceil()
+        .max(minimum)
+}
+
+pub(super) fn toolbar_button(
+    ui: &mut egui::Ui,
+    text: impl Into<String>,
+    minimum: f32,
+) -> egui::Button<'static> {
+    let text = text.into();
+    let width = toolbar_button_width(ui, &text, minimum);
+    egui::Button::new(text)
+        .wrap_mode(egui::TextWrapMode::Extend)
+        .min_size(egui::vec2(width, toolbar_control_height(ui)))
+}
+
+pub(super) fn selectable_toolbar_button(
+    ui: &mut egui::Ui,
+    selected: bool,
+    text: impl Into<String>,
+    minimum: f32,
+) -> egui::Button<'static> {
+    let text = text.into();
+    let width = toolbar_button_width(ui, &text, minimum);
+    egui::Button::selectable(selected, text)
+        .wrap_mode(egui::TextWrapMode::Extend)
+        .min_size(egui::vec2(width, toolbar_control_height(ui)))
+}
+
+pub(super) fn toolbar_checkbox_width(ui: &mut egui::Ui, text: &str) -> f32 {
+    (ui.spacing().icon_width
+        + ui.spacing().icon_spacing
+        + styled_text_width(ui, text, egui::TextStyle::Button))
+    .ceil()
+}
+
+pub(super) fn responsive_toolbar_breakpoint(ui: &egui::Ui, base_width: f32) -> f32 {
+    let font_size = egui::TextStyle::Button.resolve(ui.style()).size;
+    base_width * (font_size / 15.0).max(1.0)
+}
+
 pub(super) fn status_control_height(ui: &mut egui::Ui) -> f32 {
     let text_font = egui::TextStyle::Button.resolve(ui.style());
     let icon_font = FontId::proportional(THEME_ICON_SIZE);

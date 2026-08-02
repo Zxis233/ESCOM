@@ -1,14 +1,17 @@
 use super::receive::{
-    receive_row_layout_job, receive_text_for_clipboard, virtual_rows_content_height,
+    ReceiveToolbarLayout, receive_row_layout_job, receive_text_for_clipboard,
+    receive_toolbar_layout, virtual_rows_content_height,
 };
-use super::send::{history_preview, terminal_bytes_from_events};
+use super::send::{history_preview, send_toolbar_group_rows, terminal_bytes_from_events};
 use super::settings_ui::{
     centered_window_position, cover_uv, format_background_opacity, local_background_uri,
     normalized_online_image_url, parse_background_opacity, preferred_settings_window_width,
 };
 use super::status::human_bytes;
 use super::widgets::{
-    framed_control_height, status_control_height_from_metrics, toolbar_control_height_from_metrics,
+    framed_control_height, responsive_toolbar_breakpoint, status_control_height_from_metrics,
+    toolbar_button, toolbar_button_width, toolbar_control_height,
+    toolbar_control_height_from_metrics,
 };
 use super::*;
 use crate::formatting::format_snapshot;
@@ -44,6 +47,82 @@ fn byte_counts_are_readable() {
 fn toolbar_control_height_expands_with_large_text_metrics() {
     assert_eq!(toolbar_control_height_from_metrics(13.0, 3.0), 32.0);
     assert_eq!(toolbar_control_height_from_metrics(50.0, 4.0), 58.0);
+}
+
+#[test]
+fn toolbar_buttons_expand_for_large_text_without_growing_taller() {
+    egui::__run_test_ui(|ui| {
+        ui.style_mut().text_styles.insert(
+            egui::TextStyle::Button,
+            FontId::new(18.0, egui::FontFamily::Proportional),
+        );
+        ui.set_width(72.0);
+
+        let expected_width = toolbar_button_width(ui, "Export TXT", 40.0);
+        let expected_height = toolbar_control_height(ui);
+        let button = toolbar_button(ui, "Export TXT", 40.0);
+        let response = ui.add(button);
+
+        assert!(response.rect.width() >= expected_width);
+        assert_eq!(response.rect.height(), expected_height);
+    });
+}
+
+#[test]
+fn responsive_toolbar_breakpoint_scales_with_ui_font() {
+    egui::__run_test_ui(|ui| {
+        ui.style_mut().text_styles.insert(
+            egui::TextStyle::Button,
+            FontId::new(15.0, egui::FontFamily::Proportional),
+        );
+        assert_eq!(responsive_toolbar_breakpoint(ui, 1_000.0), 1_000.0);
+
+        ui.style_mut().text_styles.insert(
+            egui::TextStyle::Button,
+            FontId::new(18.0, egui::FontFamily::Proportional),
+        );
+        assert_eq!(responsive_toolbar_breakpoint(ui, 1_000.0), 1_200.0);
+    });
+}
+
+#[test]
+fn receive_toolbar_moves_only_the_groups_that_no_longer_fit() {
+    let display = 600.0;
+    let clear = 180.0;
+    let transfer = 220.0;
+    let separator = 17.0;
+
+    assert_eq!(
+        receive_toolbar_layout(1_034.0, display, clear, transfer, separator),
+        ReceiveToolbarLayout::AllOneRow
+    );
+    assert_eq!(
+        receive_toolbar_layout(900.0, display, clear, transfer, separator),
+        ReceiveToolbarLayout::ClearOnFirstRow
+    );
+    assert_eq!(
+        receive_toolbar_layout(750.0, display, clear, transfer, separator),
+        ReceiveToolbarLayout::ActionsOnSecondRow
+    );
+    assert_eq!(
+        receive_toolbar_layout(400.0, display, clear, transfer, separator),
+        ReceiveToolbarLayout::ThreeRows
+    );
+}
+
+#[test]
+fn send_toolbar_packs_groups_into_each_row_before_wrapping() {
+    let widths = [300.0, 250.0, 200.0, 250.0];
+    let joins = [0.0, 17.0, 8.0, 17.0];
+
+    assert_eq!(
+        send_toolbar_group_rows(1_042.0, widths, joins),
+        [0, 0, 0, 0]
+    );
+    assert_eq!(send_toolbar_group_rows(800.0, widths, joins), [0, 0, 0, 1]);
+    assert_eq!(send_toolbar_group_rows(650.0, widths, joins), [0, 0, 1, 1]);
+    assert_eq!(send_toolbar_group_rows(500.0, widths, joins), [0, 1, 1, 2]);
+    assert_eq!(send_toolbar_group_rows(240.0, widths, joins), [0, 1, 2, 3]);
 }
 
 #[test]

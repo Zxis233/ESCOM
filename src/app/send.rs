@@ -1,6 +1,34 @@
 use super::widgets::*;
 use super::*;
 
+const SEND_TOOLBAR_GROUP_COUNT: usize = 4;
+
+pub(super) fn send_toolbar_group_rows(
+    available_width: f32,
+    group_widths: [f32; SEND_TOOLBAR_GROUP_COUNT],
+    joining_widths: [f32; SEND_TOOLBAR_GROUP_COUNT],
+) -> [usize; SEND_TOOLBAR_GROUP_COUNT] {
+    let available_width = available_width.max(0.0);
+    let mut rows = [0; SEND_TOOLBAR_GROUP_COUNT];
+    let mut current_row = 0;
+    let mut used_width = 0.0;
+    for index in 0..SEND_TOOLBAR_GROUP_COUNT {
+        let joining_width = if used_width > 0.0 {
+            joining_widths[index]
+        } else {
+            0.0
+        };
+        if used_width > 0.0 && used_width + joining_width + group_widths[index] > available_width {
+            current_row += 1;
+            used_width = group_widths[index];
+        } else {
+            used_width += joining_width + group_widths[index];
+        }
+        rows[index] = current_row;
+    }
+    rows
+}
+
 impl EscomApp {
     pub(super) fn process_repeat(&mut self, context: &egui::Context) {
         let Some(repeat) = self.repeat.as_ref() else {
@@ -167,7 +195,6 @@ impl EscomApp {
     pub(super) fn show_send_panel(&mut self, root_ui: &mut egui::Ui) {
         let context = root_ui.ctx().clone();
         let root_control_height = toolbar_control_height(root_ui);
-        let min_panel_height = (root_control_height * 2.0 + 72.0).max(150.0);
         let toolbar_gap = root_ui.spacing().item_spacing.y.round() as i8;
         let panel_frame = egui::Frame::side_top_panel(root_ui.style())
             .inner_margin(egui::Margin {
@@ -177,145 +204,61 @@ impl EscomApp {
                 bottom: 2,
             })
             .fill(self.surface_fill(root_ui.visuals().panel_fill, RECEIVE_SEND_PANEL_ALPHA));
+        let toolbar_available_width =
+            (root_ui.available_width() - panel_frame.total_margin().sum().x).max(0.0);
+        let item_gap = root_ui.spacing().item_spacing.x;
+        let separator_joining_width = item_gap * 2.0 + 1.0;
+        let send_toolbar_rows = send_toolbar_group_rows(
+            toolbar_available_width,
+            self.send_toolbar_group_widths(root_ui),
+            [
+                0.0,
+                separator_joining_width,
+                item_gap,
+                separator_joining_width,
+            ],
+        );
+        let toolbar_row_count = send_toolbar_rows[SEND_TOOLBAR_GROUP_COUNT - 1] + 1;
+        let toolbar_rows_height = root_control_height * toolbar_row_count as f32
+            + root_ui.spacing().item_spacing.y * toolbar_row_count.saturating_sub(1) as f32;
+        let min_panel_height = (toolbar_rows_height + root_control_height + 72.0).max(150.0);
         egui::Panel::bottom("send_panel")
             .resizable(true)
             .size_range(min_panel_height..=280.0_f32.max(min_panel_height + 48.0))
             .frame(panel_frame)
             .show(root_ui, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                 let repeat_running = self.repeat.is_some();
                 let mut send_requested = false;
                 let control_height = toolbar_control_height(ui);
                 ui.spacing_mut().interact_size.y = control_height;
-                ui.horizontal_wrapped(|ui| {
-                    toolbar_label(ui, "发送", 38.0);
-                    ui.scope(|ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        ui.add_enabled_ui(!repeat_running, |ui| {
-                            for mode in [SendMode::Text, SendMode::Hex] {
-                                if ui
-                                    .add(
-                                        egui::Button::selectable(
-                                            self.preferences.send_mode == mode,
-                                            mode.label(),
-                                        )
-                                        .min_size(egui::vec2(50.0, control_height)),
-                                    )
-                                    .clicked()
-                                    && self.preferences.send_mode != mode
-                                {
-                                    self.preferences.send_mode = mode;
-                                    self.mark_preferences_dirty();
-                                    self.send_error = None;
-                                }
+                for row in 0..toolbar_row_count {
+                    ui.horizontal(|ui| {
+                        let mut first_group = true;
+                        for (group, group_row) in send_toolbar_rows.iter().copied().enumerate() {
+                            if group_row != row {
+                                continue;
                             }
-                        });
-                    });
-
-                    toolbar_separator(ui);
-                    toolbar_label(ui, "行尾", 40.0);
-                    let mut ending_changed = false;
-                    ui.add_enabled_ui(
-                        !repeat_running && self.preferences.send_mode == SendMode::Text,
-                        |ui| {
-                            let ending_label = self.preferences.line_ending.label();
-                            egui::ComboBox::from_id_salt("line_ending")
-                                .selected_text(ending_label)
-                                .width(combo_width(ui, ending_label, 92.0))
-                                .show_ui(ui, |ui| {
-                                    for ending in [
-                                        LineEnding::None,
-                                        LineEnding::Cr,
-                                        LineEnding::Lf,
-                                        LineEnding::CrLf,
-                                    ] {
-                                        ending_changed |= ui
-                                            .selectable_value(
-                                                &mut self.preferences.line_ending,
-                                                ending,
-                                                ending.label(),
-                                            )
-                                            .changed();
-                                    }
-                                });
-                        },
-                    );
-                    if ending_changed {
-                        self.mark_preferences_dirty();
-                    }
-
-                    let selected_history = ui
-                        .add_enabled_ui(!repeat_running, |ui| self.history_menu(ui))
-                        .inner;
-                    if let Some(item) = selected_history {
-                        self.preferences.send_mode = item.mode;
-                        self.send_input = item.input;
-                        self.send_error = None;
-                        self.mark_preferences_dirty();
-                    }
-                    let can_clear = !repeat_running
-                        && (!self.send_input.is_empty() || self.send_error.is_some());
-                    if ui
-                        .add_enabled(
-                            can_clear,
-                            egui::Button::new("清发送").min_size(egui::vec2(72.0, control_height)),
-                        )
-                        .clicked()
-                    {
-                        self.send_input.clear();
-                        self.send_error = None;
-                    }
-                    if ui
-                        .add_enabled_ui(!repeat_running, |ui| {
-                            ui.checkbox(&mut self.preferences.clear_after_send, "发送成功后清空")
-                        })
-                        .inner
-                        .changed()
-                    {
-                        self.mark_preferences_dirty();
-                    }
-
-                    toolbar_separator(ui);
-                    toolbar_label(ui, "循环间隔", 64.0);
-                    if ui
-                        .add_enabled_ui(!repeat_running, |ui| {
-                            ui.add_sized(
-                                [92.0, control_height],
-                                egui::DragValue::new(&mut self.preferences.repeat_interval_ms)
-                                    .range(20..=3_600_000)
-                                    .speed(10.0)
-                                    .suffix(" ms"),
-                            )
-                        })
-                        .inner
-                        .changed()
-                    {
-                        self.mark_preferences_dirty();
-                    }
-                    let mut repeat_checkbox = repeat_running;
-                    let repeat_available = self.connection.is_connected() || repeat_running;
-                    let repeat_response = ui
-                        .add_enabled_ui(repeat_available, |ui| {
-                            ui.checkbox(&mut repeat_checkbox, "循环发送")
-                        })
-                        .inner
-                        .on_disabled_hover_text("请先打开串口");
-                    if repeat_response.changed() {
-                        if repeat_checkbox {
-                            self.start_repeat(&context);
-                        } else {
-                            self.repeat = None;
+                            if !first_group && matches!(group, 1 | 3) {
+                                toolbar_separator(ui);
+                            }
+                            match group {
+                                0 => self.show_send_mode_controls(ui, repeat_running),
+                                1 => self.show_send_line_ending_controls(ui, repeat_running),
+                                2 => self.show_send_history_controls(ui, repeat_running),
+                                3 => {
+                                    send_requested |= self.show_send_repeat_controls(
+                                        ui,
+                                        repeat_running,
+                                        &context,
+                                    );
+                                }
+                                _ => unreachable!("send toolbar group index is bounded"),
+                            }
+                            first_group = false;
                         }
-                    }
-
-                    let can_send = self.connection.is_connected() && !repeat_running;
-                    let mut button = egui::Button::new(RichText::new("发送").strong());
-                    if can_send {
-                        button = button.fill(ui.visuals().selection.bg_fill);
-                    }
-                    send_requested = ui
-                        .add_enabled(can_send, button.min_size(egui::vec2(72.0, control_height)))
-                        .clicked();
-                });
+                    });
+                }
 
                 let editor_id = ui.make_persistent_id("send_input_editor");
                 let shortcut_requested = ui.memory(|memory| memory.has_focus(editor_id))
@@ -366,11 +309,161 @@ impl EscomApp {
             });
     }
 
+    fn send_toolbar_group_widths(&self, ui: &mut egui::Ui) -> [f32; SEND_TOOLBAR_GROUP_COUNT] {
+        let gap = ui.spacing().item_spacing.x;
+        let mode_width = label_width(ui, "发送", 38.0)
+            + toolbar_button_width(ui, SendMode::Text.label(), 50.0)
+            + toolbar_button_width(ui, SendMode::Hex.label(), 50.0)
+            + gap * 2.0;
+        let line_ending_width = label_width(ui, "行尾", 40.0)
+            + combo_width(ui, self.preferences.line_ending.label(), 92.0)
+            + gap;
+        let history_width =
+            toolbar_button_width(ui, &format!("历史 ({})", self.history.len()), 82.0)
+                + toolbar_button_width(ui, "清发送", 72.0)
+                + toolbar_checkbox_width(ui, "发送成功后清空")
+                + gap * 2.0;
+        let repeat_width = label_width(ui, "循环间隔", 64.0)
+            + 92.0
+            + toolbar_checkbox_width(ui, "循环发送")
+            + toolbar_button_width(ui, "发送", 72.0)
+            + gap * 3.0;
+        [mode_width, line_ending_width, history_width, repeat_width]
+    }
+
+    fn show_send_mode_controls(&mut self, ui: &mut egui::Ui, repeat_running: bool) {
+        toolbar_label(ui, "发送", 38.0);
+        for mode in [SendMode::Text, SendMode::Hex] {
+            let button = selectable_toolbar_button(
+                ui,
+                self.preferences.send_mode == mode,
+                mode.label(),
+                50.0,
+            );
+            if ui.add_enabled(!repeat_running, button).clicked()
+                && self.preferences.send_mode != mode
+            {
+                self.preferences.send_mode = mode;
+                self.mark_preferences_dirty();
+                self.send_error = None;
+            }
+        }
+    }
+
+    fn show_send_line_ending_controls(&mut self, ui: &mut egui::Ui, repeat_running: bool) {
+        toolbar_label(ui, "行尾", 40.0);
+        let mut ending_changed = false;
+        ui.add_enabled_ui(
+            !repeat_running && self.preferences.send_mode == SendMode::Text,
+            |ui| {
+                let ending_label = self.preferences.line_ending.label();
+                egui::ComboBox::from_id_salt("line_ending")
+                    .selected_text(ending_label)
+                    .width(combo_width(ui, ending_label, 92.0))
+                    .show_ui(ui, |ui| {
+                        for ending in [
+                            LineEnding::None,
+                            LineEnding::Cr,
+                            LineEnding::Lf,
+                            LineEnding::CrLf,
+                        ] {
+                            ending_changed |= ui
+                                .selectable_value(
+                                    &mut self.preferences.line_ending,
+                                    ending,
+                                    ending.label(),
+                                )
+                                .changed();
+                        }
+                    });
+            },
+        );
+        if ending_changed {
+            self.mark_preferences_dirty();
+        }
+    }
+
+    fn show_send_history_controls(&mut self, ui: &mut egui::Ui, repeat_running: bool) {
+        let selected_history = ui
+            .add_enabled_ui(!repeat_running, |ui| self.history_menu(ui))
+            .inner;
+        if let Some(item) = selected_history {
+            self.preferences.send_mode = item.mode;
+            self.send_input = item.input;
+            self.send_error = None;
+            self.mark_preferences_dirty();
+        }
+        let can_clear =
+            !repeat_running && (!self.send_input.is_empty() || self.send_error.is_some());
+        let clear_button = toolbar_button(ui, "清发送", 72.0);
+        if ui.add_enabled(can_clear, clear_button).clicked() {
+            self.send_input.clear();
+            self.send_error = None;
+        }
+        if ui
+            .add_enabled(
+                !repeat_running,
+                egui::Checkbox::new(&mut self.preferences.clear_after_send, "发送成功后清空"),
+            )
+            .changed()
+        {
+            self.mark_preferences_dirty();
+        }
+    }
+
+    fn show_send_repeat_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        repeat_running: bool,
+        context: &egui::Context,
+    ) -> bool {
+        let control_height = toolbar_control_height(ui);
+        toolbar_label(ui, "循环间隔", 64.0);
+        if ui
+            .add_enabled_ui(!repeat_running, |ui| {
+                ui.add_sized(
+                    [92.0, control_height],
+                    egui::DragValue::new(&mut self.preferences.repeat_interval_ms)
+                        .range(20..=3_600_000)
+                        .speed(10.0)
+                        .suffix(" ms"),
+                )
+            })
+            .inner
+            .changed()
+        {
+            self.mark_preferences_dirty();
+        }
+        let mut repeat_checkbox = repeat_running;
+        let repeat_available = self.connection.is_connected() || repeat_running;
+        let repeat_response = ui
+            .add_enabled(
+                repeat_available,
+                egui::Checkbox::new(&mut repeat_checkbox, "循环发送"),
+            )
+            .on_disabled_hover_text("请先打开串口");
+        if repeat_response.changed() {
+            if repeat_checkbox {
+                self.start_repeat(context);
+            } else {
+                self.repeat = None;
+            }
+        }
+
+        let can_send = self.connection.is_connected() && !repeat_running;
+        let width = toolbar_button_width(ui, "发送", 72.0);
+        let mut button = egui::Button::new(RichText::new("发送").strong())
+            .wrap_mode(egui::TextWrapMode::Extend)
+            .min_size(egui::vec2(width, control_height));
+        if can_send {
+            button = button.fill(ui.visuals().selection.bg_fill);
+        }
+        ui.add_enabled(can_send, button).clicked()
+    }
+
     pub(super) fn history_menu(&mut self, ui: &mut egui::Ui) -> Option<HistoryItem> {
         let mut selected = None;
-        let control_height = toolbar_control_height(ui);
-        let button = egui::Button::new(format!("历史 ({})", self.history.len()))
-            .min_size(egui::vec2(82.0, control_height));
+        let button = toolbar_button(ui, format!("历史 ({})", self.history.len()), 82.0);
         egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
             if self.history.is_empty() {
                 ui.label("暂无成功发送记录");

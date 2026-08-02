@@ -1,6 +1,46 @@
 use super::widgets::*;
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReceiveToolbarLayout {
+    AllOneRow,
+    ClearOnFirstRow,
+    ActionsOnSecondRow,
+    ThreeRows,
+}
+
+pub(super) fn receive_toolbar_layout(
+    available_width: f32,
+    display_width: f32,
+    clear_width: f32,
+    transfer_width: f32,
+    separator_width: f32,
+) -> ReceiveToolbarLayout {
+    if display_width + separator_width + clear_width + separator_width + transfer_width
+        <= available_width
+    {
+        ReceiveToolbarLayout::AllOneRow
+    } else if display_width + separator_width + clear_width <= available_width {
+        ReceiveToolbarLayout::ClearOnFirstRow
+    } else if clear_width + separator_width + transfer_width <= available_width {
+        ReceiveToolbarLayout::ActionsOnSecondRow
+    } else {
+        ReceiveToolbarLayout::ThreeRows
+    }
+}
+
+fn receive_clear_controls_width(ui: &mut egui::Ui) -> f32 {
+    toolbar_button_width(ui, "清接收", 64.0)
+        + toolbar_button_width(ui, "全部清空", 80.0)
+        + ui.spacing().item_spacing.x
+}
+
+fn receive_transfer_controls_width(ui: &mut egui::Ui) -> f32 {
+    toolbar_button_width(ui, "复制接收区", 96.0)
+        + toolbar_button_width(ui, "导出 TXT", 80.0)
+        + ui.spacing().item_spacing.x
+}
+
 impl EscomApp {
     pub(super) fn maybe_start_format(&mut self, context: &egui::Context) {
         if self.paused || self.display_task.is_running() || self.search_task.is_running() {
@@ -156,159 +196,54 @@ impl EscomApp {
             .resizable(false)
             .frame(toolbar_frame)
             .show(root_ui, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                 let mut preferences_changed = false;
                 let mut display_changed = false;
                 let control_height = toolbar_control_height(ui);
                 ui.spacing_mut().interact_size.y = control_height;
-                ui.horizontal_wrapped(|ui| {
-                    toolbar_label(ui, "接收", 38.0);
-                    for mode in [ReceiveMode::Text, ReceiveMode::Hex, ReceiveMode::Terminal] {
-                        let width = if mode == ReceiveMode::Terminal {
-                            64.0
-                        } else {
-                            50.0
-                        };
-                        if ui
-                            .add(
-                                egui::Button::selectable(
-                                    self.preferences.receive_mode == mode,
-                                    mode.label(),
-                                )
-                                .min_size(egui::vec2(width, control_height)),
-                            )
-                            .clicked()
-                            && self.preferences.receive_mode != mode
-                        {
-                            self.preferences.receive_mode = mode;
-                            if mode == ReceiveMode::Terminal {
-                                self.repeat = None;
-                                self.focus_terminal_surface = true;
-                            }
-                            display_changed = true;
-                            preferences_changed = true;
-                        }
+                let separator_width = ui.spacing().item_spacing.x * 2.0 + 1.0;
+                let toolbar_layout = receive_toolbar_layout(
+                    ui.available_width(),
+                    self.receive_display_controls_width(ui),
+                    receive_clear_controls_width(ui),
+                    receive_transfer_controls_width(ui),
+                    separator_width,
+                );
+                ui.horizontal(|ui| {
+                    self.show_receive_display_controls(
+                        ui,
+                        &mut display_changed,
+                        &mut preferences_changed,
+                    );
+                    if matches!(
+                        toolbar_layout,
+                        ReceiveToolbarLayout::AllOneRow | ReceiveToolbarLayout::ClearOnFirstRow
+                    ) {
+                        toolbar_separator(ui);
+                        self.show_receive_clear_controls(ui);
                     }
-                    let encoding_label = self.preferences.text_encoding.label();
-                    egui::ComboBox::from_id_salt("text_encoding")
-                        .selected_text(encoding_label)
-                        .width(combo_width(ui, encoding_label, 92.0))
-                        .show_ui(ui, |ui| {
-                            for encoding in [TextEncoding::Utf8, TextEncoding::Gbk] {
-                                if ui
-                                    .selectable_value(
-                                        &mut self.preferences.text_encoding,
-                                        encoding,
-                                        encoding.label(),
-                                    )
-                                    .changed()
-                                {
-                                    display_changed = true;
-                                    preferences_changed = true;
-                                }
-                            }
-                        });
-                    let timestamps_changed = ui
-                        .checkbox(&mut self.preferences.timestamps, "时间戳")
-                        .changed();
-                    preferences_changed |= timestamps_changed;
-                    if timestamps_changed {
-                        self.request_search(true);
-                    }
-                    preferences_changed |= ui
-                        .checkbox(&mut self.preferences.auto_scroll, "自动滚动")
-                        .changed();
-
-                    let pause_label = if self.paused {
-                        "继续显示"
-                    } else {
-                        "暂停显示"
-                    };
-                    if ui
-                        .add(
-                            egui::Button::new(pause_label)
-                                .min_size(egui::vec2(80.0, control_height)),
-                        )
-                        .clicked()
-                    {
-                        self.paused = !self.paused;
-                        self.invalidate_format();
-                    }
-                    if ui
-                        .add(egui::Button::new("到底部").min_size(egui::vec2(64.0, control_height)))
-                        .clicked()
-                    {
-                        self.force_scroll_bottom = true;
-                        self.preferences.auto_scroll = true;
-                        preferences_changed = true;
-                    }
-
-                    toolbar_separator(ui);
-
-                    if ui
-                        .add(egui::Button::new("清接收").min_size(egui::vec2(64.0, control_height)))
-                        .clicked()
-                    {
-                        self.clear_receive();
-                    }
-                    if ui
-                        .add(
-                            egui::Button::new("全部清空")
-                                .min_size(egui::vec2(80.0, control_height)),
-                        )
-                        .clicked()
-                    {
-                        self.clear_receive();
-                        self.send_input.clear();
-                        self.send_error = None;
-                    }
-                    let copy_filter_active = self.search_filter
-                        && !self.search_query.is_empty()
-                        && self.search_index_is_current()
-                        && self.search_index.error.is_none();
-                    let copy_row_count = if copy_filter_active {
-                        self.search_index.matched_row_count(self.display_rows.len())
-                    } else {
-                        self.display_rows.len()
-                    };
-
-                    toolbar_separator(ui);
-
-                    if ui
-                        .add_enabled(
-                            copy_row_count > 0,
-                            egui::Button::new("复制接收区")
-                                .min_size(egui::vec2(96.0, control_height)),
-                        )
-                        .clicked()
-                    {
-                        let visible_rows =
-                            copy_filter_active.then_some(self.search_index.matched_rows.as_slice());
-                        let text = receive_text_for_clipboard(
-                            &self.display_rows,
-                            self.preferences.timestamps,
-                            &self.preferences.timestamp_format,
-                            visible_rows,
-                        );
-                        context.copy_text(text);
-                        self.set_notice(format!("已复制接收区（{copy_row_count} 行）"), false);
-                    }
-                    if ui
-                        .add_enabled_ui(
-                            self.receive_bytes_len() > 0 && !self.export_in_progress,
-                            |ui| {
-                                ui.add(
-                                    egui::Button::new("导出 TXT")
-                                        .wrap_mode(egui::TextWrapMode::Extend)
-                                        .min_size(egui::vec2(80.0, control_height)),
-                                )
-                            },
-                        )
-                        .inner
-                        .clicked()
-                    {
-                        self.export_snapshot(&context);
+                    if toolbar_layout == ReceiveToolbarLayout::AllOneRow {
+                        toolbar_separator(ui);
+                        self.show_receive_transfer_controls(ui, &context);
                     }
                 });
+                match toolbar_layout {
+                    ReceiveToolbarLayout::AllOneRow => {}
+                    ReceiveToolbarLayout::ClearOnFirstRow => {
+                        ui.horizontal(|ui| self.show_receive_transfer_controls(ui, &context));
+                    }
+                    ReceiveToolbarLayout::ActionsOnSecondRow => {
+                        ui.horizontal(|ui| {
+                            self.show_receive_clear_controls(ui);
+                            toolbar_separator(ui);
+                            self.show_receive_transfer_controls(ui, &context);
+                        });
+                    }
+                    ReceiveToolbarLayout::ThreeRows => {
+                        ui.horizontal(|ui| self.show_receive_clear_controls(ui));
+                        ui.horizontal(|ui| self.show_receive_transfer_controls(ui, &context));
+                    }
+                }
                 self.show_search_bar(ui, &context);
                 if display_changed {
                     self.invalidate_format();
@@ -329,6 +264,152 @@ impl EscomApp {
                     self.show_receive_content(ui);
                 }
             });
+    }
+
+    fn show_receive_display_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        display_changed: &mut bool,
+        preferences_changed: &mut bool,
+    ) {
+        toolbar_label(ui, "接收", 38.0);
+        for mode in [ReceiveMode::Text, ReceiveMode::Hex, ReceiveMode::Terminal] {
+            let minimum = if mode == ReceiveMode::Terminal {
+                64.0
+            } else {
+                50.0
+            };
+            let button = selectable_toolbar_button(
+                ui,
+                self.preferences.receive_mode == mode,
+                mode.label(),
+                minimum,
+            );
+            if ui.add(button).clicked() && self.preferences.receive_mode != mode {
+                self.preferences.receive_mode = mode;
+                if mode == ReceiveMode::Terminal {
+                    self.repeat = None;
+                    self.focus_terminal_surface = true;
+                }
+                *display_changed = true;
+                *preferences_changed = true;
+            }
+        }
+        let encoding_label = self.preferences.text_encoding.label();
+        egui::ComboBox::from_id_salt("text_encoding")
+            .selected_text(encoding_label)
+            .width(combo_width(ui, encoding_label, 92.0))
+            .show_ui(ui, |ui| {
+                for encoding in [TextEncoding::Utf8, TextEncoding::Gbk] {
+                    if ui
+                        .selectable_value(
+                            &mut self.preferences.text_encoding,
+                            encoding,
+                            encoding.label(),
+                        )
+                        .changed()
+                    {
+                        *display_changed = true;
+                        *preferences_changed = true;
+                    }
+                }
+            });
+        let timestamps_changed = ui
+            .checkbox(&mut self.preferences.timestamps, "时间戳")
+            .changed();
+        *preferences_changed |= timestamps_changed;
+        if timestamps_changed {
+            self.request_search(true);
+        }
+        *preferences_changed |= ui
+            .checkbox(&mut self.preferences.auto_scroll, "自动滚动")
+            .changed();
+
+        let pause_label = if self.paused {
+            "继续显示"
+        } else {
+            "暂停显示"
+        };
+        let pause_button = toolbar_button(ui, pause_label, 80.0);
+        if ui.add(pause_button).clicked() {
+            self.paused = !self.paused;
+            self.invalidate_format();
+        }
+        let bottom_button = toolbar_button(ui, "到底部", 64.0);
+        if ui.add(bottom_button).clicked() {
+            self.force_scroll_bottom = true;
+            self.preferences.auto_scroll = true;
+            *preferences_changed = true;
+        }
+    }
+
+    fn receive_display_controls_width(&self, ui: &mut egui::Ui) -> f32 {
+        let pause_label = if self.paused {
+            "继续显示"
+        } else {
+            "暂停显示"
+        };
+        let widths = [
+            label_width(ui, "接收", 38.0),
+            toolbar_button_width(ui, ReceiveMode::Text.label(), 50.0),
+            toolbar_button_width(ui, ReceiveMode::Hex.label(), 50.0),
+            toolbar_button_width(ui, ReceiveMode::Terminal.label(), 64.0),
+            combo_width(ui, self.preferences.text_encoding.label(), 92.0),
+            toolbar_checkbox_width(ui, "时间戳"),
+            toolbar_checkbox_width(ui, "自动滚动"),
+            toolbar_button_width(ui, pause_label, 80.0),
+            toolbar_button_width(ui, "到底部", 64.0),
+        ];
+        widths.into_iter().sum::<f32>() + ui.spacing().item_spacing.x * 8.0
+    }
+
+    fn show_receive_clear_controls(&mut self, ui: &mut egui::Ui) {
+        let clear_receive_button = toolbar_button(ui, "清接收", 64.0);
+        if ui.add(clear_receive_button).clicked() {
+            self.clear_receive();
+        }
+        let clear_all_button = toolbar_button(ui, "全部清空", 80.0);
+        if ui.add(clear_all_button).clicked() {
+            self.clear_receive();
+            self.send_input.clear();
+            self.send_error = None;
+        }
+    }
+
+    fn show_receive_transfer_controls(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        let copy_filter_active = self.search_filter
+            && !self.search_query.is_empty()
+            && self.search_index_is_current()
+            && self.search_index.error.is_none();
+        let copy_row_count = if copy_filter_active {
+            self.search_index.matched_row_count(self.display_rows.len())
+        } else {
+            self.display_rows.len()
+        };
+
+        let copy_button = toolbar_button(ui, "复制接收区", 96.0);
+        if ui.add_enabled(copy_row_count > 0, copy_button).clicked() {
+            let visible_rows =
+                copy_filter_active.then_some(self.search_index.matched_rows.as_slice());
+            let text = receive_text_for_clipboard(
+                &self.display_rows,
+                self.preferences.timestamps,
+                &self.preferences.timestamp_format,
+                visible_rows,
+            );
+            context.copy_text(text);
+            self.set_notice(format!("已复制接收区（{copy_row_count} 行）"), false);
+        }
+        let export_button = toolbar_button(ui, "导出 TXT", 80.0);
+        if ui
+            .add_enabled(
+                self.receive_bytes_len() > 0 && !self.export_in_progress,
+                export_button,
+            )
+            .clicked()
+        {
+            self.export_snapshot(context);
+        }
     }
 
     pub(super) fn show_receive_content(&mut self, ui: &mut egui::Ui) {
