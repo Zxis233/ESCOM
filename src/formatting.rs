@@ -638,8 +638,11 @@ pub fn write_export<W: io::Write + ?Sized>(
 ) -> io::Result<()> {
     writer.write_all(&UTF8_BOM)?;
     match mode {
-        ReceiveMode::Text | ReceiveMode::Terminal => {
+        ReceiveMode::Text => {
             write_text_export(writer, snapshot, encoding, timestamps, timestamp_format)
+        }
+        ReceiveMode::Terminal => {
+            write_terminal_export(writer, snapshot, encoding, timestamps, timestamp_format)
         }
         ReceiveMode::Hex => write_hex_export(writer, snapshot, timestamps, timestamp_format),
     }
@@ -771,6 +774,29 @@ fn write_text_export<W: io::Write + ?Sized>(
         &mut exporter,
     )?;
     exporter.finish()
+}
+
+fn write_terminal_export<W: io::Write + ?Sized>(
+    writer: &mut W,
+    snapshot: ReceiveSnapshot,
+    encoding: TextEncoding,
+    timestamps: bool,
+    timestamp_format: &str,
+) -> io::Result<()> {
+    // Reuse the display formatter so cursor movement, erasing, overwriting, encoding and display
+    // limits have exactly the same semantics as the terminal surface. Release the raw snapshot
+    // before writing the bounded rendered rows.
+    let (_, rows) = DisplayFormatter::rebuild(&snapshot, ReceiveMode::Terminal, encoding);
+    drop(snapshot);
+
+    for row in rows {
+        write_export_timestamp(writer, row.received_at, timestamps, timestamp_format)?;
+        for bytes in row.text.as_bytes().chunks(EXPORT_DECODE_INPUT_BYTES) {
+            writer.write_all(bytes)?;
+        }
+        writer.write_all(b"\r\n")?;
+    }
+    Ok(())
 }
 
 fn decode_export_piece<W: io::Write + ?Sized>(
@@ -1471,6 +1497,82 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(&output[UTF8_BOM.len()..]).unwrap(),
             "中文\r\n完成\r\n"
+        );
+    }
+
+    #[test]
+    fn terminal_export_writes_the_interpreted_screen_instead_of_ansi_input() {
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), b"msh >list".to_vec());
+        store.append(timestamp(2), b"\x1b[2K\rmsh >thread\r\n".to_vec());
+        store.append(timestamp(3), b"normal \x1b[31mred\x1b[0m text".to_vec());
+        let mut output = Vec::new();
+
+        write_export(
+            &mut output,
+            store.snapshot(),
+            ReceiveMode::Terminal,
+            TextEncoding::Utf8,
+            false,
+            DEFAULT_TIMESTAMP_FORMAT,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::str::from_utf8(&output[UTF8_BOM.len()..]).unwrap(),
+            "msh >thread\r\nnormal red text\r\n"
+        );
+        assert!(!output.contains(&0x1B));
+    }
+
+    #[test]
+    fn terminal_export_handles_split_csi_and_split_gbk() {
+        let (encoded, _, _) = GBK.encode("中文");
+        let encoded = encoded.into_owned();
+        let mut clear_and_first_byte = b"2J".to_vec();
+        clear_and_first_byte.extend_from_slice(&encoded[..1]);
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), b"obsolete\r\n\x1b[".to_vec());
+        store.append(timestamp(2), clear_and_first_byte);
+        store.append(timestamp(3), encoded[1..].to_vec());
+        let mut output = Vec::new();
+
+        write_export(
+            &mut output,
+            store.snapshot(),
+            ReceiveMode::Terminal,
+            TextEncoding::Gbk,
+            false,
+            DEFAULT_TIMESTAMP_FORMAT,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::str::from_utf8(&output[UTF8_BOM.len()..]).unwrap(),
+            "中文\r\n"
+        );
+    }
+
+    #[test]
+    fn terminal_export_uses_rendered_row_timestamps() {
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), b"first\r\n".to_vec());
+        store.append(timestamp(2), b"second".to_vec());
+        let mut output = Vec::new();
+
+        write_export(
+            &mut output,
+            store.snapshot(),
+            ReceiveMode::Terminal,
+            TextEncoding::Utf8,
+            true,
+            "%H:%M:%S",
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::str::from_utf8(&output[UTF8_BOM.len()..]).unwrap(),
+            "[12:00:01] first\r\n[12:00:02] second\r\n"
         );
     }
 
