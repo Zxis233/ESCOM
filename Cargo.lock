@@ -1305,7 +1305,6 @@ dependencies = [
  "fontdb",
  "image",
  "log",
- "raw-window-handle",
  "regex",
  "rfd",
  "serde",
@@ -1314,7 +1313,6 @@ dependencies = [
  "toml",
  "unicode-width",
  "vte",
- "windows-sys 0.61.2",
  "winresource",
 ]
 
