@@ -24,6 +24,21 @@ const EXPORT_DECODE_INPUT_BYTES: usize = 64 * 1024;
 const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
 
+fn hex_skipped_bytes_modulo(snapshot: &ReceiveSnapshot) -> usize {
+    ((snapshot.dropped_bytes % HEX_BYTES_PER_ROW as u64) as usize
+        + snapshot.omitted_bytes % HEX_BYTES_PER_ROW)
+        % HEX_BYTES_PER_ROW
+}
+
+fn hex_first_row_capacity(skipped_bytes_modulo: usize) -> usize {
+    let skipped_bytes_modulo = skipped_bytes_modulo % HEX_BYTES_PER_ROW;
+    if skipped_bytes_modulo == 0 {
+        HEX_BYTES_PER_ROW
+    } else {
+        HEX_BYTES_PER_ROW - skipped_bytes_modulo
+    }
+}
+
 pub const fn display_snapshot_limit(mode: ReceiveMode) -> usize {
     match mode {
         ReceiveMode::Text | ReceiveMode::Terminal => MAX_TEXT_REBUILD_BYTES,
@@ -78,7 +93,7 @@ pub struct DisplayFormatter {
 enum DisplayFormatterState {
     Text(IncrementalTextFormatter),
     Terminal(Box<IncrementalTerminalFormatter>),
-    Hex,
+    Hex(IncrementalHexFormatter),
 }
 
 struct IncrementalTextFormatter {
@@ -90,6 +105,14 @@ struct IncrementalTextFormatter {
     partial_visible: bool,
     max_line_bytes: usize,
     line_limited: bool,
+}
+
+struct IncrementalHexFormatter {
+    current: Vec<u8>,
+    current_capacity: usize,
+    line_started_at: Option<DateTime<Local>>,
+    current_end_sequence: Option<u64>,
+    partial_visible: bool,
 }
 
 impl DisplayFormatter {
@@ -115,7 +138,9 @@ impl DisplayFormatter {
             ReceiveMode::Terminal => DisplayFormatterState::Terminal(Box::new(
                 IncrementalTerminalFormatter::new(encoding),
             )),
-            ReceiveMode::Hex => DisplayFormatterState::Hex,
+            ReceiveMode::Hex => DisplayFormatterState::Hex(IncrementalHexFormatter::new(
+                hex_skipped_bytes_modulo(snapshot),
+            )),
         };
         let mut formatter = Self {
             mode,
@@ -179,10 +204,11 @@ impl DisplayFormatter {
             return self.apply_terminal_delta(delta);
         }
 
-        let partial_visible = matches!(
-            &self.state,
-            DisplayFormatterState::Text(state) if state.partial_visible
-        );
+        let partial_visible = match &self.state {
+            DisplayFormatterState::Text(state) => state.partial_visible,
+            DisplayFormatterState::Hex(state) => state.partial_visible,
+            DisplayFormatterState::Terminal(_) => false,
+        };
         let completed_rows = self
             .row_end_sequences
             .len()
@@ -207,8 +233,10 @@ impl DisplayFormatter {
             if let Some(bytes) = self.row_text_bytes.pop_back() {
                 self.text_bytes = self.text_bytes.saturating_sub(bytes);
             }
-            if let DisplayFormatterState::Text(state) = &mut self.state {
-                state.partial_visible = false;
+            match &mut self.state {
+                DisplayFormatterState::Text(state) => state.partial_visible = false,
+                DisplayFormatterState::Hex(state) => state.partial_visible = false,
+                DisplayFormatterState::Terminal(_) => {}
             }
         }
 
@@ -258,10 +286,10 @@ impl DisplayFormatter {
                         *limits,
                     );
                 }
-                DisplayFormatterState::Hex => {
+                DisplayFormatterState::Hex(state) => {
                     for chunk in &delta.chunks {
                         let new_rows_start = rows.len();
-                        push_hex_chunk(chunk, &mut rows, row_end_sequences);
+                        state.push_chunk(chunk, &mut rows, row_end_sequences);
                         register_new_rows(&rows[new_rows_start..], row_text_bytes, text_bytes);
                         enforce_display_limits(
                             &mut retained_existing,
@@ -274,6 +302,19 @@ impl DisplayFormatter {
                             *limits,
                         );
                     }
+                    let new_rows_start = rows.len();
+                    state.push_partial_row(&mut rows, row_end_sequences);
+                    register_new_rows(&rows[new_rows_start..], row_text_bytes, text_bytes);
+                    enforce_display_limits(
+                        &mut retained_existing,
+                        &mut cap_removed_existing,
+                        &mut removed_new_rows,
+                        row_end_sequences,
+                        row_text_bytes,
+                        text_bytes,
+                        limited,
+                        *limits,
+                    );
                 }
                 DisplayFormatterState::Terminal(_) => {
                     unreachable!("terminal deltas are handled before append-only formatting")
@@ -508,25 +549,90 @@ impl IncrementalTextFormatter {
     }
 }
 
-fn push_hex_chunk(
-    chunk: &RxChunk,
-    rows: &mut Vec<FormattedRow>,
-    row_end_sequences: &mut VecDeque<u64>,
-) {
-    for bytes in chunk.bytes.chunks(16) {
-        let mut text = String::with_capacity(bytes.len() * 3);
-        for (index, byte) in bytes.iter().enumerate() {
-            if index > 0 {
-                text.push(' ');
-            }
-            let _ = write!(text, "{byte:02X}");
+impl IncrementalHexFormatter {
+    fn new(skipped_bytes_modulo: usize) -> Self {
+        Self {
+            current: Vec::with_capacity(HEX_BYTES_PER_ROW),
+            current_capacity: hex_first_row_capacity(skipped_bytes_modulo),
+            line_started_at: None,
+            current_end_sequence: None,
+            partial_visible: false,
         }
-        rows.push(FormattedRow {
-            received_at: chunk.received_at,
-            text,
-        });
-        row_end_sequences.push_back(chunk.sequence);
     }
+
+    fn push_chunk(
+        &mut self,
+        chunk: &RxChunk,
+        rows: &mut Vec<FormattedRow>,
+        row_end_sequences: &mut VecDeque<u64>,
+    ) {
+        let mut bytes = &*chunk.bytes;
+        while !bytes.is_empty() {
+            if self.current.is_empty() {
+                self.line_started_at = Some(chunk.received_at);
+            }
+            let take = bytes
+                .len()
+                .min(self.current_capacity.saturating_sub(self.current.len()));
+            self.current.extend_from_slice(&bytes[..take]);
+            self.current_end_sequence = Some(chunk.sequence);
+            bytes = &bytes[take..];
+
+            if self.current.len() == self.current_capacity {
+                self.push_completed_row(chunk.received_at, chunk.sequence, rows, row_end_sequences);
+            }
+        }
+    }
+
+    fn push_completed_row(
+        &mut self,
+        fallback_time: DateTime<Local>,
+        sequence: u64,
+        rows: &mut Vec<FormattedRow>,
+        row_end_sequences: &mut VecDeque<u64>,
+    ) {
+        rows.push(FormattedRow {
+            received_at: self.line_started_at.unwrap_or(fallback_time),
+            text: format_hex_row(&self.current),
+        });
+        row_end_sequences.push_back(sequence);
+        self.current.clear();
+        self.current_capacity = HEX_BYTES_PER_ROW;
+        self.line_started_at = None;
+        self.current_end_sequence = None;
+    }
+
+    fn push_partial_row(
+        &mut self,
+        rows: &mut Vec<FormattedRow>,
+        row_end_sequences: &mut VecDeque<u64>,
+    ) {
+        if self.current.is_empty() {
+            self.partial_visible = false;
+            return;
+        }
+
+        rows.push(FormattedRow {
+            received_at: self.line_started_at.unwrap_or_else(Local::now),
+            text: format_hex_row(&self.current),
+        });
+        row_end_sequences.push_back(
+            self.current_end_sequence
+                .expect("visible HEX bytes must originate from a receive chunk"),
+        );
+        self.partial_visible = true;
+    }
+}
+
+fn format_hex_row(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len().saturating_mul(3).saturating_sub(1));
+    for (index, byte) in bytes.iter().enumerate() {
+        if index != 0 {
+            text.push(' ');
+        }
+        let _ = write!(text, "{byte:02X}");
+    }
+    text
 }
 
 pub fn parse_send_input(
@@ -679,22 +785,13 @@ pub fn display_text(row: &FormattedRow, timestamps: bool, timestamp_format: &str
 }
 
 fn format_hex(snapshot: &ReceiveSnapshot) -> Vec<FormattedRow> {
+    let mut state = IncrementalHexFormatter::new(hex_skipped_bytes_modulo(snapshot));
     let mut rows = Vec::new();
+    let mut row_end_sequences = VecDeque::new();
     for chunk in &snapshot.chunks {
-        for bytes in chunk.bytes.chunks(16) {
-            let mut text = String::with_capacity(bytes.len() * 3);
-            for (index, byte) in bytes.iter().enumerate() {
-                if index > 0 {
-                    text.push(' ');
-                }
-                let _ = write!(text, "{byte:02X}");
-            }
-            rows.push(FormattedRow {
-                received_at: chunk.received_at,
-                text,
-            });
-        }
+        state.push_chunk(chunk, &mut rows, &mut row_end_sequences);
     }
+    state.push_partial_row(&mut rows, &mut row_end_sequences);
     rows
 }
 
@@ -929,23 +1026,63 @@ fn write_hex_export<W: io::Write + ?Sized>(
     timestamps: bool,
     timestamp_format: &str,
 ) -> io::Result<()> {
+    let mut row_capacity = hex_first_row_capacity(hex_skipped_bytes_modulo(&snapshot));
+    let mut row = [0_u8; HEX_BYTES_PER_ROW];
+    let mut row_len = 0;
+    let mut row_started_at = None;
+
     for chunk in snapshot.chunks {
-        for bytes in chunk.bytes.chunks(HEX_BYTES_PER_ROW) {
-            write_export_timestamp(writer, chunk.received_at, timestamps, timestamp_format)?;
-            let mut encoded = [0_u8; HEX_BYTES_PER_ROW * 3 - 1];
-            for (index, byte) in bytes.iter().copied().enumerate() {
-                let offset = index * 3;
-                if index != 0 {
-                    encoded[offset - 1] = b' ';
-                }
-                encoded[offset] = HEX_DIGITS[usize::from(byte >> 4)];
-                encoded[offset + 1] = HEX_DIGITS[usize::from(byte & 0x0F)];
+        for byte in chunk.bytes.iter().copied() {
+            if row_len == 0 {
+                row_started_at = Some(chunk.received_at);
             }
-            writer.write_all(&encoded[..bytes.len() * 3 - 1])?;
-            writer.write_all(b"\r\n")?;
+            row[row_len] = byte;
+            row_len += 1;
+            if row_len == row_capacity {
+                write_hex_export_row(
+                    writer,
+                    &row[..row_len],
+                    row_started_at.unwrap_or(chunk.received_at),
+                    timestamps,
+                    timestamp_format,
+                )?;
+                row_len = 0;
+                row_capacity = HEX_BYTES_PER_ROW;
+                row_started_at = None;
+            }
         }
     }
+    if row_len != 0 {
+        write_hex_export_row(
+            writer,
+            &row[..row_len],
+            row_started_at.unwrap_or_else(Local::now),
+            timestamps,
+            timestamp_format,
+        )?;
+    }
     Ok(())
+}
+
+fn write_hex_export_row<W: io::Write + ?Sized>(
+    writer: &mut W,
+    bytes: &[u8],
+    received_at: DateTime<Local>,
+    timestamps: bool,
+    timestamp_format: &str,
+) -> io::Result<()> {
+    write_export_timestamp(writer, received_at, timestamps, timestamp_format)?;
+    let mut encoded = [0_u8; HEX_BYTES_PER_ROW * 3 - 1];
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        let offset = index * 3;
+        if index != 0 {
+            encoded[offset - 1] = b' ';
+        }
+        encoded[offset] = HEX_DIGITS[usize::from(byte >> 4)];
+        encoded[offset + 1] = HEX_DIGITS[usize::from(byte & 0x0F)];
+    }
+    writer.write_all(&encoded[..bytes.len() * 3 - 1])?;
+    writer.write_all(b"\r\n")
 }
 
 fn write_export_timestamp<W: io::Write + ?Sized>(
@@ -1175,6 +1312,102 @@ mod tests {
         assert_eq!(
             rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
             ["中文", "完成"]
+        );
+    }
+
+    #[test]
+    fn hex_rebuild_is_independent_of_receive_chunk_boundaries() {
+        let bytes: Vec<u8> = (0..=32).collect();
+        let mut single_chunk = ReceiveStore::new(1024);
+        single_chunk.append(timestamp(1), bytes.clone());
+        let mut fragmented = ReceiveStore::new(1024);
+        for part in [&bytes[..1], &bytes[1..8], &bytes[8..17], &bytes[17..]] {
+            fragmented.append(timestamp(1), part.to_vec());
+        }
+
+        let single_rows = format_snapshot(
+            &single_chunk.snapshot(),
+            ReceiveMode::Hex,
+            TextEncoding::Utf8,
+        );
+        let fragmented_rows =
+            format_snapshot(&fragmented.snapshot(), ReceiveMode::Hex, TextEncoding::Utf8);
+
+        assert_eq!(fragmented_rows, single_rows);
+        assert_eq!(
+            single_rows
+                .iter()
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F",
+                "10 11 12 13 14 15 16 17 18 19 1A 1B 1C 1D 1E 1F",
+                "20",
+            ]
+        );
+    }
+
+    #[test]
+    fn incremental_hex_formatter_replaces_and_completes_partial_rows() {
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), (0..5).collect());
+        let (mut formatter, mut rows) =
+            DisplayFormatter::rebuild(&store.snapshot(), ReceiveMode::Hex, TextEncoding::Utf8);
+        assert_eq!(rows[0].text, "00 01 02 03 04");
+
+        store.append(timestamp(2), (5..16).collect());
+        let update = formatter
+            .apply_delta(&store.delta_since(formatter.cursor()))
+            .unwrap();
+        assert_eq!(update.replace_tail, 1);
+        assert_eq!(update.rows[0].received_at, timestamp(1));
+        apply_display_update(&mut rows, update);
+        assert_eq!(
+            rows[0].text,
+            "00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F"
+        );
+
+        store.append(timestamp(3), vec![0x10, 0x11]);
+        let update = formatter
+            .apply_delta(&store.delta_since(formatter.cursor()))
+            .unwrap();
+        assert_eq!(update.replace_tail, 0);
+        apply_display_update(&mut rows, update);
+        assert_eq!(rows[1].text, "10 11");
+
+        store.append(timestamp(4), (0x12..0x20).collect());
+        let update = formatter
+            .apply_delta(&store.delta_since(formatter.cursor()))
+            .unwrap();
+        assert_eq!(update.replace_tail, 1);
+        assert_eq!(update.rows[0].received_at, timestamp(3));
+        apply_display_update(&mut rows, update);
+
+        assert_eq!(
+            rows,
+            format_snapshot(&store.snapshot(), ReceiveMode::Hex, TextEncoding::Utf8)
+        );
+    }
+
+    #[test]
+    fn hex_tail_snapshot_preserves_the_original_sixteen_byte_alignment() {
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), (0..20).collect());
+        let snapshot = store.tail_snapshot(18);
+        let rows = format_snapshot(&snapshot, ReceiveMode::Hex, TextEncoding::Utf8);
+
+        let mut evicted_store = ReceiveStore::new(18);
+        evicted_store.append(timestamp(1), vec![0, 1]);
+        evicted_store.append(timestamp(1), (2..20).collect());
+        let evicted_snapshot = evicted_store.snapshot();
+        let evicted_rows = format_snapshot(&evicted_snapshot, ReceiveMode::Hex, TextEncoding::Utf8);
+
+        assert_eq!(snapshot.omitted_bytes, 2);
+        assert_eq!(evicted_snapshot.dropped_bytes, 2);
+        assert_eq!(evicted_rows, rows);
+        assert_eq!(
+            rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+            ["02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F", "10 11 12 13",]
         );
     }
 
@@ -1577,7 +1810,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_hex_export_uses_custom_timestamp_format() {
+    fn streaming_hex_export_joins_chunks_and_uses_the_first_byte_timestamp() {
         let mut store = ReceiveStore::new(1024);
         store.append(timestamp(1), vec![0x00, 0x01, 0xAB]);
         store.append(timestamp(2), vec![0xFF]);
@@ -1595,7 +1828,32 @@ mod tests {
 
         assert_eq!(
             std::str::from_utf8(&output[UTF8_BOM.len()..]).unwrap(),
-            "[12:00:01] 00 01 AB\r\n[12:00:02] FF\r\n"
+            "[12:00:01] 00 01 AB FF\r\n"
+        );
+    }
+
+    #[test]
+    fn streaming_hex_export_preserves_alignment_after_an_omitted_prefix() {
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), (0..20).collect());
+        let mut output = Vec::new();
+
+        write_export(
+            &mut output,
+            store.tail_snapshot(18),
+            ReceiveMode::Hex,
+            TextEncoding::Utf8,
+            false,
+            DEFAULT_TIMESTAMP_FORMAT,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::str::from_utf8(&output[UTF8_BOM.len()..]).unwrap(),
+            concat!(
+                "02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F\r\n",
+                "10 11 12 13\r\n"
+            )
         );
     }
 
