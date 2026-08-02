@@ -59,6 +59,7 @@ pub struct UiPreferences {
     pub timestamp_format: String,
     pub auto_scroll: bool,
     pub line_ending: LineEnding,
+    pub clear_after_send: bool,
     pub repeat_interval_ms: u64,
     pub buffer_limit_mib: usize,
     pub theme_preference: ThemePreference,
@@ -88,6 +89,7 @@ impl Default for UiPreferences {
             timestamp_format: DEFAULT_TIMESTAMP_FORMAT.to_owned(),
             auto_scroll: true,
             line_ending: LineEnding::CrLf,
+            clear_after_send: false,
             repeat_interval_ms: 1_000,
             buffer_limit_mib: 20,
             theme_preference: ThemePreference::System,
@@ -192,6 +194,7 @@ impl From<&UiPreferences> for SettingsDocument {
             send: SendSettings {
                 mode: preferences.send_mode.into(),
                 line_ending: preferences.line_ending.into(),
+                clear_after_send: preferences.clear_after_send,
                 repeat_interval_ms: preferences.repeat_interval_ms,
             },
             background: BackgroundSettings {
@@ -224,6 +227,7 @@ impl From<SettingsDocument> for UiPreferences {
             timestamp_format: settings.receive.timestamp_format,
             auto_scroll: settings.receive.auto_scroll,
             line_ending: settings.send.line_ending.into(),
+            clear_after_send: settings.send.clear_after_send,
             repeat_interval_ms: settings.send.repeat_interval_ms,
             buffer_limit_mib: settings.receive.buffer_limit_mib,
             theme_preference: settings.interface.theme.into(),
@@ -308,6 +312,7 @@ impl Default for ReceiveSettings {
 struct SendSettings {
     mode: SendModeValue,
     line_ending: LineEndingValue,
+    clear_after_send: bool,
     repeat_interval_ms: u64,
 }
 
@@ -317,6 +322,7 @@ impl Default for SendSettings {
         Self {
             mode: preferences.send_mode.into(),
             line_ending: preferences.line_ending.into(),
+            clear_after_send: preferences.clear_after_send,
             repeat_interval_ms: preferences.repeat_interval_ms,
         }
     }
@@ -629,7 +635,9 @@ fn render_toml(preferences: &UiPreferences) -> Result<String, toml::ser::Error> 
             "[receive]" => Some(
                 "# mode: text、hex 或 terminal；encoding: utf8 或 gbk\n# timestamp_format: chrono/strftime 格式\n# buffer_limit_mib: 5、20、100 或 500",
             ),
-            "[send]" => Some("# mode: text 或 hex；line_ending: none、cr、lf 或 crlf"),
+            "[send]" => Some(
+                "# mode: text 或 hex；line_ending: none、cr、lf 或 crlf\n# clear_after_send: 成功加入发送队列后是否清空输入框",
+            ),
             "[background]" => Some(
                 "# source: none、local 或 online；opacity 范围 0.0-1.0\n# dynamic_accent: 是否根据背景图片自动生成强调色",
             ),
@@ -661,6 +669,7 @@ mod tests {
             data_line_spacing: 8.0,
             receive_mode: ReceiveMode::Terminal,
             send_mode: SendMode::Hex,
+            clear_after_send: true,
             timestamps: true,
             timestamp_format: "%H:%M:%S%.6f".into(),
             background_local_path: r"C:\images\[send]\background.png".into(),
@@ -675,6 +684,7 @@ mod tests {
         assert_eq!(loaded.data_line_spacing, 8.0);
         assert_eq!(loaded.receive_mode, ReceiveMode::Terminal);
         assert_eq!(loaded.send_mode, SendMode::Hex);
+        assert!(loaded.clear_after_send);
         assert_eq!(
             loaded.background_local_path,
             r"C:\images\[send]\background.png"
@@ -739,6 +749,7 @@ mode = "hex"
         let preferences = UiPreferences::from(document);
         assert_eq!(preferences.receive_mode, ReceiveMode::Hex);
         assert_eq!(preferences.send_mode, SendMode::Text);
+        assert!(!preferences.clear_after_send);
         assert_eq!(preferences.text_encoding, TextEncoding::Utf8);
         assert_eq!(preferences.timestamp_format, DEFAULT_TIMESTAMP_FORMAT);
         assert_eq!(preferences.theme_preference, ThemePreference::System);

@@ -268,6 +268,15 @@ impl EscomApp {
                         self.send_input.clear();
                         self.send_error = None;
                     }
+                    if ui
+                        .add_enabled_ui(!repeat_running, |ui| {
+                            ui.checkbox(&mut self.preferences.clear_after_send, "发送成功后清空")
+                        })
+                        .inner
+                        .changed()
+                    {
+                        self.mark_preferences_dirty();
+                    }
 
                     toolbar_separator(ui);
                     toolbar_label(ui, "循环间隔", 64.0);
@@ -317,10 +326,12 @@ impl EscomApp {
                     && ui.input_mut(|input| {
                         input.consume_key(egui::Modifiers::CTRL, egui::Key::Enter)
                     });
-                if (send_requested || shortcut_requested)
-                    && let Err(message) = self.queue_current_input()
-                {
-                    self.send_error = Some(message);
+                if send_requested || shortcut_requested {
+                    match self.queue_current_input() {
+                        Ok(()) if self.preferences.clear_after_send => self.send_input.clear(),
+                        Ok(()) => {}
+                        Err(message) => self.send_error = Some(message),
+                    }
                 }
 
                 let hint = match self.preferences.send_mode {

@@ -160,6 +160,7 @@ buffer_limit_mib = 20 # 5、20、100 或 500
 [send]
 mode = "text" # text 或 hex
 line_ending = "crlf" # none、cr、lf 或 crlf
+clear_after_send = false # 成功加入发送队列后清空输入框
 repeat_interval_ms = 1000 # 20-3600000
 
 [background]
