@@ -38,5 +38,5 @@ OriginalFilename = "escom.exe"
 LegalCopyright = "Copyright (c) 2026 ESCOM contributors"
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 strip = "symbols"

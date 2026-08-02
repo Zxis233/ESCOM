@@ -386,6 +386,12 @@ impl EscomApp {
                         self.set_notice("没有数据被发送", true);
                     }
                 }
+                WorkerEvent::TxFailed { id, message } => {
+                    self.pending_history.remove(&id);
+                    self.repeat = None;
+                    self.send_error = Some(message.clone());
+                    self.set_notice(message, true);
+                }
                 WorkerEvent::PortError(message) => {
                     self.repeat = None;
                     self.send_error = Some(message.clone());

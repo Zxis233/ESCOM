@@ -10,6 +10,11 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use crate::model::SerialConfig;
 use crate::store::ReceiveStore;
 
+const WRITE_QUEUE_CAPACITY: usize = 128;
+const WRITE_SLICE_BYTES: usize = 16 * 1024;
+const DISCONNECTED_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const EMPTY_READ_BACKOFF: Duration = Duration::from_millis(1);
+
 pub trait PortIo: Read + Write + Send {
     fn set_dtr(&mut self, level: bool) -> Result<(), String>;
     fn set_rts(&mut self, level: bool) -> Result<(), String>;
@@ -91,10 +96,21 @@ enum WorkerCommand {
     RefreshPorts,
     Open(SerialConfig),
     Close,
-    Send { id: u64, bytes: Vec<u8> },
     SetDtr(bool),
     SetRts(bool),
     Shutdown,
+}
+
+#[derive(Debug)]
+struct WriteRequest {
+    id: u64,
+    bytes: Vec<u8>,
+}
+
+struct PendingWrite {
+    id: u64,
+    bytes: Vec<u8>,
+    offset: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +119,7 @@ pub enum WorkerEvent {
     Opened(String),
     Closed,
     TxCompleted { id: u64, count: usize },
+    TxFailed { id: u64, message: String },
     PortError(String),
     ControlError(String),
 }
@@ -130,6 +147,7 @@ impl SerialStats {
 
 pub struct WorkerHandle {
     commands: Sender<WorkerCommand>,
+    write_requests: Sender<WriteRequest>,
     pub events: Receiver<WorkerEvent>,
     pub stats: Arc<SerialStats>,
     thread: Option<JoinHandle<()>>,
@@ -144,17 +162,21 @@ impl WorkerHandle {
         store: Arc<Mutex<ReceiveStore>>,
         backend: Arc<dyn SerialBackend>,
     ) -> Self {
-        let (command_tx, command_rx) = bounded(128);
+        let (command_tx, command_rx) = unbounded();
+        let (write_tx, write_rx) = bounded(WRITE_QUEUE_CAPACITY);
         let (event_tx, event_rx) = unbounded();
         let stats = Arc::new(SerialStats::default());
         let worker_stats = Arc::clone(&stats);
         let thread = thread::Builder::new()
             .name("escom-serial".into())
-            .spawn(move || worker_loop(backend, store, command_rx, event_tx, worker_stats))
+            .spawn(move || {
+                worker_loop(backend, store, command_rx, write_rx, event_tx, worker_stats)
+            })
             .expect("failed to start serial worker");
 
         Self {
             commands: command_tx,
+            write_requests: write_tx,
             events: event_rx,
             stats,
             thread: Some(thread),
@@ -174,7 +196,12 @@ impl WorkerHandle {
     }
 
     pub fn send(&self, id: u64, bytes: Vec<u8>) -> Result<(), String> {
-        self.send_command(WorkerCommand::Send { id, bytes })
+        self.write_requests
+            .try_send(WriteRequest { id, bytes })
+            .map_err(|error| match error {
+                crossbeam_channel::TrySendError::Full(_) => "串口发送队列已满，请稍后重试".into(),
+                crossbeam_channel::TrySendError::Disconnected(_) => "串口任务已停止".into(),
+            })
     }
 
     pub fn set_dtr(&self, level: bool) -> Result<(), String> {
@@ -187,11 +214,8 @@ impl WorkerHandle {
 
     fn send_command(&self, command: WorkerCommand) -> Result<(), String> {
         self.commands
-            .try_send(command)
-            .map_err(|error| match error {
-                crossbeam_channel::TrySendError::Full(_) => "串口任务繁忙，请稍后重试".into(),
-                crossbeam_channel::TrySendError::Disconnected(_) => "串口任务已停止".into(),
-            })
+            .send(command)
+            .map_err(|_| "串口任务已停止".into())
     }
 
     pub fn shutdown(&mut self) {
@@ -212,17 +236,28 @@ fn worker_loop(
     backend: Arc<dyn SerialBackend>,
     store: Arc<Mutex<ReceiveStore>>,
     commands: Receiver<WorkerCommand>,
+    write_requests: Receiver<WriteRequest>,
     events: Sender<WorkerEvent>,
     stats: Arc<SerialStats>,
 ) {
     let mut port: Option<Box<dyn PortIo>> = None;
+    let mut pending_write: Option<PendingWrite> = None;
     let mut read_buffer = vec![0_u8; 8192];
 
     loop {
         if port.is_none() {
-            match commands.recv_timeout(Duration::from_millis(250)) {
+            reject_queued_writes(&write_requests, &events, "串口尚未连接");
+            match commands.recv_timeout(DISCONNECTED_POLL_INTERVAL) {
                 Ok(command) => {
-                    if handle_command(command, &backend, &events, &stats, &mut port) {
+                    if handle_command(
+                        command,
+                        &backend,
+                        &events,
+                        &stats,
+                        &mut port,
+                        &mut pending_write,
+                        &write_requests,
+                    ) {
                         break;
                     }
                 }
@@ -232,17 +267,57 @@ fn worker_loop(
             continue;
         }
 
-        while let Ok(command) = commands.try_recv() {
-            if handle_command(command, &backend, &events, &stats, &mut port) {
-                return;
+        loop {
+            match commands.try_recv() {
+                Ok(command) => {
+                    if handle_command(
+                        command,
+                        &backend,
+                        &events,
+                        &stats,
+                        &mut port,
+                        &mut pending_write,
+                        &write_requests,
+                    ) {
+                        return;
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => return,
             }
         }
+
+        if port.is_none() {
+            continue;
+        }
+
+        if pending_write.is_none()
+            && let Ok(request) = write_requests.try_recv()
+        {
+            pending_write = Some(PendingWrite {
+                id: request.id,
+                bytes: request.bytes,
+                offset: 0,
+            });
+        }
+
+        if let Some(active_port) = port.as_mut()
+            && let Err(error) =
+                write_next_slice(active_port.as_mut(), &mut pending_write, &events, &stats)
+        {
+            let _ = events.send(WorkerEvent::PortError(format!("串口写入失败：{error}")));
+            port = None;
+            discard_writes(&mut pending_write, &write_requests);
+            let _ = events.send(WorkerEvent::Closed);
+            continue;
+        }
+
         let Some(active_port) = port.as_mut() else {
             continue;
         };
 
         match active_port.read(&mut read_buffer) {
-            Ok(0) => {}
+            Ok(0) => thread::sleep(EMPTY_READ_BACKOFF),
             Ok(count) => {
                 stats.rx_bytes.fetch_add(count as u64, Ordering::Relaxed);
                 if let Ok(mut receive_store) = store.lock() {
@@ -257,6 +332,7 @@ fn worker_loop(
             Err(error) => {
                 let _ = events.send(WorkerEvent::PortError(format!("串口读取失败：{error}")));
                 port = None;
+                discard_writes(&mut pending_write, &write_requests);
                 let _ = events.send(WorkerEvent::Closed);
             }
         }
@@ -269,6 +345,8 @@ fn handle_command(
     events: &Sender<WorkerEvent>,
     stats: &Arc<SerialStats>,
     port: &mut Option<Box<dyn PortIo>>,
+    pending_write: &mut Option<PendingWrite>,
+    write_requests: &Receiver<WriteRequest>,
 ) -> bool {
     match command {
         WorkerCommand::RefreshPorts => match backend.list_ports() {
@@ -280,6 +358,7 @@ fn handle_command(
             }
         },
         WorkerCommand::Open(config) => {
+            discard_writes(pending_write, write_requests);
             *port = None;
             match backend.open(&config) {
                 Ok(opened_port) => {
@@ -294,31 +373,10 @@ fn handle_command(
             }
         }
         WorkerCommand::Close => {
+            discard_writes(pending_write, write_requests);
             let was_open = port.take().is_some();
             if was_open {
                 let _ = events.send(WorkerEvent::Closed);
-            }
-        }
-        WorkerCommand::Send { id, bytes } => {
-            let Some(active_port) = port.as_mut() else {
-                let _ = events.send(WorkerEvent::ControlError("串口尚未连接".into()));
-                return false;
-            };
-            match active_port.write_all(&bytes) {
-                Ok(()) => {
-                    stats
-                        .tx_bytes
-                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    let _ = events.send(WorkerEvent::TxCompleted {
-                        id,
-                        count: bytes.len(),
-                    });
-                }
-                Err(error) => {
-                    let _ = events.send(WorkerEvent::PortError(format!("串口写入失败：{error}")));
-                    *port = None;
-                    let _ = events.send(WorkerEvent::Closed);
-                }
             }
         }
         WorkerCommand::SetDtr(level) => {
@@ -340,6 +398,81 @@ fn handle_command(
     false
 }
 
+fn write_next_slice(
+    port: &mut dyn PortIo,
+    pending_write: &mut Option<PendingWrite>,
+    events: &Sender<WorkerEvent>,
+    stats: &Arc<SerialStats>,
+) -> io::Result<()> {
+    let Some(pending) = pending_write.as_mut() else {
+        return Ok(());
+    };
+
+    if pending.offset == pending.bytes.len() {
+        let id = pending.id;
+        let count = pending.bytes.len();
+        *pending_write = None;
+        let _ = events.send(WorkerEvent::TxCompleted { id, count });
+        return Ok(());
+    }
+
+    let slice_end = pending
+        .offset
+        .saturating_add(WRITE_SLICE_BYTES)
+        .min(pending.bytes.len());
+    let slice = &pending.bytes[pending.offset..slice_end];
+    let written = match port.write(slice) {
+        Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+        Ok(count) if count <= slice.len() => count,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "串口驱动返回了无效的写入字节数",
+            ));
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+
+    pending.offset += written;
+    stats.tx_bytes.fetch_add(written as u64, Ordering::Relaxed);
+    if pending.offset == pending.bytes.len() {
+        let id = pending.id;
+        let count = pending.bytes.len();
+        *pending_write = None;
+        let _ = events.send(WorkerEvent::TxCompleted { id, count });
+    }
+    Ok(())
+}
+
+fn discard_writes(
+    pending_write: &mut Option<PendingWrite>,
+    write_requests: &Receiver<WriteRequest>,
+) {
+    *pending_write = None;
+    while write_requests.try_recv().is_ok() {}
+}
+
+fn reject_queued_writes(
+    write_requests: &Receiver<WriteRequest>,
+    events: &Sender<WorkerEvent>,
+    message: &str,
+) {
+    while let Ok(request) = write_requests.try_recv() {
+        let _ = events.send(WorkerEvent::TxFailed {
+            id: request.id,
+            message: message.into(),
+        });
+    }
+}
+
 fn port_sort_key(name: &str) -> (u32, String) {
     let uppercase = name.to_ascii_uppercase();
     let number = uppercase
@@ -352,7 +485,7 @@ fn port_sort_key(name: &str) -> (u32, String) {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -423,6 +556,87 @@ mod tests {
         }
     }
 
+    struct SchedulingBackend {
+        total_bytes: usize,
+        max_write_bytes: usize,
+        read_delay: Duration,
+        inject_read_between_writes: bool,
+        written_bytes: Arc<AtomicUsize>,
+        write_calls: Arc<Mutex<Vec<usize>>>,
+        read_observed_at: Arc<AtomicUsize>,
+    }
+
+    impl SerialBackend for SchedulingBackend {
+        fn list_ports(&self) -> Result<Vec<String>, String> {
+            Ok(vec!["COM3".into()])
+        }
+
+        fn open(&self, _config: &SerialConfig) -> Result<Box<dyn PortIo>, String> {
+            Ok(Box::new(SchedulingPort {
+                total_bytes: self.total_bytes,
+                max_write_bytes: self.max_write_bytes,
+                read_delay: self.read_delay,
+                inject_read_between_writes: self.inject_read_between_writes,
+                written_bytes: Arc::clone(&self.written_bytes),
+                write_calls: Arc::clone(&self.write_calls),
+                read_observed_at: Arc::clone(&self.read_observed_at),
+            }))
+        }
+    }
+
+    struct SchedulingPort {
+        total_bytes: usize,
+        max_write_bytes: usize,
+        read_delay: Duration,
+        inject_read_between_writes: bool,
+        written_bytes: Arc<AtomicUsize>,
+        write_calls: Arc<Mutex<Vec<usize>>>,
+        read_observed_at: Arc<AtomicUsize>,
+    }
+
+    impl Read for SchedulingPort {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let written = self.written_bytes.load(Ordering::SeqCst);
+            if self.inject_read_between_writes
+                && written > 0
+                && written < self.total_bytes
+                && self
+                    .read_observed_at
+                    .compare_exchange(usize::MAX, written, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                buffer[..2].copy_from_slice(b"rx");
+                return Ok(2);
+            }
+
+            thread::sleep(self.read_delay);
+            Err(io::Error::new(io::ErrorKind::TimedOut, "idle"))
+        }
+    }
+
+    impl Write for SchedulingPort {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            let count = buffer.len().min(self.max_write_bytes);
+            self.write_calls.lock().unwrap().push(count);
+            self.written_bytes.fetch_add(count, Ordering::SeqCst);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl PortIo for SchedulingPort {
+        fn set_dtr(&mut self, _level: bool) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn set_rts(&mut self, _level: bool) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn worker_moves_data_both_directions() {
         let (read_tx, read_rx) = unbounded();
@@ -457,6 +671,94 @@ mod tests {
         assert_eq!(worker.stats.tx_bytes(), 8);
         assert_eq!(&*writes.lock().unwrap(), b"outgoing");
         assert_eq!(store.lock().unwrap().bytes_len(), 8);
+        worker.shutdown();
+    }
+
+    #[test]
+    fn worker_fragments_writes_and_reads_between_slices() {
+        let total_bytes = WRITE_SLICE_BYTES * 2 + 23;
+        let written_bytes = Arc::new(AtomicUsize::new(0));
+        let write_calls = Arc::new(Mutex::new(Vec::new()));
+        let read_observed_at = Arc::new(AtomicUsize::new(usize::MAX));
+        let backend = Arc::new(SchedulingBackend {
+            total_bytes,
+            max_write_bytes: usize::MAX,
+            read_delay: Duration::from_millis(1),
+            inject_read_between_writes: true,
+            written_bytes: Arc::clone(&written_bytes),
+            write_calls: Arc::clone(&write_calls),
+            read_observed_at: Arc::clone(&read_observed_at),
+        });
+        let store = Arc::new(Mutex::new(ReceiveStore::new(1024)));
+        let mut worker = WorkerHandle::spawn_with_backend(Arc::clone(&store), backend);
+        let config = SerialConfig {
+            port_name: "COM3".into(),
+            ..Default::default()
+        };
+
+        worker.open(config).unwrap();
+        wait_for_event(&worker.events, |event| {
+            matches!(event, WorkerEvent::Opened(_))
+        });
+        worker.send(9, vec![0xA5; total_bytes]).unwrap();
+        wait_for_event(&worker.events, |event| {
+            matches!(
+                event,
+                WorkerEvent::TxCompleted {
+                    id: 9,
+                    count
+                } if *count == total_bytes
+            )
+        });
+
+        assert_eq!(written_bytes.load(Ordering::SeqCst), total_bytes);
+        assert_eq!(
+            &*write_calls.lock().unwrap(),
+            &[WRITE_SLICE_BYTES, WRITE_SLICE_BYTES, 23]
+        );
+        assert_eq!(read_observed_at.load(Ordering::SeqCst), WRITE_SLICE_BYTES);
+        assert_eq!(worker.stats.tx_bytes(), total_bytes as u64);
+        assert_eq!(worker.stats.rx_bytes(), 2);
+        assert_eq!(store.lock().unwrap().bytes_len(), 2);
+        worker.shutdown();
+    }
+
+    #[test]
+    fn close_interrupts_an_in_progress_write() {
+        let total_bytes = 4096;
+        let written_bytes = Arc::new(AtomicUsize::new(0));
+        let write_calls = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(SchedulingBackend {
+            total_bytes,
+            max_write_bytes: 1,
+            read_delay: Duration::from_millis(2),
+            inject_read_between_writes: false,
+            written_bytes: Arc::clone(&written_bytes),
+            write_calls,
+            read_observed_at: Arc::new(AtomicUsize::new(usize::MAX)),
+        });
+        let store = Arc::new(Mutex::new(ReceiveStore::new(1024)));
+        let mut worker = WorkerHandle::spawn_with_backend(store, backend);
+        let config = SerialConfig {
+            port_name: "COM3".into(),
+            ..Default::default()
+        };
+
+        worker.open(config).unwrap();
+        wait_for_event(&worker.events, |event| {
+            matches!(event, WorkerEvent::Opened(_))
+        });
+        worker.send(10, vec![0x5A; total_bytes]).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while written_bytes.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(written_bytes.load(Ordering::SeqCst) > 0);
+
+        worker.close().unwrap();
+        wait_for_event(&worker.events, |event| matches!(event, WorkerEvent::Closed));
+        assert!(written_bytes.load(Ordering::SeqCst) < total_bytes);
         worker.shutdown();
     }
 
