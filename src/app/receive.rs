@@ -134,10 +134,11 @@ impl EscomApp {
 
     pub(super) fn show_output_panel(&mut self, root_ui: &mut egui::Ui) {
         let context = root_ui.ctx().clone();
-        let panel_frame = egui::Frame::central_panel(root_ui.style())
-            .fill(self.surface_fill(root_ui.visuals().panel_fill, 82));
-        egui::CentralPanel::default()
-            .frame(panel_frame)
+        let toolbar_frame = egui::Frame::central_panel(root_ui.style())
+            .fill(self.surface_fill(root_ui.visuals().panel_fill, RECEIVE_SEND_PANEL_ALPHA));
+        egui::Panel::top("receive_toolbar_panel")
+            .resizable(false)
+            .frame(toolbar_frame)
             .show(root_ui, |ui| {
                 let mut preferences_changed = false;
                 let mut display_changed = false;
@@ -266,8 +267,13 @@ impl EscomApp {
                 if preferences_changed {
                     self.mark_preferences_dirty();
                 }
+            });
 
-                ui.separator();
+        let content_frame = egui::Frame::central_panel(root_ui.style())
+            .fill(self.surface_fill(root_ui.visuals().panel_fill, RECEIVE_CONTENT_ALPHA));
+        egui::CentralPanel::default()
+            .frame(content_frame)
+            .show(root_ui, |ui| {
                 if self.preferences.receive_mode == ReceiveMode::Terminal {
                     self.show_terminal_surface(ui);
                 } else {

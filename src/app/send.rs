@@ -180,7 +180,7 @@ impl EscomApp {
                 top: toolbar_gap,
                 bottom: 2,
             })
-            .fill(self.surface_fill(root_ui.visuals().panel_fill, 112));
+            .fill(self.surface_fill(root_ui.visuals().panel_fill, RECEIVE_SEND_PANEL_ALPHA));
         egui::Panel::bottom("send_panel")
             .resizable(true)
             .size_range(min_panel_height..=280.0_f32.max(min_panel_height + 48.0))
