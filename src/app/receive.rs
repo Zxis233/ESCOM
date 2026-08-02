@@ -298,6 +298,7 @@ impl EscomApp {
                             |ui| {
                                 ui.add(
                                     egui::Button::new("导出 TXT")
+                                        .wrap_mode(egui::TextWrapMode::Extend)
                                         .min_size(egui::vec2(80.0, control_height)),
                                 )
                             },
