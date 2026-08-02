@@ -361,6 +361,7 @@ impl EscomApp {
     pub(super) fn show_misc_settings_tab(&mut self, ui: &mut egui::Ui) {
         let mut timestamp_format_changed = false;
         let mut buffer_changed = false;
+        let input_fill = self.standard_text_input_fill(ui.visuals());
 
         settings_card(
             ui,
@@ -391,6 +392,7 @@ impl EscomApp {
                         egui::TextEdit::singleline(&mut self.timestamp_format_draft)
                             .char_limit(128)
                             .vertical_align(Align::Center)
+                            .background_color(input_fill)
                             .text_color(text_color),
                     );
                     if response.changed()
@@ -516,6 +518,7 @@ impl EscomApp {
         let mut preferences_changed = false;
         let mut reload_requested = false;
         let mut dynamic_accent_changed = false;
+        let input_fill = self.standard_text_input_fill(ui.visuals());
 
         settings_card(
             ui,
@@ -569,7 +572,9 @@ impl EscomApp {
                             let field_width = (ui.available_width() - 184.0).max(220.0);
                             ui.add_sized(
                                 [field_width, control_height],
-                                egui::TextEdit::singleline(&mut path_display).interactive(false),
+                                egui::TextEdit::singleline(&mut path_display)
+                                    .interactive(false)
+                                    .background_color(input_fill),
                             )
                             .on_hover_text(&path_display);
                             if ui
@@ -615,7 +620,8 @@ impl EscomApp {
                             let response = ui.add_sized(
                                 [field_width, control_height],
                                 egui::TextEdit::singleline(&mut self.background_url_draft)
-                                    .hint_text("https://example.com/background.jpg"),
+                                    .hint_text("https://example.com/background.jpg")
+                                    .background_color(input_fill),
                             );
                             let enter_pressed = response.lost_focus()
                                 && ui.input(|input| input.key_pressed(egui::Key::Enter));
@@ -709,6 +715,7 @@ impl EscomApp {
                                 ui,
                                 &mut self.background_light_opacity_draft,
                                 &mut self.preferences.background_light_opacity,
+                                input_fill,
                             );
                         });
                         ui.end_row();
@@ -719,6 +726,7 @@ impl EscomApp {
                                 ui,
                                 &mut self.background_dark_opacity_draft,
                                 &mut self.preferences.background_dark_opacity,
+                                input_fill,
                             );
                         });
                         ui.end_row();
@@ -924,6 +932,7 @@ pub(super) fn background_opacity_control(
     ui: &mut egui::Ui,
     draft: &mut String,
     opacity: &mut f32,
+    input_fill: Color32,
 ) -> bool {
     let control_height = toolbar_control_height(ui);
     let input_is_valid = parse_background_opacity(draft).is_ok();
@@ -938,7 +947,7 @@ pub(super) fn background_opacity_control(
         egui::Stroke::new(1.0, ui.visuals().error_fg_color)
     };
     let input_frame = egui::Frame::new()
-        .fill(ui.visuals().text_edit_bg_color())
+        .fill(input_fill)
         .stroke(input_stroke)
         .corner_radius(4)
         .inner_margin(egui::Margin::symmetric(8, 4));

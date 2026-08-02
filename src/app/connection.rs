@@ -24,11 +24,13 @@ impl EscomApp {
             } else {
                 ui.visuals().text_color()
             };
+            let input_fill = self.standard_text_input_fill(ui.visuals());
             let response = ui.add_sized(
                 [input_width, control_height],
                 egui::TextEdit::singleline(&mut self.baud_rate_input)
                     .char_limit(10)
                     .text_color(input_color)
+                    .background_color(input_fill)
                     .horizontal_align(Align::Center)
                     .vertical_align(Align::Center),
             );
@@ -91,82 +93,92 @@ impl EscomApp {
                 ui.add_space(4.0);
                 let control_height = toolbar_control_height(ui);
                 ui.spacing_mut().interact_size.y = control_height;
-                ui.horizontal_wrapped(|ui| {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(76.0, control_height),
-                        Layout::left_to_right(Align::Center),
+                let (_, settings_clicked) = egui::containers::Sides::new()
+                    .height(control_height)
+                    .shrink_left()
+                    .show(
+                        ui,
                         |ui| {
-                            ui.label(RichText::new("ESCOM").size(20.0).strong());
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(76.0, control_height),
+                                Layout::left_to_right(Align::Center),
+                                |ui| {
+                                    ui.label(RichText::new("ESCOM").size(20.0).strong());
+                                },
+                            );
+                            ui.separator();
+
+                            let editable = self.connection.is_disconnected();
+                            ui.add_enabled_ui(editable, |ui| {
+                                egui::ComboBox::from_id_salt("serial_port")
+                                    .selected_text(self.port_display_name())
+                                    .width(combo_width(ui, &self.port_display_name(), 112.0))
+                                    .show_ui(ui, |ui| {
+                                        for port in &self.ports {
+                                            ui.selectable_value(
+                                                &mut self.serial_config.port_name,
+                                                port.clone(),
+                                                port,
+                                            );
+                                        }
+                                    });
+                                if ui
+                                    .add(
+                                        egui::Button::new("刷新")
+                                            .min_size(egui::vec2(56.0, control_height)),
+                                    )
+                                    .on_hover_text("重新扫描可用串口")
+                                    .clicked()
+                                {
+                                    if let Err(message) = self.worker.refresh_ports() {
+                                        self.set_notice(message, true);
+                                    }
+                                    self.last_port_refresh = Instant::now();
+                                }
+
+                                toolbar_label(ui, "波特率", 52.0);
+                                self.show_baud_rate_control(ui);
+                            });
+
+                            let button_text = match self.connection {
+                                ConnectionState::Disconnected => "打开串口",
+                                ConnectionState::Connecting => "正在连接...",
+                                ConnectionState::Connected(_) => "关闭串口",
+                            };
+                            let enabled = !matches!(self.connection, ConnectionState::Connecting);
+                            if ui
+                                .add_enabled(
+                                    enabled,
+                                    egui::Button::new(button_text)
+                                        .min_size(egui::vec2(88.0, control_height)),
+                                )
+                                .clicked()
+                            {
+                                if self.connection.is_connected() {
+                                    self.repeat = None;
+                                    if let Err(message) = self.worker.close() {
+                                        self.set_notice(message, true);
+                                    }
+                                } else {
+                                    self.open_selected_port();
+                                }
+                            }
+                        },
+                        |ui| {
+                            ui.add(
+                                egui::Button::new("设置")
+                                    .min_size(egui::vec2(60.0, control_height)),
+                            )
+                            .clicked()
                         },
                     );
-                    ui.separator();
-
-                    let editable = self.connection.is_disconnected();
-                    ui.add_enabled_ui(editable, |ui| {
-                        egui::ComboBox::from_id_salt("serial_port")
-                            .selected_text(self.port_display_name())
-                            .width(combo_width(ui, &self.port_display_name(), 112.0))
-                            .show_ui(ui, |ui| {
-                                for port in &self.ports {
-                                    ui.selectable_value(
-                                        &mut self.serial_config.port_name,
-                                        port.clone(),
-                                        port,
-                                    );
-                                }
-                            });
-                        if ui
-                            .add(
-                                egui::Button::new("刷新")
-                                    .min_size(egui::vec2(56.0, control_height)),
-                            )
-                            .on_hover_text("重新扫描可用串口")
-                            .clicked()
-                        {
-                            if let Err(message) = self.worker.refresh_ports() {
-                                self.set_notice(message, true);
-                            }
-                            self.last_port_refresh = Instant::now();
-                        }
-
-                        toolbar_label(ui, "波特率", 52.0);
-                        self.show_baud_rate_control(ui);
-                    });
-
-                    let button_text = match self.connection {
-                        ConnectionState::Disconnected => "打开串口",
-                        ConnectionState::Connecting => "正在连接...",
-                        ConnectionState::Connected(_) => "关闭串口",
-                    };
-                    let enabled = !matches!(self.connection, ConnectionState::Connecting);
-                    if ui
-                        .add_enabled(
-                            enabled,
-                            egui::Button::new(button_text)
-                                .min_size(egui::vec2(88.0, control_height)),
-                        )
-                        .clicked()
-                    {
-                        if self.connection.is_connected() {
-                            self.repeat = None;
-                            if let Err(message) = self.worker.close() {
-                                self.set_notice(message, true);
-                            }
-                        } else {
-                            self.open_selected_port();
-                        }
-                    }
-                    if ui
-                        .add(egui::Button::new("设置").min_size(egui::vec2(60.0, control_height)))
-                        .clicked()
-                    {
-                        self.background_url_draft
-                            .clone_from(&self.preferences.background_online_url);
-                        self.sync_background_opacity_drafts();
-                        self.settings_open = true;
-                        self.settings_center_on_open = true;
-                    }
-                });
+                if settings_clicked {
+                    self.background_url_draft
+                        .clone_from(&self.preferences.background_online_url);
+                    self.sync_background_opacity_drafts();
+                    self.settings_open = true;
+                    self.settings_center_on_open = true;
+                }
 
                 ui.horizontal_wrapped(|ui| {
                     ui.set_min_height(control_height);

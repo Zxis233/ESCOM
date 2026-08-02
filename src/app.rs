@@ -56,8 +56,10 @@ const SETTINGS_VIEWPORT_MARGIN: f32 = 16.0;
 const THEME_ICON_SIZE: f32 = 17.0;
 const RECEIVE_SEND_PANEL_ALPHA: u8 = 144;
 const RECEIVE_CONTENT_ALPHA: u8 = 82;
-const SEND_EDITOR_LIGHT_ALPHA: u8 = 120;
-const SEND_EDITOR_DARK_ALPHA: u8 = 104;
+const STANDARD_TEXT_INPUT_LIGHT_ALPHA: u8 = 128;
+const STANDARD_TEXT_INPUT_DARK_ALPHA: u8 = 96;
+const SEND_EDITOR_LIGHT_ALPHA: u8 = 64;
+const SEND_EDITOR_DARK_ALPHA: u8 = 64;
 const COMMON_BAUD_RATES: [u32; 18] = [
     300, 600, 1_200, 2_400, 4_800, 9_600, 19_200, 38_400, 57_600, 115_200, 230_400, 460_800,
     576_000, 921_600, 1_000_000, 2_000_000, 3_000_000, 4_000_000,
@@ -330,6 +332,15 @@ impl EscomApp {
         } else {
             base
         }
+    }
+
+    fn standard_text_input_fill(&self, visuals: &egui::Visuals) -> Color32 {
+        let alpha = if visuals.dark_mode {
+            STANDARD_TEXT_INPUT_DARK_ALPHA
+        } else {
+            STANDARD_TEXT_INPUT_LIGHT_ALPHA
+        };
+        self.surface_fill(visuals.text_edit_bg_color(), alpha)
     }
 
     fn show_title_bar(&self, root_ui: &mut egui::Ui) {

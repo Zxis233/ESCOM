@@ -193,6 +193,7 @@ impl EscomApp {
         let highlight_rules = Arc::clone(&self.highlight_rules);
         let highlight_config_error = self.highlight_config_error.clone();
         let control_height = toolbar_control_height(ui);
+        let input_fill = self.standard_text_input_fill(ui.visuals());
         egui::containers::Sides::new()
             .height(control_height)
             .shrink_left()
@@ -216,6 +217,7 @@ impl EscomApp {
                         egui::TextEdit::singleline(&mut self.search_query)
                             .id(search_id)
                             .hint_text("输入文本或正则表达式（Ctrl+F）")
+                            .background_color(input_fill)
                             .vertical_align(Align::Center),
                     );
                     if self.focus_search {

@@ -287,10 +287,11 @@ impl EscomApp {
             ui.centered_and_justified(|ui| {
                 ui.label(
                     RichText::new(if self.paused {
-                        "显示已暂停，接收仍在继续"
+                        "显示暂停啦 >_<"
                     } else {
-                        "等待串口数据"
+                        "这里什么都没有哦 ˘o˘ ᶻᶻᶻ"
                     })
+                    .size(self.preferences.ui_font_size * 2.0)
                     .color(ui.visuals().weak_text_color()),
                 );
             });
