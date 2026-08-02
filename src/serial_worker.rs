@@ -15,6 +15,14 @@ const WRITE_SLICE_BYTES: usize = 16 * 1024;
 const DISCONNECTED_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const EMPTY_READ_BACKOFF: Duration = Duration::from_millis(1);
 
+struct WorkerLifecycleLog;
+
+impl Drop for WorkerLifecycleLog {
+    fn drop(&mut self) {
+        log::info!(target: "escom::serial", "serial worker stopped");
+    }
+}
+
 pub type UiWake = Arc<dyn Fn() + Send + Sync + 'static>;
 
 pub trait PortIo: Read + Write + Send {
@@ -284,6 +292,8 @@ fn worker_loop(
     stats: Arc<SerialStats>,
     wake_ui: UiWake,
 ) {
+    log::info!(target: "escom::serial", "serial worker started");
+    let _lifecycle_log = WorkerLifecycleLog;
     let events = WorkerNotifier::new(events, wake_ui);
     let mut port: Option<Box<dyn PortIo>> = None;
     let mut pending_write: Option<PendingWrite> = None;
@@ -350,6 +360,7 @@ fn worker_loop(
             && let Err(error) =
                 write_next_slice(active_port.as_mut(), &mut pending_write, &events, &stats)
         {
+            log::error!(target: "escom::serial", "serial write failed: {error}");
             events.emit(WorkerEvent::PortError(format!("串口写入失败：{error}")));
             port = None;
             discard_writes(&mut pending_write, &write_requests);
@@ -381,6 +392,7 @@ fn worker_loop(
                     io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
                 ) => {}
             Err(error) => {
+                log::error!(target: "escom::serial", "serial read failed: {error}");
                 events.emit(WorkerEvent::PortError(format!("串口读取失败：{error}")));
                 port = None;
                 discard_writes(&mut pending_write, &write_requests);
@@ -405,19 +417,28 @@ fn handle_command(
                 events.emit(WorkerEvent::Ports(ports));
             }
             Err(error) => {
+                log::warn!(target: "escom::serial", "port enumeration failed: {error}");
                 events.emit(WorkerEvent::ControlError(error));
             }
         },
         WorkerCommand::Open(config) => {
+            log::info!(
+                target: "escom::serial",
+                "opening port={} baud={}",
+                config.port_name,
+                config.baud_rate
+            );
             discard_writes(pending_write, write_requests);
             *port = None;
             match backend.open(&config) {
                 Ok(opened_port) => {
                     stats.reset();
                     *port = Some(opened_port);
+                    log::info!(target: "escom::serial", "port opened: {}", config.port_name);
                     events.emit(WorkerEvent::Opened(config.port_name));
                 }
                 Err(error) => {
+                    log::error!(target: "escom::serial", "port open failed: {error}");
                     events.emit(WorkerEvent::PortError(error));
                     events.emit(WorkerEvent::Closed);
                 }
@@ -427,6 +448,7 @@ fn handle_command(
             discard_writes(pending_write, write_requests);
             let was_open = port.take().is_some();
             if was_open {
+                log::info!(target: "escom::serial", "port closed by user");
                 events.emit(WorkerEvent::Closed);
             }
         }
@@ -434,6 +456,7 @@ fn handle_command(
             if let Some(active_port) = port.as_mut()
                 && let Err(error) = active_port.set_dtr(level)
             {
+                log::warn!(target: "escom::serial", "DTR update failed: {error}");
                 events.emit(WorkerEvent::ControlError(error));
             }
         }
@@ -441,6 +464,7 @@ fn handle_command(
             if let Some(active_port) = port.as_mut()
                 && let Err(error) = active_port.set_rts(level)
             {
+                log::warn!(target: "escom::serial", "RTS update failed: {error}");
                 events.emit(WorkerEvent::ControlError(error));
             }
         }

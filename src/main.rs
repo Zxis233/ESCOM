@@ -3,6 +3,7 @@
 use eframe::egui;
 use escom::app::EscomApp;
 use escom::icon;
+use escom::logging;
 use escom::settings;
 
 fn main() -> eframe::Result {
@@ -13,6 +14,15 @@ fn main() -> eframe::Result {
             .set_level(rfd::MessageLevel::Error)
             .show();
         return Ok(());
+    }
+
+    match logging::init() {
+        Ok(path) => log::info!(
+            "ESCOM {} starting; log_path={}",
+            env!("CARGO_PKG_VERSION"),
+            path.display()
+        ),
+        Err(error) => eprintln!("{error}"),
     }
 
     let native_options = eframe::NativeOptions {
@@ -28,9 +38,16 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "ESCOM",
         native_options,
         Box::new(|creation_context| Ok(Box::new(EscomApp::new(creation_context)))),
-    )
+    );
+    if let Err(error) = &result {
+        log::error!("application exited with an error: {error}");
+    } else {
+        log::info!("ESCOM stopped");
+    }
+    log::logger().flush();
+    result
 }

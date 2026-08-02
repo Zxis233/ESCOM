@@ -6,7 +6,7 @@
 
 ESCOM 是一款使用 Rust 和 `eframe/egui` 编写的 Windows 串口查看器，面向嵌入式开发、设备联调和持续日志观察场景。串口读写在独立线程中执行，避免阻塞界面；接收数据采用有界缓存，并针对持续数据流进行了增量格式化和搜索优化。
 
-> 当前版本：`0.2.2`。项目处于早期开发阶段，欢迎提交 Issue 和 Pull Request。
+> 当前版本：`0.2.4`。项目处于早期开发阶段，欢迎提交 Issue 和 Pull Request。
 
 ## 功能特性
 
@@ -131,6 +131,7 @@ ESCOM 的本地文件保存在 `%APPDATA%\ESCOM\`：
 | `settings.toml` | 界面、字体、收发显示和背景偏好 |
 | `highlight.toml` | 接收内容高亮规则 |
 | `window.ron` | 窗口位置与尺寸 |
+| `logs\escom.log` | 应用生命周期、串口错误和后台任务耗时诊断日志 |
 
 `settings.toml` 按功能分组，首次启动时会自动创建。建议关闭 ESCOM 后再手动修改，重新启动后生效：
 
@@ -178,13 +179,31 @@ dynamic_accent = true # 根据背景图片自动生成按钮与选项的强调�
 - 应用启动时不会自动连接串口。
 - 本地背景仅记录原始文件路径；在线背景仅记录图片地址。
 - 使用在线背景时，应用需要访问对应的 HTTP(S) 图片地址。
+- 诊断日志不会记录串口收发正文；单个日志文件最多 2 MiB，并保留 3 份滚动归档。
+
+## 性能基准
+
+默认基准覆盖 20 MiB 全量显示重建与流式导出、128 KiB 增量格式化，以及 10 万行普通/正则搜索：
+
+```powershell
+cargo bench --bench pipeline
+```
+
+需要同时测量 100 MiB 和 500 MiB 缓存时，显式启用大数据集：
+
+```powershell
+$env:ESCOM_BENCH_LARGE = "1"
+cargo bench --bench pipeline
+Remove-Item Env:ESCOM_BENCH_LARGE
+```
 
 ## 项目结构
 
 ```text
 src/
 ├── app.rs            # 应用状态、后台事件与生命周期
-├── app/              # 连接、接收、搜索、发送和设置界面
+├── app/              # 连接、接收、搜索、任务状态机、发送和设置界面
+├── logging.rs        # 滚动诊断日志
 ├── serial_worker.rs  # 串口后台任务
 ├── store.rs          # 有界接收缓存
 ├── formatting.rs     # 文本/HEX 格式化与导出
@@ -193,6 +212,8 @@ src/
 ├── settings.rs       # 用户偏好与配置存储
 ├── fonts.rs          # 系统字体加载
 └── window_chrome.rs  # 自绘标题栏与窗口交互
+benches/
+└── pipeline.rs       # 格式化、搜索和导出性能基准
 ```
 
 ## 当前边界
@@ -200,7 +221,7 @@ src/
 当前版本暂不包含：
 
 - 协议解析和数据绘图
-- 自动日志记录
+- 自动保存串口接收内容
 - 多命令预设
 - 插件系统
 - 串口断线自动重连

@@ -39,7 +39,10 @@ mod search_ui;
 mod send;
 mod settings_ui;
 mod status;
+mod task_state;
 mod widgets;
+
+use task_state::{DisplayTaskState, SearchTaskState};
 
 const FORMAT_DEBOUNCE: Duration = Duration::from_millis(80);
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
@@ -154,11 +157,8 @@ pub struct EscomApp {
     display_generation: u64,
     display_formatter: Option<DisplayFormatter>,
     terminal_cursor: Option<(usize, usize)>,
-    format_token: u64,
-    format_in_progress: bool,
+    display_task: DisplayTaskState,
     export_in_progress: bool,
-    force_format: bool,
-    last_format_started: Instant,
     paused: bool,
     force_scroll_bottom: bool,
     search_query: String,
@@ -168,12 +168,7 @@ pub struct EscomApp {
     search_index: Arc<SearchIndex>,
     search_matcher: Option<SearchMatcher>,
     search_index_generation: Option<u64>,
-    search_token: u64,
-    search_pending: bool,
-    search_in_progress: bool,
-    search_wait_for_debounce: bool,
-    search_reset_selection: bool,
-    search_last_changed: Instant,
+    search_task: SearchTaskState,
     search_selected_match: Option<usize>,
     search_scroll_to_row: Option<usize>,
     focus_search: bool,
@@ -288,11 +283,8 @@ impl EscomApp {
             display_generation: u64::MAX,
             display_formatter: None,
             terminal_cursor: None,
-            format_token: 0,
-            format_in_progress: false,
+            display_task: DisplayTaskState::new(FORMAT_DEBOUNCE),
             export_in_progress: false,
-            force_format: true,
-            last_format_started: Instant::now() - FORMAT_DEBOUNCE,
             paused: false,
             force_scroll_bottom: false,
             search_query: String::new(),
@@ -302,12 +294,7 @@ impl EscomApp {
             search_index: Arc::new(SearchIndex::default()),
             search_matcher: None,
             search_index_generation: None,
-            search_token: 0,
-            search_pending: false,
-            search_in_progress: false,
-            search_wait_for_debounce: false,
-            search_reset_selection: false,
-            search_last_changed: Instant::now() - SEARCH_DEBOUNCE,
+            search_task: SearchTaskState::new(),
             search_selected_match: None,
             search_scroll_to_row: None,
             focus_search: false,
@@ -417,16 +404,12 @@ impl EscomApp {
                     rows,
                     formatter,
                 } => {
-                    self.format_in_progress = false;
-                    if token == self.format_token && !self.paused {
+                    if self.display_task.finish(token, !self.paused) {
                         self.terminal_cursor = formatter.terminal_cursor();
                         self.display_rows = Arc::new(rows);
                         self.display_generation = generation;
                         self.display_formatter = Some(*formatter);
-                        self.force_format = false;
                         self.request_search_for_display();
-                    } else {
-                        self.force_format = true;
                     }
                 }
                 BackgroundEvent::Searched {
@@ -434,25 +417,28 @@ impl EscomApp {
                     generation,
                     index,
                 } => {
-                    self.search_in_progress = false;
-                    if token == self.search_token && generation == self.display_generation {
+                    let apply = self.search_task.finish(
+                        token,
+                        generation,
+                        self.display_generation,
+                        self.search_matcher.is_some(),
+                    );
+                    if apply {
+                        let reset_selection = self.search_task.take_reset_selection();
                         self.search_index = Arc::new(index);
                         self.search_index_generation = Some(generation);
                         if self.search_index.error.is_some() || self.search_index.matches.is_empty()
                         {
                             self.search_selected_match = None;
                             self.search_scroll_to_row = None;
-                        } else if self.search_reset_selection {
+                        } else if reset_selection {
                             self.search_selected_match = Some(0);
                             self.queue_selected_search_scroll();
                         } else if let Some(selected) = self.search_selected_match {
                             self.search_selected_match =
                                 Some(selected.min(self.search_index.matches.len() - 1));
                         }
-                        self.search_reset_selection = false;
-                    } else if token == self.search_token && self.search_matcher.is_some() {
-                        self.search_pending = true;
-                        self.search_wait_for_debounce = false;
+                    } else if self.search_task.is_pending() {
                         self.search_index_generation = None;
                     }
                 }
@@ -478,8 +464,7 @@ impl EscomApp {
     }
 
     fn invalidate_format(&mut self) {
-        self.format_token = self.format_token.wrapping_add(1);
-        self.force_format = true;
+        self.display_task.invalidate();
     }
 
     fn mark_preferences_dirty(&mut self) {
@@ -497,6 +482,7 @@ impl EscomApp {
             Ok(()) => self.preferences_dirty_since = None,
             Err(message) => {
                 self.preferences_dirty_since = None;
+                log::error!(target: "escom::settings", "preference save failed: {message}");
                 self.set_notice(message, true);
             }
         }
@@ -543,7 +529,9 @@ impl eframe::App for EscomApp {
 
 impl Drop for EscomApp {
     fn drop(&mut self) {
-        let _ = settings::save(&self.preferences);
+        if let Err(error) = settings::save(&self.preferences) {
+            log::error!(target: "escom::settings", "final preference save failed: {error}");
+        }
         self.worker.shutdown();
     }
 }

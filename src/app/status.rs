@@ -61,7 +61,7 @@ impl EscomApp {
                                         human_bytes(MAX_DISPLAY_TEXT_BYTES as u64)
                                     ));
                             }
-                            if self.format_in_progress {
+                            if self.display_task.is_running() {
                                 ui.label("正在整理显示...");
                             }
                             if self.export_in_progress {

@@ -3,7 +3,7 @@ use super::*;
 
 impl EscomApp {
     pub(super) fn maybe_start_format(&mut self, context: &egui::Context) {
-        if self.paused || self.format_in_progress || self.search_in_progress {
+        if self.paused || self.display_task.is_running() || self.search_task.is_running() {
             return;
         }
         let generation = self
@@ -11,17 +11,17 @@ impl EscomApp {
             .lock()
             .map(|store| store.generation())
             .unwrap_or(self.display_generation);
-        if generation == self.display_generation && !self.force_format {
+        if generation == self.display_generation && !self.display_task.needs_full_rebuild() {
             return;
         }
-        if !self.force_format && self.last_format_started.elapsed() < FORMAT_DEBOUNCE {
-            context.request_repaint_after(FORMAT_DEBOUNCE - self.last_format_started.elapsed());
+        if let Some(remaining) = self.display_task.debounce_remaining(FORMAT_DEBOUNCE) {
+            context.request_repaint_after(remaining);
             return;
         }
 
         let mode = self.preferences.receive_mode;
         let encoding = self.preferences.text_encoding;
-        let can_apply_delta = !self.force_format
+        let can_apply_delta = !self.display_task.needs_full_rebuild()
             && self
                 .display_formatter
                 .as_ref()
@@ -53,11 +53,10 @@ impl EscomApp {
                         .as_ref()
                         .and_then(DisplayFormatter::terminal_cursor);
                     self.apply_display_update(update);
-                    self.last_format_started = Instant::now();
                     return;
                 }
             }
-            self.force_format = true;
+            self.display_task.require_full_rebuild();
         }
 
         let snapshot = self
@@ -69,18 +68,23 @@ impl EscomApp {
             self.set_notice("接收缓存不可用", true);
             return;
         };
-        let token = self.format_token;
+        let token = self.display_task.start();
         let sender = self.background_tx.clone();
         let repaint_context = context.clone();
-        self.format_in_progress = true;
-        self.force_format = false;
-        self.last_format_started = Instant::now();
+        let snapshot_bytes = snapshot.bytes_len;
 
-        thread::Builder::new()
+        let spawn_result = thread::Builder::new()
             .name("escom-format".into())
             .spawn(move || {
+                let started = Instant::now();
                 let generation = snapshot.generation;
                 let (formatter, rows) = DisplayFormatter::rebuild(&snapshot, mode, encoding);
+                log::info!(
+                    target: "escom::format",
+                    "display rebuild completed: mode={mode:?} bytes={snapshot_bytes} rows={} elapsed_ms={}",
+                    rows.len(),
+                    started.elapsed().as_millis()
+                );
                 let _ = sender.send(BackgroundEvent::Formatted {
                     token,
                     generation,
@@ -88,8 +92,12 @@ impl EscomApp {
                     formatter: Box::new(formatter),
                 });
                 repaint_context.request_repaint();
-            })
-            .expect("failed to start formatting task");
+            });
+        if let Err(error) = spawn_result {
+            self.display_task.finish(token, false);
+            log::error!(target: "escom::format", "failed to start display rebuild: {error}");
+            self.set_notice(format!("无法启动显示整理任务：{error}"), true);
+        }
     }
 
     pub(super) fn apply_display_update(&mut self, update: DisplayUpdate) {
@@ -131,11 +139,10 @@ impl EscomApp {
         display_rows.truncate(display_rows.len().saturating_sub(replace_tail));
         display_rows.extend(rows);
         self.display_generation = generation;
-        self.force_format = false;
+        self.display_task.mark_applied();
 
         if search_requires_full_search {
             self.request_search_for_display();
-            self.search_wait_for_debounce = false;
         } else if search_was_current {
             self.clamp_search_selection();
         }
@@ -334,7 +341,7 @@ impl EscomApp {
         if visible_row_count == 0 {
             ui.centered_and_justified(|ui| {
                 ui.label(
-                    RichText::new(if self.search_pending || self.search_in_progress {
+                    RichText::new(if self.search_task.is_busy() {
                         "正在搜索…"
                     } else {
                         "没有匹配的接收数据"
@@ -423,10 +430,7 @@ impl EscomApp {
         self.display_generation = generation;
         self.display_formatter = None;
         self.terminal_cursor = None;
-        self.search_token = self.search_token.wrapping_add(1);
-        self.search_pending = false;
-        self.search_wait_for_debounce = false;
-        self.search_reset_selection = false;
+        self.search_task.cancel();
         self.search_index = Arc::new(SearchIndex::default());
         self.search_index_generation = Some(generation);
         self.search_selected_match = None;
@@ -463,9 +467,11 @@ impl EscomApp {
         let sender = self.background_tx.clone();
         let repaint_context = context.clone();
         self.export_in_progress = true;
+        let snapshot_bytes = snapshot.bytes_len;
         let spawn_result = thread::Builder::new()
             .name("escom-export".into())
             .spawn(move || {
+                let started = Instant::now();
                 let result = export_snapshot_to_file(
                     &path,
                     snapshot,
@@ -476,11 +482,24 @@ impl EscomApp {
                 )
                 .map(|()| path)
                 .map_err(|error| format!("导出失败：{error}"));
+                match &result {
+                    Ok(_) => log::info!(
+                        target: "escom::export",
+                        "export completed: bytes={snapshot_bytes} mode={mode:?} elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    ),
+                    Err(error) => log::error!(
+                        target: "escom::export",
+                        "export failed: bytes={snapshot_bytes} mode={mode:?} elapsed_ms={} error={error}",
+                        started.elapsed().as_millis()
+                    ),
+                }
                 let _ = sender.send(BackgroundEvent::Exported(result));
                 repaint_context.request_repaint();
             });
         if let Err(error) = spawn_result {
             self.export_in_progress = false;
+            log::error!(target: "escom::export", "failed to start export task: {error}");
             self.set_notice(format!("无法启动导出任务：{error}"), true);
         }
     }

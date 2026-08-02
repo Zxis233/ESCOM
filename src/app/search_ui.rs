@@ -6,10 +6,8 @@ use super::*;
 
 impl EscomApp {
     pub(super) fn request_search(&mut self, reset_selection: bool) {
-        self.search_token = self.search_token.wrapping_add(1);
-        self.search_last_changed = Instant::now();
-        self.search_wait_for_debounce = true;
-        self.search_reset_selection |= reset_selection;
+        self.search_task
+            .request_debounced(SEARCH_DEBOUNCE, reset_selection);
         self.search_index_generation = None;
         if reset_selection {
             self.search_index = Arc::new(SearchIndex::default());
@@ -24,21 +22,16 @@ impl EscomApp {
         ) {
             Ok(Some(matcher)) => {
                 self.search_matcher = Some(matcher);
-                self.search_pending = true;
             }
             Ok(None) => {
                 self.search_matcher = None;
-                self.search_pending = false;
-                self.search_wait_for_debounce = false;
-                self.search_reset_selection = false;
+                self.search_task.cancel();
                 self.search_index = Arc::new(SearchIndex::default());
                 self.search_index_generation = Some(self.display_generation);
             }
             Err(error) => {
                 self.search_matcher = None;
-                self.search_pending = false;
-                self.search_wait_for_debounce = false;
-                self.search_reset_selection = false;
+                self.search_task.cancel();
                 self.search_index = Arc::new(SearchIndex {
                     error: Some(error),
                     ..Default::default()
@@ -53,53 +46,59 @@ impl EscomApp {
     pub(super) fn request_search_for_display(&mut self) {
         self.search_index_generation = None;
         if self.search_query.is_empty() {
+            self.search_task.cancel();
             self.search_index = Arc::new(SearchIndex::default());
-            self.search_pending = false;
-            self.search_wait_for_debounce = false;
             self.search_index_generation = Some(self.display_generation);
         } else if self.search_matcher.is_some() {
-            self.search_token = self.search_token.wrapping_add(1);
-            self.search_pending = true;
+            self.search_task.request_now();
         } else if self.search_index.error.is_some() {
+            self.search_task.cancel();
             self.search_index_generation = Some(self.display_generation);
         }
     }
 
     pub(super) fn maybe_start_search(&mut self, context: &egui::Context) {
-        if !self.search_pending
-            || self.search_in_progress
-            || self.format_in_progress
+        if !self.search_task.is_pending()
+            || self.search_task.is_running()
+            || self.display_task.is_running()
             || self.search_query.is_empty()
         {
             return;
         }
-        if self.search_wait_for_debounce && self.search_last_changed.elapsed() < SEARCH_DEBOUNCE {
-            context.request_repaint_after(SEARCH_DEBOUNCE - self.search_last_changed.elapsed());
+        if let Some(remaining) = self.search_task.debounce_remaining() {
+            context.request_repaint_after(remaining);
             return;
         }
 
         let Some(matcher) = self.search_matcher.clone() else {
-            self.search_pending = false;
+            self.search_task.cancel();
             return;
         };
-        let token = self.search_token;
-        let generation = self.display_generation;
+        let Some((token, generation)) = self.search_task.start(self.display_generation) else {
+            return;
+        };
         let rows = Arc::clone(&self.display_rows);
         let timestamps = self.preferences.timestamps;
         let timestamp_format = self.preferences.timestamp_format.clone();
         let sender = self.background_tx.clone();
         let repaint_context = context.clone();
-        self.search_pending = false;
-        self.search_in_progress = true;
-        self.search_wait_for_debounce = false;
 
-        thread::Builder::new()
+        let row_count = rows.len();
+        let spawn_result = thread::Builder::new()
             .name("escom-search".into())
             .spawn(move || {
+                let started = Instant::now();
                 let index = search::search_rows_with_matcher(
                     &rows,
                     &matcher,
                     SearchDisplayOptions::new(timestamps, &timestamp_format),
+                );
+                log::info!(
+                    target: "escom::search",
+                    "search completed: rows={row_count} matches={} truncated={} elapsed_ms={}",
+                    index.matches.len(),
+                    index.truncated,
+                    started.elapsed().as_millis()
                 );
                 drop(rows);
                 let _ = sender.send(BackgroundEvent::Searched {
@@ -108,8 +107,12 @@ impl EscomApp {
                     index,
                 });
                 repaint_context.request_repaint();
-            })
-            .expect("failed to start search task");
+            });
+        if let Err(error) = spawn_result {
+            self.search_task.abort(token, generation);
+            log::error!(target: "escom::search", "failed to start search task: {error}");
+            self.set_notice(format!("无法启动搜索任务：{error}"), true);
+        }
     }
 
     pub(super) fn search_index_is_current(&self) -> bool {
@@ -127,7 +130,7 @@ impl EscomApp {
     }
 
     pub(super) fn navigate_search(&mut self, direction: isize) {
-        if !self.search_index_is_current() || self.search_pending || self.search_in_progress {
+        if !self.search_index_is_current() || self.search_task.is_busy() {
             return;
         }
         let count = self.search_index.matches.len();
@@ -273,8 +276,7 @@ impl EscomApp {
                         .add_enabled(
                             !self.search_query.is_empty()
                                 && search_current
-                                && !self.search_pending
-                                && !self.search_in_progress
+                                && !self.search_task.is_busy()
                                 && self.search_index.error.is_none(),
                             egui::Button::selectable(self.search_filter, "过滤")
                                 .min_size(egui::vec2(64.0, control_height)),
@@ -286,8 +288,7 @@ impl EscomApp {
                     }
 
                     let can_navigate = search_current
-                        && !self.search_pending
-                        && !self.search_in_progress
+                        && !self.search_task.is_busy()
                         && !self.search_index.matches.is_empty();
                     if ui
                         .add_enabled(
@@ -311,8 +312,7 @@ impl EscomApp {
                     let status_error = search_current
                         .then(|| self.search_index.error.clone())
                         .flatten();
-                    let status = if self.search_pending
-                        || self.search_in_progress
+                    let status = if self.search_task.is_busy()
                         || (!self.search_query.is_empty() && !search_current)
                     {
                         RichText::new("搜索中…").color(ui.visuals().weak_text_color())
