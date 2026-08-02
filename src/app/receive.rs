@@ -243,6 +243,7 @@ impl EscomApp {
                     }
 
                     toolbar_separator(ui);
+
                     if ui
                         .add(egui::Button::new("清接收").min_size(egui::vec2(64.0, control_height)))
                         .clicked()
@@ -259,6 +260,37 @@ impl EscomApp {
                         self.clear_receive();
                         self.send_input.clear();
                         self.send_error = None;
+                    }
+                    let copy_filter_active = self.search_filter
+                        && !self.search_query.is_empty()
+                        && self.search_index_is_current()
+                        && self.search_index.error.is_none();
+                    let copy_row_count = if copy_filter_active {
+                        self.search_index.matched_row_count(self.display_rows.len())
+                    } else {
+                        self.display_rows.len()
+                    };
+
+                    toolbar_separator(ui);
+
+                    if ui
+                        .add_enabled(
+                            copy_row_count > 0,
+                            egui::Button::new("复制接收区")
+                                .min_size(egui::vec2(96.0, control_height)),
+                        )
+                        .clicked()
+                    {
+                        let visible_rows =
+                            copy_filter_active.then_some(self.search_index.matched_rows.as_slice());
+                        let text = receive_text_for_clipboard(
+                            &self.display_rows,
+                            self.preferences.timestamps,
+                            &self.preferences.timestamp_format,
+                            visible_rows,
+                        );
+                        context.copy_text(text);
+                        self.set_notice(format!("已复制接收区（{copy_row_count} 行）"), false);
                     }
                     if ui
                         .add_enabled_ui(
@@ -510,6 +542,42 @@ impl EscomApp {
             .map(|store| store.bytes_len())
             .unwrap_or(0)
     }
+}
+
+pub(super) fn receive_text_for_clipboard(
+    rows: &[FormattedRow],
+    timestamps: bool,
+    timestamp_format: &str,
+    visible_rows: Option<&[usize]>,
+) -> String {
+    let estimated_text_bytes = match visible_rows {
+        Some(indices) => indices
+            .iter()
+            .filter_map(|row_index| rows.get(*row_index))
+            .map(|row| row.text.len().saturating_add(1))
+            .sum(),
+        None => rows
+            .iter()
+            .map(|row| row.text.len().saturating_add(1))
+            .sum(),
+    };
+    let row_indices: Box<dyn Iterator<Item = usize> + '_> = match visible_rows {
+        Some(indices) => Box::new(indices.iter().copied()),
+        None => Box::new(0..rows.len()),
+    };
+    let mut output = String::with_capacity(estimated_text_bytes);
+    let mut first = true;
+    for row_index in row_indices {
+        let Some(row) = rows.get(row_index) else {
+            continue;
+        };
+        if !first {
+            output.push('\n');
+        }
+        output.push_str(&display_text(row, timestamps, timestamp_format));
+        first = false;
+    }
+    output
 }
 
 pub(super) fn virtual_rows_content_height(

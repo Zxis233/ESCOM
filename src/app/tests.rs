@@ -1,4 +1,6 @@
-use super::receive::{receive_row_layout_job, virtual_rows_content_height};
+use super::receive::{
+    receive_row_layout_job, receive_text_for_clipboard, virtual_rows_content_height,
+};
 use super::send::{history_preview, terminal_bytes_from_events};
 use super::settings_ui::{
     centered_window_position, cover_uv, format_background_opacity, local_background_uri,
@@ -129,6 +131,22 @@ fn receive_row_layout_combines_rule_and_search_highlights() {
         assert_eq!(job.sections[1].format.background, rule_background);
         assert_ne!(job.sections[1].format.underline, egui::Stroke::NONE);
     });
+}
+
+#[test]
+fn receive_clipboard_text_matches_visible_rows() {
+    let mut store = ReceiveStore::new(1024);
+    store.append(Local::now(), b"first\nsecond\nthird".to_vec());
+    let rows = format_snapshot(&store.snapshot(), ReceiveMode::Text, TextEncoding::Utf8);
+
+    assert_eq!(
+        receive_text_for_clipboard(&rows, false, DEFAULT_TIMESTAMP_FORMAT, None),
+        "first\nsecond\nthird"
+    );
+    assert_eq!(
+        receive_text_for_clipboard(&rows, false, DEFAULT_TIMESTAMP_FORMAT, Some(&[0, 2])),
+        "first\nthird"
+    );
 }
 
 fn assert_virtual_scroll_reaches_bottom(row_height: f32, line_spacing: f32, row_count: usize) {
