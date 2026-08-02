@@ -425,16 +425,6 @@ impl EscomApp {
     }
 
     pub(super) fn export_snapshot(&mut self, context: &egui::Context) {
-        let snapshot = self.store.lock().ok().map(|store| store.snapshot());
-        let Some(snapshot) = snapshot else {
-            self.set_notice("无法读取接收缓存", true);
-            return;
-        };
-        if snapshot.bytes_len == 0 {
-            self.set_notice("接收区没有可导出的数据", true);
-            return;
-        }
-
         let file_name = format!("ESCOM_{}.txt", Local::now().format("%Y%m%d_%H%M%S"));
         let Some(path) = rfd::FileDialog::new()
             .set_title("导出接收数据")
@@ -444,6 +434,18 @@ impl EscomApp {
         else {
             return;
         };
+
+        // Include bytes received while the modal file dialog was open, and avoid retaining an
+        // obsolete snapshot if the user cancels the dialog.
+        let snapshot = self.store.lock().ok().map(|store| store.snapshot());
+        let Some(snapshot) = snapshot else {
+            self.set_notice("无法读取接收缓存", true);
+            return;
+        };
+        if snapshot.bytes_len == 0 {
+            self.set_notice("接收区没有可导出的数据", true);
+            return;
+        }
 
         let mode = self.preferences.receive_mode;
         let encoding = self.preferences.text_encoding;
