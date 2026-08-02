@@ -11,6 +11,9 @@ use crate::store::RxChunk;
 const TERMINAL_DECODE_INPUT_BYTES: usize = 64 * 1024;
 const MAX_TERMINAL_ROWS: usize = 100_000;
 const MAX_TERMINAL_COLUMNS: usize = 512 * 1024;
+// Bound fresh storage requested by one CSI dispatch without restricting access to existing cells.
+const MAX_CSI_CELL_GROWTH: usize = 4 * 1024;
+const MAX_CSI_LINE_GROWTH: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TerminalRow {
@@ -55,20 +58,18 @@ impl IncrementalTerminalFormatter {
         max_text_bytes: usize,
         max_line_bytes: usize,
     ) -> TerminalUpdate {
-        self.screen.begin_update();
+        let max_rows = max_rows.clamp(1, MAX_TERMINAL_ROWS);
+        let max_text_bytes = max_text_bytes.max(1);
+        let max_line_bytes = max_line_bytes.clamp(16, MAX_TERMINAL_COLUMNS);
+        self.screen
+            .begin_update(max_rows, max_text_bytes, max_line_bytes);
         for chunk in chunks {
-            self.push_chunk(
-                chunk,
-                max_rows.max(1),
-                max_text_bytes.max(1),
-                max_line_bytes.max(16),
-            );
+            self.push_chunk(chunk, max_rows, max_text_bytes, max_line_bytes);
         }
-        self.limited |= self.screen.enforce_limits(
-            max_rows.max(1),
-            max_text_bytes.max(1),
-            max_line_bytes.max(16),
-        );
+        self.limited |= self
+            .screen
+            .enforce_limits(max_rows, max_text_bytes, max_line_bytes);
+        self.limited |= self.screen.csi_limited;
 
         let new_len = self.screen.rendered_len();
         let (remove_prefix, replace_tail, rows_start) = if self.screen.full_replace {
@@ -163,6 +164,9 @@ struct TerminalScreen {
     removed_front: usize,
     full_replace: bool,
     text_bytes: usize,
+    max_rows: usize,
+    max_line_cells: usize,
+    csi_limited: bool,
 }
 
 impl Default for TerminalScreen {
@@ -178,16 +182,22 @@ impl Default for TerminalScreen {
             removed_front: 0,
             full_replace: false,
             text_bytes: 0,
+            max_rows: MAX_TERMINAL_ROWS,
+            max_line_cells: MAX_TERMINAL_COLUMNS,
+            csi_limited: false,
         }
     }
 }
 
 impl TerminalScreen {
-    fn begin_update(&mut self) {
+    fn begin_update(&mut self, max_rows: usize, max_text_bytes: usize, max_line_bytes: usize) {
         self.dirty_from = None;
         self.byte_dirty_from = None;
         self.removed_front = 0;
         self.full_replace = false;
+        self.max_rows = max_rows;
+        self.max_line_cells = max_line_bytes.min(max_text_bytes).max(1);
+        self.csi_limited = false;
     }
 
     fn rendered_len(&self) -> usize {
@@ -307,18 +317,13 @@ impl TerminalScreen {
     }
 
     fn move_down(&mut self, count: usize) {
-        self.cursor_row = self
-            .cursor_row
-            .saturating_add(count)
-            .min(MAX_TERMINAL_ROWS - 1);
-        self.ensure_line(self.cursor_row);
+        let row = self.cursor_row.saturating_add(count);
+        self.set_csi_row(row);
     }
 
     fn move_forward(&mut self, count: usize) {
-        self.cursor_col = self
-            .cursor_col
-            .saturating_add(count)
-            .min(MAX_TERMINAL_COLUMNS);
+        let col = self.cursor_col.saturating_add(count);
+        self.set_csi_column(col);
     }
 
     fn move_back(&mut self, count: usize) {
@@ -331,29 +336,78 @@ impl TerminalScreen {
         self.ensure_line(self.cursor_row);
     }
 
+    fn set_csi_position(&mut self, row: usize, col: usize) {
+        self.set_csi_row(row);
+        self.set_csi_column(col);
+    }
+
+    fn set_csi_row(&mut self, row: usize) {
+        let allocation_limit = self
+            .lines
+            .len()
+            .saturating_add(MAX_CSI_LINE_GROWTH)
+            .saturating_sub(1);
+        let target = row
+            .min(self.max_rows.saturating_sub(1))
+            .min(allocation_limit);
+        self.csi_limited |= target != row;
+        self.lines
+            .reserve_exact(target.saturating_add(1).saturating_sub(self.lines.len()));
+        self.cursor_row = target;
+        self.ensure_line(self.cursor_row);
+    }
+
+    fn set_csi_column(&mut self, col: usize) {
+        let line_len = self
+            .lines
+            .get(self.cursor_row)
+            .map_or(0, |line| line.cells.len());
+        let allocation_limit = line_len
+            .saturating_add(MAX_CSI_CELL_GROWTH)
+            .saturating_sub(1);
+        let target = col
+            .min(self.max_line_cells.saturating_sub(1))
+            .min(allocation_limit);
+        self.csi_limited |= target != col;
+        self.cursor_col = target;
+    }
+
+    fn csi_cell_growth_limit(&self, current_len: usize) -> usize {
+        current_len
+            .saturating_add(MAX_CSI_CELL_GROWTH)
+            .min(self.max_line_cells)
+    }
+
     fn erase_line(&mut self, mode: usize) {
         self.ensure_line(self.cursor_row);
         self.mark_dirty(self.cursor_row);
-        let line = &mut self.lines[self.cursor_row];
         match mode {
             1 => {
-                if line.cells.len() <= self.cursor_col {
-                    line.cells.resize(self.cursor_col.saturating_add(1), ' ');
+                let current_len = self.lines[self.cursor_row].cells.len();
+                let requested_end = self.cursor_col.saturating_add(1);
+                let end = requested_end
+                    .min(current_len.saturating_add(MAX_CSI_CELL_GROWTH))
+                    .min(self.max_line_cells);
+                self.csi_limited |= end != requested_end;
+                let line = &mut self.lines[self.cursor_row];
+                line.cells.reserve_exact(end.saturating_sub(current_len));
+                if current_len < end {
+                    line.cells.resize(end, ' ');
                 }
-                for cell in line
-                    .cells
-                    .iter_mut()
-                    .take(self.cursor_col.saturating_add(1))
-                {
+                for cell in line.cells.iter_mut().take(end) {
                     *cell = ' ';
                 }
             }
             2 | 3 => {
+                let line = &mut self.lines[self.cursor_row];
                 line.cells.clear();
                 line.received_at = None;
                 line.completed = false;
             }
-            _ => line.cells.truncate(self.cursor_col.min(line.cells.len())),
+            _ => {
+                let line = &mut self.lines[self.cursor_row];
+                line.cells.truncate(self.cursor_col.min(line.cells.len()));
+            }
         }
     }
 
@@ -384,13 +438,28 @@ impl TerminalScreen {
     fn insert_blank_characters(&mut self, count: usize) {
         self.ensure_line(self.cursor_row);
         self.mark_dirty(self.cursor_row);
+        let current_len = self.lines[self.cursor_row].cells.len();
+        let growth_limit = self.csi_cell_growth_limit(current_len);
+        let insert_at = self.cursor_col.min(growth_limit);
+        let base_len = current_len.max(insert_at);
+        let inserted = count.min(growth_limit.saturating_sub(base_len));
+        let final_len = base_len.saturating_add(inserted);
+        self.csi_limited |= insert_at != self.cursor_col || inserted != count;
+
         let line = &mut self.lines[self.cursor_row];
-        if self.cursor_col > line.cells.len() {
-            line.cells.resize(self.cursor_col, ' ');
+        line.cells
+            .reserve_exact(final_len.saturating_sub(current_len));
+        if insert_at > current_len {
+            line.cells.resize(insert_at, ' ');
         }
-        for _ in 0..count {
-            line.cells.insert(self.cursor_col, ' ');
+        if inserted == 0 {
+            return;
         }
+        let old_len = line.cells.len();
+        line.cells.resize(final_len, ' ');
+        line.cells
+            .copy_within(insert_at..old_len, insert_at + inserted);
+        line.cells[insert_at..insert_at + inserted].fill(' ');
     }
 
     fn delete_characters(&mut self, count: usize) {
@@ -405,12 +474,22 @@ impl TerminalScreen {
     fn erase_characters(&mut self, count: usize) {
         self.ensure_line(self.cursor_row);
         self.mark_dirty(self.cursor_row);
+        let current_len = self.lines[self.cursor_row].cells.len();
+        let growth_limit = self.csi_cell_growth_limit(current_len);
+        let start = self.cursor_col.min(self.max_line_cells);
+        let requested_end = start.saturating_add(count);
+        let end = requested_end.min(growth_limit);
+        self.csi_limited |= start != self.cursor_col || end != requested_end;
+        if start >= end {
+            return;
+        }
+
         let line = &mut self.lines[self.cursor_row];
-        let end = self.cursor_col.saturating_add(count);
-        if line.cells.len() < end {
+        line.cells.reserve_exact(end.saturating_sub(current_len));
+        if current_len < end {
             line.cells.resize(end, ' ');
         }
-        for cell in &mut line.cells[self.cursor_col..end] {
+        for cell in &mut line.cells[start..end] {
             *cell = ' ';
         }
     }
@@ -418,7 +497,18 @@ impl TerminalScreen {
     fn insert_lines(&mut self, count: usize) {
         self.ensure_line(self.cursor_row);
         self.mark_dirty(self.cursor_row);
+        let requested = count;
+        let count = count.min(MAX_CSI_LINE_GROWTH).min(self.max_rows);
+        self.csi_limited |= count != requested;
+        let additional_capacity = count.min(self.max_rows.saturating_sub(self.lines.len()));
+        self.lines.reserve_exact(additional_capacity);
         for _ in 0..count {
+            if self.lines.len() >= self.max_rows
+                && let Some(removed) = self.lines.pop_back()
+            {
+                self.text_bytes = self.text_bytes.saturating_sub(removed.byte_len);
+                self.csi_limited = true;
+            }
             self.lines.insert(self.cursor_row, TerminalLine::default());
         }
     }
@@ -448,9 +538,20 @@ impl TerminalScreen {
 
     fn scroll_down(&mut self, count: usize) {
         self.mark_dirty(0);
-        for _ in 0..count.min(MAX_TERMINAL_ROWS) {
+        let requested = count;
+        let count = count.min(MAX_CSI_LINE_GROWTH).min(self.max_rows);
+        self.csi_limited |= count != requested;
+        let additional_capacity = count.min(self.max_rows.saturating_sub(self.lines.len()));
+        self.lines.reserve_exact(additional_capacity);
+        for _ in 0..count {
+            if self.lines.len() >= self.max_rows
+                && let Some(removed) = self.lines.pop_back()
+            {
+                self.text_bytes = self.text_bytes.saturating_sub(removed.byte_len);
+                self.csi_limited = true;
+            }
             self.lines.push_front(TerminalLine::default());
-            self.cursor_row = self.cursor_row.saturating_add(1).min(MAX_TERMINAL_ROWS - 1);
+            self.cursor_row = self.cursor_row.saturating_add(1).min(self.max_rows - 1);
         }
     }
 
@@ -625,19 +726,14 @@ impl Perform for TerminalScreen {
                 self.carriage_return();
             }
             'G' | '`' => {
-                self.cursor_col = parameter(params, 0, 1)
-                    .saturating_sub(1)
-                    .min(MAX_TERMINAL_COLUMNS);
+                self.set_csi_column(parameter(params, 0, 1).saturating_sub(1));
             }
-            'H' | 'f' => self.set_position(
+            'H' | 'f' => self.set_csi_position(
                 parameter(params, 0, 1).saturating_sub(1),
                 parameter(params, 1, 1).saturating_sub(1),
             ),
             'd' => {
-                self.cursor_row = parameter(params, 0, 1)
-                    .saturating_sub(1)
-                    .min(MAX_TERMINAL_ROWS - 1);
-                self.ensure_line(self.cursor_row);
+                self.set_csi_row(parameter(params, 0, 1).saturating_sub(1));
             }
             'J' => self.erase_display(mode_parameter(params)),
             'K' => self.erase_line(mode_parameter(params)),
@@ -753,6 +849,48 @@ mod tests {
         );
 
         assert_eq!(update.rows[0].text, "normal red text");
+    }
+
+    #[test]
+    fn csi_character_operations_limit_growth_per_dispatch() {
+        let mut parser = Parser::new();
+        let mut screen = TerminalScreen::default();
+        screen.begin_update(
+            MAX_TERMINAL_ROWS,
+            MAX_TERMINAL_COLUMNS,
+            MAX_TERMINAL_COLUMNS,
+        );
+
+        parser.advance(&mut screen, b"a\x1b[65535@");
+        assert_eq!(screen.lines[0].cells.len(), 1 + MAX_CSI_CELL_GROWTH);
+
+        let previous_len = screen.lines[0].cells.len();
+        parser.advance(&mut screen, b"\x1b[65535X");
+        assert_eq!(
+            screen.lines[0].cells.len() - previous_len,
+            MAX_CSI_CELL_GROWTH
+        );
+    }
+
+    #[test]
+    fn csi_coordinates_and_line_operations_respect_allocation_limits() {
+        let mut parser = Parser::new();
+        let mut screen = TerminalScreen::default();
+        screen.begin_update(10, 64, 64);
+
+        parser.advance(&mut screen, b"\x1b[65535;65535HX");
+        assert_eq!(screen.lines.len(), 10);
+        assert_eq!(screen.cursor_row, 9);
+        assert_eq!(screen.cursor_col, 64);
+        assert_eq!(screen.lines[9].cells.len(), 64);
+
+        parser.advance(&mut screen, b"\x1b[65535L\x1b[65535T");
+        assert_eq!(screen.lines.len(), 10);
+        assert!(screen.csi_limited);
+
+        let mut formatter = IncrementalTerminalFormatter::new(TextEncoding::Utf8);
+        formatter.apply_chunks(&[chunk(0, 1, b"\x1b[65535;65535HX")], 10, 64, 64);
+        assert!(formatter.is_limited());
     }
 
     #[test]

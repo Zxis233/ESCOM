@@ -287,9 +287,9 @@ impl EscomApp {
             ui.centered_and_justified(|ui| {
                 ui.label(
                     RichText::new(if self.paused {
-                        "显示暂停啦 >_<"
+                        "显示被暂停啦 >_<"
                     } else {
-                        "这里什么都没有哦 ˘o˘ ᶻᶻᶻ"
+                        "什么都没有哦 ˘o˘ ᶻᶻᶻ"
                     })
                     .size(self.preferences.ui_font_size * 2.0)
                     .color(ui.visuals().weak_text_color()),
