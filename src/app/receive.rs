@@ -102,22 +102,28 @@ impl EscomApp {
         let old_generation = self.display_generation;
         let old_row_count = self.display_rows.len();
         let search_was_current = self.search_index_generation == Some(old_generation);
+        let mut search_requires_full_search = false;
 
         if search_was_current {
             if let Some(matcher) = &self.search_matcher {
-                Arc::make_mut(&mut self.search_index).apply_display_update(
-                    old_row_count,
-                    remove_prefix,
-                    replace_tail,
-                    &rows,
-                    matcher,
-                    SearchDisplayOptions::new(
-                        self.preferences.timestamps,
-                        &self.preferences.timestamp_format,
+                search_requires_full_search = matches!(
+                    Arc::make_mut(&mut self.search_index).apply_display_update(
+                        old_row_count,
+                        remove_prefix,
+                        replace_tail,
+                        &rows,
+                        matcher,
+                        SearchDisplayOptions::new(
+                            self.preferences.timestamps,
+                            &self.preferences.timestamp_format,
+                        ),
                     ),
+                    search::SearchUpdateOutcome::RequiresFullSearch
                 );
             }
-            self.search_index_generation = Some(generation);
+            if !search_requires_full_search {
+                self.search_index_generation = Some(generation);
+            }
         }
 
         let display_rows = Arc::make_mut(&mut self.display_rows);
@@ -127,7 +133,10 @@ impl EscomApp {
         self.display_generation = generation;
         self.force_format = false;
 
-        if search_was_current {
+        if search_requires_full_search {
+            self.request_search_for_display();
+            self.search_wait_for_debounce = false;
+        } else if search_was_current {
             self.clamp_search_selection();
         }
     }

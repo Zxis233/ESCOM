@@ -31,6 +31,13 @@ pub struct SearchDisplayOptions<'a> {
     pub timestamp_format: &'a str,
 }
 
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchUpdateOutcome {
+    Applied,
+    RequiresFullSearch,
+}
+
 impl<'a> SearchDisplayOptions<'a> {
     pub const fn new(timestamps: bool, timestamp_format: &'a str) -> Self {
         Self {
@@ -87,16 +94,26 @@ impl SearchIndex {
         rows: &[FormattedRow],
         matcher: &SearchMatcher,
         display_options: SearchDisplayOptions<'_>,
-    ) {
+    ) -> SearchUpdateOutcome {
         debug_assert!(remove_prefix <= old_row_count);
         let rows_after_prefix = old_row_count.saturating_sub(remove_prefix);
         debug_assert!(replace_tail <= rows_after_prefix);
 
-        if remove_prefix != 0 {
-            let first_match = self
+        let removed_matches = self
+            .matches
+            .partition_point(|item| item.row_index < remove_prefix);
+        let replaced_tail_start = old_row_count.saturating_sub(replace_tail);
+        let replacement_touches_indexed_prefix = replace_tail != 0
+            && self
                 .matches
-                .partition_point(|item| item.row_index < remove_prefix);
-            self.matches.drain(..first_match);
+                .last()
+                .is_some_and(|item| replaced_tail_start <= item.row_index);
+        if self.truncated && (removed_matches != 0 || replacement_touches_indexed_prefix) {
+            return SearchUpdateOutcome::RequiresFullSearch;
+        }
+
+        if remove_prefix != 0 {
+            self.matches.drain(..removed_matches);
             for item in &mut self.matches {
                 item.row_index -= remove_prefix;
             }
@@ -125,6 +142,7 @@ impl SearchIndex {
         if !self.truncated {
             append_matches(self, rows, append_start, matcher, display_options);
         }
+        SearchUpdateOutcome::Applied
     }
 }
 
@@ -241,7 +259,9 @@ mod tests {
         let initial = vec![row("ready 0"), row("idle"), row("ready 2")];
         let mut index = search_rows_with_matcher(&initial, &matcher, DISPLAY_OPTIONS);
 
-        index.apply_display_update(3, 1, 0, &[row("ready 3")], &matcher, DISPLAY_OPTIONS);
+        let outcome =
+            index.apply_display_update(3, 1, 0, &[row("ready 3")], &matcher, DISPLAY_OPTIONS);
+        assert_eq!(outcome, SearchUpdateOutcome::Applied);
         assert_eq!(index.matched_rows, [1, 2]);
         assert_eq!(
             index
@@ -259,8 +279,120 @@ mod tests {
         let initial = vec![row("first"), row("not yet")];
         let mut index = search_rows_with_matcher(&initial, &matcher, DISPLAY_OPTIONS);
 
-        index.apply_display_update(2, 0, 1, &[row("now ok")], &matcher, DISPLAY_OPTIONS);
+        let outcome =
+            index.apply_display_update(2, 0, 1, &[row("now ok")], &matcher, DISPLAY_OPTIONS);
+        assert_eq!(outcome, SearchUpdateOutcome::Applied);
         assert_eq!(index.matched_rows, [1]);
         assert_eq!(index.matches[0].byte_range, 4..6);
+    }
+
+    #[test]
+    fn truncated_update_requests_full_search_after_indexed_matches_are_evicted() {
+        let matcher = SearchMatcher::new("hit", true, false).unwrap().unwrap();
+        let mut index = SearchIndex {
+            matches: vec![
+                SearchMatch {
+                    row_index: 0,
+                    byte_range: 0..3,
+                },
+                SearchMatch {
+                    row_index: 2,
+                    byte_range: 0..3,
+                },
+            ],
+            matched_rows: vec![0, 2],
+            error: None,
+            truncated: true,
+        };
+
+        let outcome =
+            index.apply_display_update(3, 1, 0, &[row("hit new")], &matcher, DISPLAY_OPTIONS);
+
+        assert_eq!(outcome, SearchUpdateOutcome::RequiresFullSearch);
+        assert_eq!(
+            index
+                .matches
+                .iter()
+                .map(|item| item.row_index)
+                .collect::<Vec<_>>(),
+            [0, 2]
+        );
+    }
+
+    #[test]
+    fn truncated_update_keeps_valid_prefix_when_eviction_removes_no_matches() {
+        let matcher = SearchMatcher::new("hit", true, false).unwrap().unwrap();
+        let mut index = SearchIndex {
+            matches: vec![
+                SearchMatch {
+                    row_index: 1,
+                    byte_range: 0..3,
+                },
+                SearchMatch {
+                    row_index: 2,
+                    byte_range: 0..3,
+                },
+            ],
+            matched_rows: vec![1, 2],
+            error: None,
+            truncated: true,
+        };
+
+        let outcome =
+            index.apply_display_update(3, 1, 0, &[row("hit new")], &matcher, DISPLAY_OPTIONS);
+
+        assert_eq!(outcome, SearchUpdateOutcome::Applied);
+        assert_eq!(
+            index
+                .matches
+                .iter()
+                .map(|item| item.row_index)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(index.matched_rows, [0, 1]);
+        assert!(index.truncated);
+    }
+
+    #[test]
+    fn truncated_update_rebuilds_only_when_tail_replacement_touches_indexed_prefix() {
+        let matcher = SearchMatcher::new("hit", true, false).unwrap().unwrap();
+        let make_index = || SearchIndex {
+            matches: vec![
+                SearchMatch {
+                    row_index: 0,
+                    byte_range: 0..3,
+                },
+                SearchMatch {
+                    row_index: 1,
+                    byte_range: 0..3,
+                },
+            ],
+            matched_rows: vec![0, 1],
+            error: None,
+            truncated: true,
+        };
+
+        let mut after_prefix = make_index();
+        let outcome = after_prefix.apply_display_update(
+            4,
+            0,
+            1,
+            &[row("hit tail")],
+            &matcher,
+            DISPLAY_OPTIONS,
+        );
+        assert_eq!(outcome, SearchUpdateOutcome::Applied);
+
+        let mut touching_prefix = make_index();
+        let outcome = touching_prefix.apply_display_update(
+            2,
+            0,
+            1,
+            &[row("hit replacement")],
+            &matcher,
+            DISPLAY_OPTIONS,
+        );
+        assert_eq!(outcome, SearchUpdateOutcome::RequiresFullSearch);
     }
 }
