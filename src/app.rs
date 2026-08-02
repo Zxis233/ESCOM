@@ -44,6 +44,7 @@ mod widgets;
 const FORMAT_DEBOUNCE: Duration = Duration::from_millis(80);
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 const PORT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const WORKER_REPAINT_FALLBACK: Duration = Duration::from_millis(500);
 const NOTICE_DURATION: Duration = Duration::from_secs(6);
 const MAX_HISTORY: usize = 50;
 const MIN_CONTROL_HEIGHT: f32 = 32.0;
@@ -232,7 +233,11 @@ impl EscomApp {
         let store = Arc::new(Mutex::new(ReceiveStore::new(
             preferences.buffer_limit_bytes(),
         )));
-        let worker = WorkerHandle::spawn(Arc::clone(&store));
+        let repaint_context = creation_context.egui_ctx.clone();
+        let worker = WorkerHandle::spawn_with_wake(
+            Arc::clone(&store),
+            Arc::new(move || repaint_context.request_repaint()),
+        );
         let _ = worker.refresh_ports();
         let (background_tx, background_rx) = unbounded();
         let highlight_path = highlight::config_path();
@@ -508,8 +513,12 @@ impl eframe::App for EscomApp {
         self.maybe_start_search(context);
         self.save_preferences_if_due();
 
-        if self.connection.is_connected() {
-            context.request_repaint_after(Duration::from_millis(40));
+        if self.connection.is_disconnected() {
+            context.request_repaint_after(
+                PORT_REFRESH_INTERVAL.saturating_sub(self.last_port_refresh.elapsed()),
+            );
+        } else {
+            context.request_repaint_after(WORKER_REPAINT_FALLBACK);
         }
         if self.preferences_dirty_since.is_some() {
             context.request_repaint_after(Duration::from_millis(750));

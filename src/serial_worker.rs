@@ -15,6 +15,8 @@ const WRITE_SLICE_BYTES: usize = 16 * 1024;
 const DISCONNECTED_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const EMPTY_READ_BACKOFF: Duration = Duration::from_millis(1);
 
+pub type UiWake = Arc<dyn Fn() + Send + Sync + 'static>;
+
 pub trait PortIo: Read + Write + Send {
     fn set_dtr(&mut self, level: bool) -> Result<(), String>;
     fn set_rts(&mut self, level: bool) -> Result<(), String>;
@@ -124,6 +126,27 @@ pub enum WorkerEvent {
     ControlError(String),
 }
 
+struct WorkerNotifier {
+    events: Sender<WorkerEvent>,
+    wake_ui: UiWake,
+}
+
+impl WorkerNotifier {
+    fn new(events: Sender<WorkerEvent>, wake_ui: UiWake) -> Self {
+        Self { events, wake_ui }
+    }
+
+    fn emit(&self, event: WorkerEvent) {
+        if self.events.send(event).is_ok() {
+            self.wake();
+        }
+    }
+
+    fn wake(&self) {
+        (self.wake_ui.as_ref())();
+    }
+}
+
 #[derive(Default)]
 pub struct SerialStats {
     rx_bytes: AtomicU64,
@@ -158,9 +181,21 @@ impl WorkerHandle {
         Self::spawn_with_backend(store, Arc::new(ProductionBackend))
     }
 
+    pub fn spawn_with_wake(store: Arc<Mutex<ReceiveStore>>, wake_ui: UiWake) -> Self {
+        Self::spawn_with_backend_and_wake(store, Arc::new(ProductionBackend), wake_ui)
+    }
+
     pub fn spawn_with_backend(
         store: Arc<Mutex<ReceiveStore>>,
         backend: Arc<dyn SerialBackend>,
+    ) -> Self {
+        Self::spawn_with_backend_and_wake(store, backend, Arc::new(|| {}))
+    }
+
+    pub fn spawn_with_backend_and_wake(
+        store: Arc<Mutex<ReceiveStore>>,
+        backend: Arc<dyn SerialBackend>,
+        wake_ui: UiWake,
     ) -> Self {
         let (command_tx, command_rx) = unbounded();
         let (write_tx, write_rx) = bounded(WRITE_QUEUE_CAPACITY);
@@ -170,7 +205,15 @@ impl WorkerHandle {
         let thread = thread::Builder::new()
             .name("escom-serial".into())
             .spawn(move || {
-                worker_loop(backend, store, command_rx, write_rx, event_tx, worker_stats)
+                worker_loop(
+                    backend,
+                    store,
+                    command_rx,
+                    write_rx,
+                    event_tx,
+                    worker_stats,
+                    wake_ui,
+                )
             })
             .expect("failed to start serial worker");
 
@@ -239,7 +282,9 @@ fn worker_loop(
     write_requests: Receiver<WriteRequest>,
     events: Sender<WorkerEvent>,
     stats: Arc<SerialStats>,
+    wake_ui: UiWake,
 ) {
+    let events = WorkerNotifier::new(events, wake_ui);
     let mut port: Option<Box<dyn PortIo>> = None;
     let mut pending_write: Option<PendingWrite> = None;
     let mut read_buffer = vec![0_u8; 8192];
@@ -305,10 +350,10 @@ fn worker_loop(
             && let Err(error) =
                 write_next_slice(active_port.as_mut(), &mut pending_write, &events, &stats)
         {
-            let _ = events.send(WorkerEvent::PortError(format!("串口写入失败：{error}")));
+            events.emit(WorkerEvent::PortError(format!("串口写入失败：{error}")));
             port = None;
             discard_writes(&mut pending_write, &write_requests);
-            let _ = events.send(WorkerEvent::Closed);
+            events.emit(WorkerEvent::Closed);
             continue;
         }
 
@@ -320,8 +365,14 @@ fn worker_loop(
             Ok(0) => thread::sleep(EMPTY_READ_BACKOFF),
             Ok(count) => {
                 stats.rx_bytes.fetch_add(count as u64, Ordering::Relaxed);
-                if let Ok(mut receive_store) = store.lock() {
+                let appended = if let Ok(mut receive_store) = store.lock() {
                     receive_store.append(Local::now(), read_buffer[..count].to_vec());
+                    true
+                } else {
+                    false
+                };
+                if appended {
+                    events.wake();
                 }
             }
             Err(error)
@@ -330,10 +381,10 @@ fn worker_loop(
                     io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
                 ) => {}
             Err(error) => {
-                let _ = events.send(WorkerEvent::PortError(format!("串口读取失败：{error}")));
+                events.emit(WorkerEvent::PortError(format!("串口读取失败：{error}")));
                 port = None;
                 discard_writes(&mut pending_write, &write_requests);
-                let _ = events.send(WorkerEvent::Closed);
+                events.emit(WorkerEvent::Closed);
             }
         }
     }
@@ -342,7 +393,7 @@ fn worker_loop(
 fn handle_command(
     command: WorkerCommand,
     backend: &Arc<dyn SerialBackend>,
-    events: &Sender<WorkerEvent>,
+    events: &WorkerNotifier,
     stats: &Arc<SerialStats>,
     port: &mut Option<Box<dyn PortIo>>,
     pending_write: &mut Option<PendingWrite>,
@@ -351,10 +402,10 @@ fn handle_command(
     match command {
         WorkerCommand::RefreshPorts => match backend.list_ports() {
             Ok(ports) => {
-                let _ = events.send(WorkerEvent::Ports(ports));
+                events.emit(WorkerEvent::Ports(ports));
             }
             Err(error) => {
-                let _ = events.send(WorkerEvent::ControlError(error));
+                events.emit(WorkerEvent::ControlError(error));
             }
         },
         WorkerCommand::Open(config) => {
@@ -364,11 +415,11 @@ fn handle_command(
                 Ok(opened_port) => {
                     stats.reset();
                     *port = Some(opened_port);
-                    let _ = events.send(WorkerEvent::Opened(config.port_name));
+                    events.emit(WorkerEvent::Opened(config.port_name));
                 }
                 Err(error) => {
-                    let _ = events.send(WorkerEvent::PortError(error));
-                    let _ = events.send(WorkerEvent::Closed);
+                    events.emit(WorkerEvent::PortError(error));
+                    events.emit(WorkerEvent::Closed);
                 }
             }
         }
@@ -376,21 +427,21 @@ fn handle_command(
             discard_writes(pending_write, write_requests);
             let was_open = port.take().is_some();
             if was_open {
-                let _ = events.send(WorkerEvent::Closed);
+                events.emit(WorkerEvent::Closed);
             }
         }
         WorkerCommand::SetDtr(level) => {
             if let Some(active_port) = port.as_mut()
                 && let Err(error) = active_port.set_dtr(level)
             {
-                let _ = events.send(WorkerEvent::ControlError(error));
+                events.emit(WorkerEvent::ControlError(error));
             }
         }
         WorkerCommand::SetRts(level) => {
             if let Some(active_port) = port.as_mut()
                 && let Err(error) = active_port.set_rts(level)
             {
-                let _ = events.send(WorkerEvent::ControlError(error));
+                events.emit(WorkerEvent::ControlError(error));
             }
         }
         WorkerCommand::Shutdown => return true,
@@ -401,7 +452,7 @@ fn handle_command(
 fn write_next_slice(
     port: &mut dyn PortIo,
     pending_write: &mut Option<PendingWrite>,
-    events: &Sender<WorkerEvent>,
+    events: &WorkerNotifier,
     stats: &Arc<SerialStats>,
 ) -> io::Result<()> {
     let Some(pending) = pending_write.as_mut() else {
@@ -412,7 +463,7 @@ fn write_next_slice(
         let id = pending.id;
         let count = pending.bytes.len();
         *pending_write = None;
-        let _ = events.send(WorkerEvent::TxCompleted { id, count });
+        events.emit(WorkerEvent::TxCompleted { id, count });
         return Ok(());
     }
 
@@ -447,7 +498,7 @@ fn write_next_slice(
         let id = pending.id;
         let count = pending.bytes.len();
         *pending_write = None;
-        let _ = events.send(WorkerEvent::TxCompleted { id, count });
+        events.emit(WorkerEvent::TxCompleted { id, count });
     }
     Ok(())
 }
@@ -462,11 +513,11 @@ fn discard_writes(
 
 fn reject_queued_writes(
     write_requests: &Receiver<WriteRequest>,
-    events: &Sender<WorkerEvent>,
+    events: &WorkerNotifier,
     message: &str,
 ) {
     while let Ok(request) = write_requests.try_recv() {
-        let _ = events.send(WorkerEvent::TxFailed {
+        events.emit(WorkerEvent::TxFailed {
             id: request.id,
             message: message.into(),
         });
@@ -675,6 +726,53 @@ mod tests {
     }
 
     #[test]
+    fn worker_wakes_ui_for_events_and_received_data_but_not_idle_reads() {
+        let (read_tx, read_rx) = unbounded();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(MockBackend {
+            opened: AtomicBool::new(false),
+            reads: read_rx,
+            writes,
+        });
+        let store = Arc::new(Mutex::new(ReceiveStore::new(1024)));
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let callback_count = Arc::clone(&wake_count);
+        let mut worker = WorkerHandle::spawn_with_backend_and_wake(
+            Arc::clone(&store),
+            backend,
+            Arc::new(move || {
+                callback_count.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let config = SerialConfig {
+            port_name: "COM3".into(),
+            ..Default::default()
+        };
+
+        worker.open(config).unwrap();
+        wait_for_event(&worker.events, |event| {
+            matches!(event, WorkerEvent::Opened(_))
+        });
+        wait_for_counter_to_exceed(&wake_count, 0);
+
+        let after_open = wake_count.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(wake_count.load(Ordering::SeqCst), after_open);
+
+        read_tx.send(b"incoming".to_vec()).unwrap();
+        wait_for_counter_to_exceed(&wake_count, after_open);
+        assert_eq!(store.lock().unwrap().bytes_len(), 8);
+
+        let after_receive = wake_count.load(Ordering::SeqCst);
+        worker.send(11, b"outgoing".to_vec()).unwrap();
+        wait_for_event(&worker.events, |event| {
+            matches!(event, WorkerEvent::TxCompleted { id: 11, .. })
+        });
+        wait_for_counter_to_exceed(&wake_count, after_receive);
+        worker.shutdown();
+    }
+
+    #[test]
     fn worker_fragments_writes_and_reads_between_slices() {
         let total_bytes = WRITE_SLICE_BYTES * 2 + 23;
         let written_bytes = Arc::new(AtomicUsize::new(0));
@@ -771,5 +869,13 @@ mod tests {
                 return;
             }
         }
+    }
+
+    fn wait_for_counter_to_exceed(counter: &AtomicUsize, previous: usize) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while counter.load(Ordering::SeqCst) <= previous && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(counter.load(Ordering::SeqCst) > previous);
     }
 }
