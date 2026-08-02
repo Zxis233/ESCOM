@@ -160,7 +160,8 @@ fn terminal_printable_key_is_sent_once_without_local_echo() {
         key_event(egui::Key::H, egui::Modifiers::NONE),
         egui::Event::Text("H".into()),
     ];
-    let bytes = terminal_bytes_from_events(&events, TextEncoding::Utf8, LineEnding::CrLf).unwrap();
+    let bytes =
+        terminal_bytes_from_events(&events, TextEncoding::Utf8, egui::Modifiers::NONE).unwrap();
     assert_eq!(bytes, b"H");
 
     let store = ReceiveStore::new(1024);
@@ -176,8 +177,48 @@ fn terminal_special_and_control_keys_map_to_serial_bytes() {
         key_event(egui::Key::ArrowUp, egui::Modifiers::NONE),
         key_event(egui::Key::C, egui::Modifiers::CTRL),
     ];
-    let bytes = terminal_bytes_from_events(&events, TextEncoding::Utf8, LineEnding::CrLf).unwrap();
+    let bytes =
+        terminal_bytes_from_events(&events, TextEncoding::Utf8, egui::Modifiers::NONE).unwrap();
     assert_eq!(bytes, b"\r\x08\x1B[A\x03");
+}
+
+#[test]
+fn terminal_copy_and_cut_events_send_real_control_bytes() {
+    let bytes = terminal_bytes_from_events(
+        &[egui::Event::Copy, egui::Event::Cut],
+        TextEncoding::Utf8,
+        egui::Modifiers::CTRL,
+    )
+    .unwrap();
+    assert_eq!(bytes, [0x03, 0x18]);
+
+    let duplicate_events = [
+        egui::Event::Copy,
+        key_event(egui::Key::C, egui::Modifiers::CTRL),
+        egui::Event::Cut,
+        key_event(egui::Key::X, egui::Modifiers::CTRL),
+    ];
+    let bytes =
+        terminal_bytes_from_events(&duplicate_events, TextEncoding::Utf8, egui::Modifiers::CTRL)
+            .unwrap();
+    assert_eq!(bytes, [0x03, 0x18]);
+}
+
+#[test]
+fn terminal_shifted_copy_and_cut_remain_clipboard_shortcuts() {
+    let modifiers = egui::Modifiers {
+        ctrl: true,
+        shift: true,
+        ..Default::default()
+    };
+    let events = [egui::Event::Copy, egui::Event::Cut];
+
+    let bytes = terminal_bytes_from_events(&events, TextEncoding::Utf8, modifiers).unwrap();
+    assert!(bytes.is_empty());
+
+    let bytes =
+        terminal_bytes_from_events(&events, TextEncoding::Utf8, egui::Modifiers::NONE).unwrap();
+    assert!(bytes.is_empty());
 }
 
 #[test]
@@ -188,7 +229,8 @@ fn terminal_navigation_keys_use_rt_thread_compatible_sequences() {
         key_event(egui::Key::Delete, egui::Modifiers::NONE),
     ];
 
-    let bytes = terminal_bytes_from_events(&events, TextEncoding::Utf8, LineEnding::CrLf).unwrap();
+    let bytes =
+        terminal_bytes_from_events(&events, TextEncoding::Utf8, egui::Modifiers::NONE).unwrap();
     assert_eq!(bytes, b"\x1B[1~\x1B[4~\x1B[3~");
 }
 
@@ -197,7 +239,7 @@ fn terminal_text_respects_selected_encoding() {
     let bytes = terminal_bytes_from_events(
         &[egui::Event::Text("中".into())],
         TextEncoding::Gbk,
-        LineEnding::CrLf,
+        egui::Modifiers::NONE,
     )
     .unwrap();
     assert_eq!(bytes, [0xD6, 0xD0]);
@@ -206,7 +248,7 @@ fn terminal_text_respects_selected_encoding() {
         terminal_bytes_from_events(
             &[egui::Event::Text("🙂".into())],
             TextEncoding::Gbk,
-            LineEnding::CrLf,
+            egui::Modifiers::NONE,
         )
         .is_err()
     );

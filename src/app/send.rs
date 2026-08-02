@@ -148,12 +148,8 @@ impl EscomApp {
             );
         });
 
-        let events = ui.input(|input| input.events.clone());
-        match terminal_bytes_from_events(
-            &events,
-            self.preferences.text_encoding,
-            self.preferences.line_ending,
-        ) {
+        let (events, modifiers) = ui.input(|input| (input.events.clone(), input.modifiers));
+        match terminal_bytes_from_events(&events, self.preferences.text_encoding, modifiers) {
             Ok(bytes) if !bytes.is_empty() => {
                 if let Err(message) = self.queue_terminal_payload(bytes) {
                     self.send_error = Some(message.clone());
@@ -400,14 +396,15 @@ impl EscomApp {
 pub(super) fn terminal_bytes_from_events(
     events: &[egui::Event],
     encoding: TextEncoding,
-    _line_ending: LineEnding,
+    frame_modifiers: egui::Modifiers,
 ) -> Result<Vec<u8>, String> {
-    let has_copy = events
-        .iter()
-        .any(|event| matches!(event, egui::Event::Copy));
     let has_paste = events
         .iter()
         .any(|event| matches!(event, egui::Event::Paste(_)));
+    let has_ctrl_c_key = has_pressed_control_key(events, egui::Key::C);
+    let has_ctrl_x_key = has_pressed_control_key(events, egui::Key::X);
+    let clipboard_event_is_control =
+        frame_modifiers.ctrl && !frame_modifiers.alt && !frame_modifiers.shift;
     let text_contains_tab = events
         .iter()
         .any(|event| matches!(event, egui::Event::Text(text) if text.contains('\t')));
@@ -415,6 +412,14 @@ pub(super) fn terminal_bytes_from_events(
 
     for event in events {
         match event {
+            // egui-winit translates Ctrl+C/Ctrl+X into Copy/Cut before emitting a Key event.
+            // Treat those events as terminal controls while the unmodified Ctrl key is held.
+            egui::Event::Copy if clipboard_event_is_control && !has_ctrl_c_key => {
+                bytes.push(0x03);
+            }
+            egui::Event::Cut if clipboard_event_is_control && !has_ctrl_x_key => {
+                bytes.push(0x18);
+            }
             egui::Event::Text(text) | egui::Event::Paste(text) => {
                 append_terminal_text(&mut bytes, text, encoding)?;
             }
@@ -428,7 +433,10 @@ pub(super) fn terminal_bytes_from_events(
                 ..
             } => {
                 if modifiers.ctrl && !modifiers.alt {
-                    if (*key == egui::Key::C && has_copy) || (*key == egui::Key::V && has_paste) {
+                    if (*key == egui::Key::C || *key == egui::Key::X) && modifiers.shift {
+                        continue;
+                    }
+                    if *key == egui::Key::V && has_paste {
                         continue;
                     }
                     if let Some(byte) = terminal_control_byte(*key) {
@@ -461,6 +469,20 @@ pub(super) fn terminal_bytes_from_events(
         }
     }
     Ok(bytes)
+}
+
+fn has_pressed_control_key(events: &[egui::Event], expected: egui::Key) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } if *key == expected && modifiers.ctrl && !modifiers.alt && !modifiers.shift
+        )
+    })
 }
 
 pub(super) fn append_terminal_text(
