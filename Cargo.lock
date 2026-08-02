@@ -1160,7 +1160,7 @@ checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
 name = "escom"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "chrono",
  "crossbeam-channel",

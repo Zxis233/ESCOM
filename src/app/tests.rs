@@ -1,4 +1,4 @@
-use super::receive::receive_row_layout_job;
+use super::receive::{receive_row_layout_job, virtual_rows_content_height};
 use super::send::{history_preview, terminal_bytes_from_events};
 use super::settings_ui::{
     centered_window_position, cover_uv, format_background_opacity, local_background_uri,
@@ -129,6 +129,59 @@ fn receive_row_layout_combines_rule_and_search_highlights() {
         assert_eq!(job.sections[1].format.background, rule_background);
         assert_ne!(job.sections[1].format.underline, egui::Stroke::NONE);
     });
+}
+
+fn assert_virtual_scroll_reaches_bottom(row_height: f32, line_spacing: f32, row_count: usize) {
+    let requested_offset = virtual_rows_content_height(row_height, line_spacing, row_count);
+    assert!(requested_offset.is_finite());
+
+    egui::__run_test_ui(|ui| {
+        ui.set_width(320.0);
+        ui.set_height(128.0);
+        ui.spacing_mut().item_spacing.y = line_spacing;
+        let mut rendered_range = 0..0;
+        let output = egui::ScrollArea::vertical()
+            .id_salt("bottom_scroll_test")
+            .max_height(128.0)
+            .auto_shrink([false, false])
+            .vertical_scroll_offset(requested_offset)
+            .show_rows(ui, row_height, row_count, |ui, range| {
+                rendered_range = range.clone();
+                for _ in range {
+                    ui.allocate_space(egui::vec2(1.0, row_height));
+                }
+            });
+
+        assert!(rendered_range.contains(&(row_count - 1)));
+        assert_eq!(rendered_range.end, row_count);
+        assert!(output.state.offset.y.is_finite());
+        assert!(output.content_size.y.is_finite());
+    });
+}
+
+#[test]
+fn receive_bottom_scroll_reaches_last_row_in_normal_view() {
+    assert_virtual_scroll_reaches_bottom(18.0, 3.0, 250);
+}
+
+#[test]
+fn receive_bottom_scroll_uses_filtered_visible_row_count() {
+    let all_rows_offset = virtual_rows_content_height(18.0, 3.0, 10_000);
+    let filtered_rows = 73;
+    let filtered_offset = virtual_rows_content_height(18.0, 3.0, filtered_rows);
+
+    assert!(filtered_offset < all_rows_offset);
+    assert_virtual_scroll_reaches_bottom(18.0, 3.0, filtered_rows);
+}
+
+#[test]
+fn receive_bottom_scroll_reaches_last_row_with_large_font() {
+    assert_virtual_scroll_reaches_bottom(48.0, 3.0, 80);
+}
+
+#[test]
+fn receive_bottom_scroll_reaches_last_row_with_large_line_spacing() {
+    assert_virtual_scroll_reaches_bottom(18.0, 24.0, 120);
 }
 
 #[test]

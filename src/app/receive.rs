@@ -298,9 +298,9 @@ impl EscomApp {
             return;
         }
 
-        let row_height = self.preferences.data_font_size + 7.0;
         let line_spacing = self.preferences.data_line_spacing;
         let data_font = FontId::new(self.preferences.data_font_size, data_font_family());
+        let row_height = ui.fonts_mut(|fonts| fonts.row_height(&data_font)).max(1.0);
         let rows = Arc::clone(&self.display_rows);
         let timestamps = self.preferences.timestamps;
         let timestamp_format = self.preferences.timestamp_format.clone();
@@ -341,7 +341,11 @@ impl EscomApp {
             .auto_shrink([false, false])
             .stick_to_bottom(self.preferences.auto_scroll && self.search_query.is_empty());
         if self.force_scroll_bottom {
-            scroll_area = scroll_area.vertical_scroll_offset(f32::INFINITY);
+            scroll_area = scroll_area.vertical_scroll_offset(virtual_rows_content_height(
+                row_height,
+                line_spacing,
+                visible_row_count,
+            ));
             self.force_scroll_bottom = false;
         } else if let Some(visible_row) = self.search_scroll_to_row.take() {
             scroll_area = scroll_area
@@ -475,6 +479,25 @@ impl EscomApp {
             .lock()
             .map(|store| store.bytes_len())
             .unwrap_or(0)
+    }
+}
+
+pub(super) fn virtual_rows_content_height(
+    row_height: f32,
+    line_spacing: f32,
+    row_count: usize,
+) -> f32 {
+    if row_count == 0 || !row_height.is_finite() || !line_spacing.is_finite() {
+        return 0.0;
+    }
+
+    let row_height = row_height.max(0.0);
+    let line_spacing = line_spacing.max(0.0);
+    let height = (row_height + line_spacing).mul_add(row_count as f32, -line_spacing);
+    if height.is_finite() {
+        height.max(0.0)
+    } else {
+        0.0
     }
 }
 
