@@ -127,10 +127,9 @@ struct PendingWrite {
 pub enum WorkerEvent {
     Ports(Vec<String>),
     Opened(String),
-    Closed,
+    Closed { error: Option<String> },
     TxCompleted { id: u64, count: usize },
     TxFailed { id: u64, message: String },
-    PortError(String),
     ControlError(String),
 }
 
@@ -361,10 +360,11 @@ fn worker_loop(
                 write_next_slice(active_port.as_mut(), &mut pending_write, &events, &stats)
         {
             log::error!(target: "escom::serial", "serial write failed: {error}");
-            events.emit(WorkerEvent::PortError(format!("串口写入失败：{error}")));
             port = None;
             discard_writes(&mut pending_write, &write_requests);
-            events.emit(WorkerEvent::Closed);
+            events.emit(WorkerEvent::Closed {
+                error: Some(format!("串口写入失败：{error}")),
+            });
             continue;
         }
 
@@ -393,10 +393,11 @@ fn worker_loop(
                 ) => {}
             Err(error) => {
                 log::error!(target: "escom::serial", "serial read failed: {error}");
-                events.emit(WorkerEvent::PortError(format!("串口读取失败：{error}")));
                 port = None;
                 discard_writes(&mut pending_write, &write_requests);
-                events.emit(WorkerEvent::Closed);
+                events.emit(WorkerEvent::Closed {
+                    error: Some(format!("串口读取失败：{error}")),
+                });
             }
         }
     }
@@ -439,8 +440,7 @@ fn handle_command(
                 }
                 Err(error) => {
                     log::error!(target: "escom::serial", "port open failed: {error}");
-                    events.emit(WorkerEvent::PortError(error));
-                    events.emit(WorkerEvent::Closed);
+                    events.emit(WorkerEvent::Closed { error: Some(error) });
                 }
             }
         }
@@ -449,7 +449,7 @@ fn handle_command(
             let was_open = port.take().is_some();
             if was_open {
                 log::info!(target: "escom::serial", "port closed by user");
-                events.emit(WorkerEvent::Closed);
+                events.emit(WorkerEvent::Closed { error: None });
             }
         }
         WorkerCommand::SetDtr(level) => {
@@ -583,6 +583,18 @@ mod tests {
                 pending: VecDeque::new(),
                 writes: Arc::clone(&self.writes),
             }))
+        }
+    }
+
+    struct FailingOpenBackend;
+
+    impl SerialBackend for FailingOpenBackend {
+        fn list_ports(&self) -> Result<Vec<String>, String> {
+            Ok(vec!["COM3".into()])
+        }
+
+        fn open(&self, config: &SerialConfig) -> Result<Box<dyn PortIo>, String> {
+            Err(format!("打开 {} 失败：端口被占用", config.port_name))
         }
     }
 
@@ -750,6 +762,33 @@ mod tests {
     }
 
     #[test]
+    fn open_failure_is_reported_by_one_error_close_event() {
+        let store = Arc::new(Mutex::new(ReceiveStore::new(1024)));
+        let mut worker = WorkerHandle::spawn_with_backend(store, Arc::new(FailingOpenBackend));
+        let config = SerialConfig {
+            port_name: "COM3".into(),
+            ..Default::default()
+        };
+
+        worker.open(config).unwrap();
+        let event = worker
+            .events
+            .recv_timeout(Duration::from_secs(1))
+            .expect("open failure event");
+        match event {
+            WorkerEvent::Closed { error: Some(error) } => {
+                assert_eq!(error, "打开 COM3 失败：端口被占用");
+            }
+            other => panic!("unexpected worker event: {other:?}"),
+        }
+        assert!(matches!(
+            worker.events.recv_timeout(Duration::from_millis(20)),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+        ));
+        worker.shutdown();
+    }
+
+    #[test]
     fn worker_wakes_ui_for_events_and_received_data_but_not_idle_reads() {
         let (read_tx, read_rx) = unbounded();
         let writes = Arc::new(Mutex::new(Vec::new()));
@@ -879,7 +918,9 @@ mod tests {
         assert!(written_bytes.load(Ordering::SeqCst) > 0);
 
         worker.close().unwrap();
-        wait_for_event(&worker.events, |event| matches!(event, WorkerEvent::Closed));
+        wait_for_event(&worker.events, |event| {
+            matches!(event, WorkerEvent::Closed { error: None })
+        });
         assert!(written_bytes.load(Ordering::SeqCst) < total_bytes);
         worker.shutdown();
     }

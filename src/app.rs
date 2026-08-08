@@ -360,12 +360,15 @@ impl EscomApp {
                     }
                     self.set_notice(format!("已连接 {port_name}"), false);
                 }
-                WorkerEvent::Closed => {
+                WorkerEvent::Closed { error } => {
                     let was_active = !self.connection.is_disconnected();
                     self.connection = ConnectionState::Disconnected;
                     self.repeat = None;
                     self.pending_history.clear();
-                    if was_active {
+                    if let Some(message) = error {
+                        self.send_error = Some(message.clone());
+                        self.set_notice(message, true);
+                    } else if was_active {
                         self.set_notice("串口已断开", false);
                     }
                 }
@@ -380,11 +383,6 @@ impl EscomApp {
                 }
                 WorkerEvent::TxFailed { id, message } => {
                     self.pending_history.remove(&id);
-                    self.repeat = None;
-                    self.send_error = Some(message.clone());
-                    self.set_notice(message, true);
-                }
-                WorkerEvent::PortError(message) => {
                     self.repeat = None;
                     self.send_error = Some(message.clone());
                     self.set_notice(message, true);
