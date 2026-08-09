@@ -13,7 +13,10 @@ const MAX_TERMINAL_ROWS: usize = 100_000;
 const MAX_TERMINAL_COLUMNS: usize = 512 * 1024;
 // Bound fresh storage requested by one CSI dispatch without restricting access to existing cells.
 const MAX_CSI_CELL_GROWTH: usize = 4 * 1024;
-const MAX_CSI_LINE_GROWTH: usize = 1024;
+// Bound fresh row changes requested by one CSI dispatch. L/M/S/T also share an update budget.
+const MAX_CSI_LINE_CHANGE_PER_DISPATCH: usize = 1024;
+const MAX_CSI_LINE_WORK_PER_UPDATE: usize = 4 * MAX_TERMINAL_ROWS;
+const MIN_CSI_LINE_DISPATCH_WORK: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TerminalRow {
@@ -167,6 +170,7 @@ struct TerminalScreen {
     max_rows: usize,
     max_line_cells: usize,
     csi_limited: bool,
+    csi_line_work_remaining: usize,
 }
 
 impl Default for TerminalScreen {
@@ -185,6 +189,7 @@ impl Default for TerminalScreen {
             max_rows: MAX_TERMINAL_ROWS,
             max_line_cells: MAX_TERMINAL_COLUMNS,
             csi_limited: false,
+            csi_line_work_remaining: MAX_CSI_LINE_WORK_PER_UPDATE,
         }
     }
 }
@@ -198,6 +203,7 @@ impl TerminalScreen {
         self.max_rows = max_rows;
         self.max_line_cells = max_line_bytes.min(max_text_bytes).max(1);
         self.csi_limited = false;
+        self.csi_line_work_remaining = MAX_CSI_LINE_WORK_PER_UPDATE;
     }
 
     fn rendered_len(&self) -> usize {
@@ -345,7 +351,7 @@ impl TerminalScreen {
         let allocation_limit = self
             .lines
             .len()
-            .saturating_add(MAX_CSI_LINE_GROWTH)
+            .saturating_add(MAX_CSI_LINE_CHANGE_PER_DISPATCH)
             .saturating_sub(1);
         let target = row
             .min(self.max_rows.saturating_sub(1))
@@ -376,6 +382,31 @@ impl TerminalScreen {
         current_len
             .saturating_add(MAX_CSI_CELL_GROWTH)
             .min(self.max_line_cells)
+    }
+
+    fn limit_csi_line_count(&mut self, requested: usize) -> usize {
+        let count = requested.min(MAX_CSI_LINE_CHANGE_PER_DISPATCH);
+        self.csi_limited |= count != requested;
+        count
+    }
+
+    fn claim_csi_line_work(&mut self, estimated_work: usize) -> bool {
+        let estimated_work = estimated_work.max(MIN_CSI_LINE_DISPATCH_WORK);
+        let Some(remaining) = self.csi_line_work_remaining.checked_sub(estimated_work) else {
+            self.csi_limited = true;
+            return false;
+        };
+        self.csi_line_work_remaining = remaining;
+        true
+    }
+
+    fn truncate_lines(&mut self, len: usize) -> bool {
+        if len >= self.lines.len() {
+            return false;
+        }
+        let removed_bytes = self.lines.drain(len..).map(|line| line.byte_len).sum();
+        self.text_bytes = self.text_bytes.saturating_sub(removed_bytes);
+        true
     }
 
     fn erase_line(&mut self, mode: usize) {
@@ -496,33 +527,57 @@ impl TerminalScreen {
 
     fn insert_lines(&mut self, count: usize) {
         self.ensure_line(self.cursor_row);
+        let limited_count = self.limit_csi_line_count(count);
+        let count = limited_count.min(self.max_rows.saturating_sub(self.cursor_row));
+        self.csi_limited |= count != limited_count;
+        if count == 0 {
+            return;
+        }
+
+        let retained_len = self.lines.len().min(self.max_rows.saturating_sub(count));
+        let rows_to_relocate = self
+            .lines
+            .len()
+            .saturating_add(retained_len.saturating_sub(self.cursor_row))
+            .saturating_add(count);
+        if !self.claim_csi_line_work(rows_to_relocate) {
+            return;
+        }
+
         self.mark_dirty(self.cursor_row);
-        let requested = count;
-        let count = count.min(MAX_CSI_LINE_GROWTH).min(self.max_rows);
-        self.csi_limited |= count != requested;
-        let additional_capacity = count.min(self.max_rows.saturating_sub(self.lines.len()));
-        self.lines.reserve_exact(additional_capacity);
-        for _ in 0..count {
-            if self.lines.len() >= self.max_rows
-                && let Some(removed) = self.lines.pop_back()
-            {
-                self.text_bytes = self.text_bytes.saturating_sub(removed.byte_len);
-                self.csi_limited = true;
-            }
-            self.lines.insert(self.cursor_row, TerminalLine::default());
+        if self.truncate_lines(retained_len) {
+            self.csi_limited = true;
+        }
+        let old_len = self.lines.len();
+        self.lines
+            .resize_with(old_len.saturating_add(count), TerminalLine::default);
+        if old_len > self.cursor_row {
+            self.lines.make_contiguous()[self.cursor_row..].rotate_right(count);
         }
     }
 
     fn delete_lines(&mut self, count: usize) {
         self.ensure_line(self.cursor_row);
-        self.mark_dirty(self.cursor_row);
-        for _ in 0..count {
-            if self.cursor_row < self.lines.len()
-                && let Some(removed) = self.lines.remove(self.cursor_row)
-            {
-                self.text_bytes = self.text_bytes.saturating_sub(removed.byte_len);
-            }
+        let count = self
+            .limit_csi_line_count(count)
+            .min(self.lines.len().saturating_sub(self.cursor_row));
+        if count == 0 {
+            return;
         }
+
+        let estimated_work = self.lines.len().saturating_add(count);
+        if !self.claim_csi_line_work(estimated_work) {
+            return;
+        }
+
+        self.mark_dirty(self.cursor_row);
+        let end = self.cursor_row.saturating_add(count);
+        let removed_bytes = self
+            .lines
+            .drain(self.cursor_row..end)
+            .map(|line| line.byte_len)
+            .sum();
+        self.text_bytes = self.text_bytes.saturating_sub(removed_bytes);
         if self.lines.is_empty() {
             self.lines.push_back(TerminalLine::default());
         }
@@ -530,29 +585,42 @@ impl TerminalScreen {
     }
 
     fn scroll_up(&mut self, count: usize) {
-        for _ in 0..count.min(self.lines.len()) {
-            self.remove_front();
+        let count = self.limit_csi_line_count(count).min(self.lines.len());
+        if count != 0 && self.claim_csi_line_work(count) {
+            self.remove_front_lines(count);
         }
         self.ensure_line(self.cursor_row);
     }
 
     fn scroll_down(&mut self, count: usize) {
-        self.mark_dirty(0);
-        let requested = count;
-        let count = count.min(MAX_CSI_LINE_GROWTH).min(self.max_rows);
-        self.csi_limited |= count != requested;
-        let additional_capacity = count.min(self.max_rows.saturating_sub(self.lines.len()));
-        self.lines.reserve_exact(additional_capacity);
-        for _ in 0..count {
-            if self.lines.len() >= self.max_rows
-                && let Some(removed) = self.lines.pop_back()
-            {
-                self.text_bytes = self.text_bytes.saturating_sub(removed.byte_len);
-                self.csi_limited = true;
-            }
-            self.lines.push_front(TerminalLine::default());
-            self.cursor_row = self.cursor_row.saturating_add(1).min(self.max_rows - 1);
+        let limited_count = self.limit_csi_line_count(count);
+        let count = limited_count.min(self.max_rows);
+        self.csi_limited |= count != limited_count;
+        if count == 0 {
+            return;
         }
+
+        let retained_len = self.lines.len().min(self.max_rows.saturating_sub(count));
+        let rows_to_relocate = self
+            .lines
+            .len()
+            .saturating_add(retained_len)
+            .saturating_add(count);
+        if !self.claim_csi_line_work(rows_to_relocate) {
+            return;
+        }
+
+        self.mark_dirty(0);
+        if self.truncate_lines(retained_len) {
+            self.csi_limited = true;
+        }
+        let old_len = self.lines.len();
+        self.lines
+            .resize_with(old_len.saturating_add(count), TerminalLine::default);
+        if old_len != 0 {
+            self.lines.rotate_right(count);
+        }
+        self.cursor_row = self.cursor_row.saturating_add(count).min(self.max_rows - 1);
     }
 
     fn reverse_index(&mut self) {
@@ -586,20 +654,25 @@ impl TerminalScreen {
     }
 
     fn remove_front(&mut self) {
-        let rendered_before = self.rendered_len();
-        let Some(removed) = self.lines.pop_front() else {
+        self.remove_front_lines(1);
+    }
+
+    fn remove_front_lines(&mut self, count: usize) {
+        let count = count.min(self.lines.len());
+        if count == 0 {
             return;
-        };
-        self.text_bytes = self.text_bytes.saturating_sub(removed.byte_len);
-        if rendered_before != 0 {
-            self.removed_front = self.removed_front.saturating_add(1);
         }
-        self.cursor_row = self.cursor_row.saturating_sub(1);
+
+        let rendered_removed = count.min(self.rendered_len());
+        let removed_bytes = self.lines.drain(..count).map(|line| line.byte_len).sum();
+        self.text_bytes = self.text_bytes.saturating_sub(removed_bytes);
+        self.removed_front = self.removed_front.saturating_add(rendered_removed);
+        self.cursor_row = self.cursor_row.saturating_sub(count);
         if let Some((row, col)) = self.saved_cursor {
-            self.saved_cursor = Some((row.saturating_sub(1), col));
+            self.saved_cursor = Some((row.saturating_sub(count), col));
         }
-        self.dirty_from = self.dirty_from.map(|row| row.saturating_sub(1));
-        self.byte_dirty_from = self.byte_dirty_from.map(|row| row.saturating_sub(1));
+        self.dirty_from = self.dirty_from.map(|row| row.saturating_sub(count));
+        self.byte_dirty_from = self.byte_dirty_from.map(|row| row.saturating_sub(count));
     }
 
     fn enforce_limits(
@@ -793,6 +866,28 @@ mod tests {
         formatter.apply_chunks(chunks, 100, 4096, 1024)
     }
 
+    fn terminal_line(text: &str) -> TerminalLine {
+        TerminalLine {
+            cells: text.chars().collect(),
+            completed: true,
+            byte_len: text.len(),
+            ..TerminalLine::default()
+        }
+    }
+
+    fn screen_with_lines(lines: &[&str], max_rows: usize, cursor_row: usize) -> TerminalScreen {
+        let mut screen = TerminalScreen::default();
+        screen.begin_update(max_rows, 4096, 1024);
+        screen.lines = lines.iter().map(|line| terminal_line(line)).collect();
+        screen.text_bytes = lines.iter().map(|line| line.len()).sum();
+        screen.cursor_row = cursor_row;
+        screen
+    }
+
+    fn screen_texts(screen: &TerminalScreen) -> Vec<String> {
+        screen.lines.iter().map(TerminalLine::text).collect()
+    }
+
     #[test]
     fn rt_thread_history_redraw_replaces_the_current_line() {
         let mut formatter = IncrementalTerminalFormatter::new(TextEncoding::Utf8);
@@ -891,6 +986,124 @@ mod tests {
         let mut formatter = IncrementalTerminalFormatter::new(TextEncoding::Utf8);
         formatter.apply_chunks(&[chunk(0, 1, b"\x1b[65535;65535HX")], 10, 64, 64);
         assert!(formatter.is_limited());
+    }
+
+    #[test]
+    fn csi_line_operations_batch_changes_and_preserve_screen_accounting() {
+        let mut screen = screen_with_lines(&["a", "bb", "ccc", "dddd"], 5, 1);
+        screen.saved_cursor = Some((3, 2));
+
+        screen.insert_lines(2);
+        assert_eq!(screen_texts(&screen), ["a", "", "", "bb", "ccc"]);
+        assert_eq!(screen.text_bytes, 6);
+        assert_eq!(screen.cursor_row, 1);
+        assert_eq!(screen.saved_cursor, Some((3, 2)));
+
+        screen.delete_lines(2);
+        assert_eq!(screen_texts(&screen), ["a", "bb", "ccc"]);
+        assert_eq!(screen.text_bytes, 6);
+
+        screen.scroll_down(1);
+        assert_eq!(screen_texts(&screen), ["", "a", "bb", "ccc"]);
+        assert_eq!(screen.text_bytes, 6);
+        assert_eq!(screen.cursor_row, 2);
+
+        screen.scroll_up(2);
+        assert_eq!(screen_texts(&screen), ["bb", "ccc"]);
+        assert_eq!(screen.text_bytes, 5);
+        assert_eq!(screen.cursor_row, 0);
+        assert_eq!(screen.saved_cursor, Some((1, 2)));
+        assert_eq!(screen.removed_front, 2);
+    }
+
+    #[test]
+    fn large_csi_line_counts_are_capped_per_dispatch() {
+        let mut insert_screen = TerminalScreen::default();
+        insert_screen.begin_update(2_000, 4096, 1024);
+        insert_screen.lines.push_back(TerminalLine::default());
+        insert_screen.insert_lines(usize::MAX);
+        assert_eq!(
+            insert_screen.lines.len(),
+            1 + MAX_CSI_LINE_CHANGE_PER_DISPATCH
+        );
+        assert!(insert_screen.csi_limited);
+
+        let mut delete_screen = TerminalScreen::default();
+        delete_screen.begin_update(2_000, 4096, 1024);
+        delete_screen
+            .lines
+            .resize_with(1_500, TerminalLine::default);
+        delete_screen.delete_lines(usize::MAX);
+        assert_eq!(
+            delete_screen.lines.len(),
+            1_500 - MAX_CSI_LINE_CHANGE_PER_DISPATCH
+        );
+        assert!(delete_screen.csi_limited);
+
+        let mut scroll_screen = TerminalScreen::default();
+        scroll_screen.begin_update(2_000, 4096, 1024);
+        scroll_screen
+            .lines
+            .resize_with(1_500, TerminalLine::default);
+        scroll_screen.scroll_up(usize::MAX);
+        assert_eq!(
+            scroll_screen.lines.len(),
+            1_500 - MAX_CSI_LINE_CHANGE_PER_DISPATCH
+        );
+        assert!(scroll_screen.csi_limited);
+
+        let mut scroll_down_screen = TerminalScreen::default();
+        scroll_down_screen.begin_update(2_000, 4096, 1024);
+        scroll_down_screen.lines.push_back(TerminalLine::default());
+        scroll_down_screen.scroll_down(usize::MAX);
+        assert_eq!(
+            scroll_down_screen.lines.len(),
+            1 + MAX_CSI_LINE_CHANGE_PER_DISPATCH
+        );
+        assert!(scroll_down_screen.csi_limited);
+    }
+
+    #[test]
+    fn repeated_short_csi_line_edits_stop_at_the_update_work_budget() {
+        let mut parser = Parser::new();
+        let mut screen = screen_with_lines(&["a", "b", "c"], 10, 1);
+        screen.csi_line_work_remaining = MIN_CSI_LINE_DISPATCH_WORK;
+
+        parser.advance(&mut screen, b"\x1b[L\x1b[L");
+
+        assert_eq!(screen_texts(&screen), ["a", "", "b", "c"]);
+        assert_eq!(screen.csi_line_work_remaining, 0);
+        assert!(screen.csi_limited);
+
+        screen.begin_update(10, 4096, 1024);
+        parser.advance(&mut screen, b"\x1b[L");
+        assert_eq!(screen_texts(&screen), ["a", "", "", "b", "c"]);
+    }
+
+    #[test]
+    fn batched_csi_line_edits_keep_incremental_updates_consistent() {
+        let mut formatter = IncrementalTerminalFormatter::new(TextEncoding::Utf8);
+        let mut rows = apply(&mut formatter, &[chunk(0, 1, b"a\r\nb\r\nc")]).rows;
+
+        let inserted = apply(&mut formatter, &[chunk(1, 2, b"\x1b[1A\x1b[L\rX")]);
+        assert_eq!(inserted.remove_prefix, 0);
+        assert_eq!(inserted.replace_tail, 2);
+        rows.truncate(rows.len() - inserted.replace_tail);
+        rows.extend(inserted.rows);
+        assert_eq!(
+            rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+            ["a", "X", "b", "c"]
+        );
+
+        let deleted = apply(&mut formatter, &[chunk(2, 3, b"\x1b[M")]);
+        assert_eq!(deleted.remove_prefix, 0);
+        assert_eq!(deleted.replace_tail, 3);
+        rows.truncate(rows.len() - deleted.replace_tail);
+        rows.extend(deleted.rows);
+        assert_eq!(
+            rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
     }
 
     #[test]
