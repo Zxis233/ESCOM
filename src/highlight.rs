@@ -248,8 +248,15 @@ fn parse_optional_color(
 }
 
 fn parse_color(value: &str) -> Option<Color32> {
-    let hex = value.trim().strip_prefix('#')?;
-    let parse_pair = |start: usize| u8::from_str_radix(&hex[start..start + 2], 16).ok();
+    let hex = value.trim().strip_prefix('#')?.as_bytes();
+    if !matches!(hex.len(), 6 | 8) || !hex.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+
+    let parse_pair = |start: usize| {
+        let pair = std::str::from_utf8(hex.get(start..start + 2)?).ok()?;
+        u8::from_str_radix(pair, 16).ok()
+    };
     match hex.len() {
         6 => Some(Color32::from_rgb(
             parse_pair(0)?,
@@ -349,5 +356,26 @@ mod tests {
                 .unwrap_err()
                 .contains("#RRGGBB")
         );
+    }
+
+    #[test]
+    fn unicode_colors_are_rejected_without_panicking() {
+        for color in ["#红红", "#红红ab"] {
+            let source = format!(
+                r##"
+                    version = 1
+                    [[rules]]
+                    name = "unicode color"
+                    pattern = "x"
+                    foreground = "{color}"
+                "##
+            );
+
+            let error = compile_config(PathBuf::new(), &source).unwrap_err();
+            assert!(
+                error.contains("#RRGGBB"),
+                "unexpected error for {color}: {error}"
+            );
+        }
     }
 }
