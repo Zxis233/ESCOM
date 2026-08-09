@@ -137,6 +137,7 @@ enum HighlightConfigAction {
 
 pub struct EscomApp {
     preferences: UiPreferences,
+    settings_persistence: settings::SettingsPersistence,
     serial_config: SerialConfig,
     baud_rate_input: String,
     connection: ConnectionState,
@@ -195,7 +196,11 @@ pub struct EscomApp {
 
 impl EscomApp {
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
-        let (mut preferences, settings_warning) = settings::load();
+        let settings::LoadedSettings {
+            mut preferences,
+            warning: settings_warning,
+            persistence: settings_persistence,
+        } = settings::load();
         preferences.sanitize();
         egui_extras::install_image_loaders(&creation_context.egui_ctx);
         creation_context
@@ -264,6 +269,7 @@ impl EscomApp {
 
         Self {
             preferences,
+            settings_persistence,
             serial_config,
             baud_rate_input,
             connection: ConnectionState::Disconnected,
@@ -466,6 +472,13 @@ impl EscomApp {
     }
 
     fn mark_preferences_dirty(&mut self) {
+        if !self.settings_persistence.automatic_save_allowed() {
+            self.set_notice(
+                "当前配置文件无法安全读取；为保护原文件，本次修改不会保存，请修复配置后重启 ESCOM",
+                true,
+            );
+            return;
+        }
         self.preferences_dirty_since = Some(Instant::now());
     }
 
@@ -476,8 +489,12 @@ impl EscomApp {
         if dirty_since.elapsed() < Duration::from_millis(750) {
             return;
         }
-        match settings::save(&self.preferences) {
-            Ok(()) => self.preferences_dirty_since = None,
+        match self.settings_persistence.save(&self.preferences) {
+            Ok(settings::SettingsSaveOutcome::Saved) => self.preferences_dirty_since = None,
+            Ok(settings::SettingsSaveOutcome::SkippedToProtectInvalidConfig) => {
+                self.preferences_dirty_since = None;
+                self.set_notice("为保护无法读取的配置文件，本次运行不会保存设置", true);
+            }
             Err(message) => {
                 self.preferences_dirty_since = None;
                 log::error!(target: "escom::settings", "preference save failed: {message}");
@@ -526,8 +543,17 @@ impl eframe::App for EscomApp {
 
 impl Drop for EscomApp {
     fn drop(&mut self) {
-        if let Err(error) = settings::save(&self.preferences) {
-            log::error!(target: "escom::settings", "final preference save failed: {error}");
+        match self.settings_persistence.save(&self.preferences) {
+            Ok(settings::SettingsSaveOutcome::Saved) => {}
+            Ok(settings::SettingsSaveOutcome::SkippedToProtectInvalidConfig) => {
+                log::warn!(
+                    target: "escom::settings",
+                    "skipped final preference save to preserve an unreadable configuration file"
+                );
+            }
+            Err(error) => {
+                log::error!(target: "escom::settings", "final preference save failed: {error}");
+            }
         }
         self.worker.shutdown();
     }

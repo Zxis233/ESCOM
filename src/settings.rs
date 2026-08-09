@@ -142,6 +142,70 @@ impl UiPreferences {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsSaveOutcome {
+    Saved,
+    SkippedToProtectInvalidConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct SettingsPersistence {
+    path: PathBuf,
+    automatic_save_allowed: bool,
+}
+
+impl SettingsPersistence {
+    pub const fn automatic_save_allowed(&self) -> bool {
+        self.automatic_save_allowed
+    }
+
+    pub fn save(&self, preferences: &UiPreferences) -> Result<SettingsSaveOutcome, String> {
+        if !self.automatic_save_allowed {
+            return Ok(SettingsSaveOutcome::SkippedToProtectInvalidConfig);
+        }
+
+        if let Some(directory) = self.path.parent() {
+            prepare_storage_at(directory)
+                .map_err(|error| format!("初始化配置目录失败：{error}"))?;
+        }
+        save_to(&self.path, preferences).map_err(|error| format!("保存设置失败：{error}"))?;
+        Ok(SettingsSaveOutcome::Saved)
+    }
+}
+
+pub struct LoadedSettings {
+    pub preferences: UiPreferences,
+    pub warning: Option<String>,
+    pub persistence: SettingsPersistence,
+}
+
+const PROTECTED_CONFIG_NOTICE: &str =
+    "为保护无法读取的配置文件，本次运行不会自动保存设置；请修复或移走该文件后重启 ESCOM";
+
+fn loaded_settings(
+    path: &Path,
+    preferences: UiPreferences,
+    warning: Option<String>,
+    automatic_save_allowed: bool,
+) -> LoadedSettings {
+    let warning = if automatic_save_allowed {
+        warning
+    } else {
+        Some(match warning {
+            Some(warning) => format!("{warning}；{PROTECTED_CONFIG_NOTICE}"),
+            None => PROTECTED_CONFIG_NOTICE.to_owned(),
+        })
+    };
+    LoadedSettings {
+        preferences,
+        warning,
+        persistence: SettingsPersistence {
+            path: path.to_path_buf(),
+            automatic_save_allowed,
+        },
+    }
+}
+
 fn sanitized_opacity(value: f32, fallback: f32) -> f32 {
     if value.is_finite() {
         value.clamp(0.0, 1.0)
@@ -415,19 +479,17 @@ pub fn prepare_storage() -> io::Result<()> {
     prepare_storage_at(&settings_dir())
 }
 
-pub fn load() -> (UiPreferences, Option<String>) {
+pub fn load() -> LoadedSettings {
+    let path = settings_path();
     if let Err(error) = prepare_storage() {
-        return (
+        return loaded_settings(
+            &path,
             UiPreferences::default(),
             Some(format!("初始化配置目录失败：{error}")),
+            false,
         );
     }
-    load_at(&settings_path(), &legacy_settings_path())
-}
-
-pub fn save(preferences: &UiPreferences) -> Result<(), String> {
-    prepare_storage().map_err(|error| format!("初始化配置目录失败：{error}"))?;
-    save_to(&settings_path(), preferences).map_err(|error| format!("保存设置失败：{error}"))
+    load_at(&path, &legacy_settings_path())
 }
 
 fn prepare_storage_at(directory: &Path) -> io::Result<()> {
@@ -479,45 +541,72 @@ fn recover_staged_window_state(migration_path: &Path, window_state_path: &Path) 
     Ok(())
 }
 
-fn load_at(path: &Path, legacy_path: &Path) -> (UiPreferences, Option<String>) {
+fn load_at(path: &Path, legacy_path: &Path) -> LoadedSettings {
     let backup_path = path.with_extension("toml.bak");
     let mut primary_error = None;
 
+    if path.exists() && !path.is_file() {
+        return loaded_settings(
+            path,
+            UiPreferences::default(),
+            Some(format!("配置路径 {} 不是普通文件", path.display())),
+            false,
+        );
+    }
+
     if path.is_file() {
         match load_toml_from(path) {
-            Ok(preferences) => return (preferences, None),
+            Ok(preferences) => return loaded_settings(path, preferences, None, true),
             Err(error) => primary_error = Some(error),
         }
+    }
+
+    if backup_path.exists() && !backup_path.is_file() {
+        let warning = primary_error.map_or_else(
+            || format!("配置备份路径 {} 不是普通文件", backup_path.display()),
+            |primary_error| {
+                format!(
+                    "主配置无法读取：{primary_error}；配置备份路径 {} 不是普通文件",
+                    backup_path.display()
+                )
+            },
+        );
+        return loaded_settings(path, UiPreferences::default(), Some(warning), false);
     }
 
     if backup_path.is_file() {
         match load_toml_from(&backup_path) {
             Ok(preferences) => {
-                return (
+                let protect_primary = primary_error.is_some();
+                return loaded_settings(
+                    path,
                     preferences,
                     Some(format!(
                         "主配置无法读取，已使用备份 {}：{}",
                         backup_path.display(),
                         primary_error.unwrap_or_else(|| "主配置文件不存在".to_owned())
                     )),
+                    !protect_primary,
                 );
             }
             Err(backup_error) => {
                 if let Some(primary_error) = primary_error {
-                    return (
+                    return loaded_settings(
+                        path,
                         UiPreferences::default(),
                         Some(format!(
                             "配置文件和备份均无法读取：{primary_error}；{backup_error}"
                         )),
+                        false,
                     );
                 }
-                return (UiPreferences::default(), Some(backup_error));
+                return loaded_settings(path, UiPreferences::default(), Some(backup_error), false);
             }
         }
     }
 
     if let Some(error) = primary_error {
-        return (UiPreferences::default(), Some(error));
+        return loaded_settings(path, UiPreferences::default(), Some(error), false);
     }
 
     match load_legacy_json(legacy_path) {
@@ -529,16 +618,16 @@ fn load_at(path: &Path, legacy_path: &Path) -> (UiPreferences, Option<String>) {
                     path.display()
                 )),
             };
-            (preferences, warning)
+            loaded_settings(path, preferences, warning, true)
         }
         Ok(None) => {
             let preferences = UiPreferences::default();
             let warning = save_to(path, &preferences)
                 .err()
                 .map(|error| format!("无法创建默认配置 {}：{error}", path.display()));
-            (preferences, warning)
+            loaded_settings(path, preferences, warning, true)
         }
-        Err(error) => (UiPreferences::default(), Some(error)),
+        Err(error) => loaded_settings(path, UiPreferences::default(), Some(error), true),
     }
 }
 
@@ -762,19 +851,83 @@ mode = "hex"
         fs::create_dir_all(&test_dir).unwrap();
         let toml_path = test_dir.join(SETTINGS_FILE_NAME);
         let json_path = test_dir.join(LEGACY_SETTINGS_FILE_NAME);
-        fs::write(
-            &toml_path,
-            "schema_version = 6\n[receive]\nmode = \"binary\"\n",
-        )
-        .unwrap();
+        let invalid_source = "schema_version = 6\n[receive]\nmode = \"binary\"\n";
+        fs::write(&toml_path, invalid_source).unwrap();
 
-        let (preferences, warning) = load_at(&toml_path, &json_path);
+        let loaded = load_at(&toml_path, &json_path);
 
-        assert_eq!(preferences.receive_mode, ReceiveMode::Text);
-        let warning = warning.expect("invalid TOML should produce a warning");
+        assert_eq!(loaded.preferences.receive_mode, ReceiveMode::Text);
+        let warning = loaded
+            .warning
+            .as_deref()
+            .expect("invalid TOML should produce a warning");
         assert!(warning.contains("settings.toml"));
         assert!(warning.contains("binary"));
-        assert!(toml_path.is_file());
+        assert!(warning.contains("不会自动保存"));
+        assert!(!loaded.persistence.automatic_save_allowed());
+
+        let outcome = loaded
+            .persistence
+            .save(&loaded.preferences)
+            .expect("protected save should be skipped without failing");
+        assert_eq!(outcome, SettingsSaveOutcome::SkippedToProtectInvalidConfig);
+        assert_eq!(fs::read_to_string(&toml_path).unwrap(), invalid_source);
+        assert!(!toml_path.with_extension("toml.bak").exists());
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn unsupported_schema_is_not_overwritten_by_automatic_save() {
+        let test_dir = unique_test_dir("unsupported-schema");
+        fs::create_dir_all(&test_dir).unwrap();
+        let toml_path = test_dir.join(SETTINGS_FILE_NAME);
+        let json_path = test_dir.join(LEGACY_SETTINGS_FILE_NAME);
+        let newer_source = "schema_version = 999\n";
+        fs::write(&toml_path, newer_source).unwrap();
+
+        let loaded = load_at(&toml_path, &json_path);
+
+        assert!(!loaded.persistence.automatic_save_allowed());
+        assert!(loaded.warning.as_deref().is_some_and(|warning| {
+            warning.contains("schema_version 999") && warning.contains("不会自动保存")
+        }));
+        assert_eq!(
+            loaded.persistence.save(&loaded.preferences).unwrap(),
+            SettingsSaveOutcome::SkippedToProtectInvalidConfig
+        );
+        assert_eq!(fs::read_to_string(&toml_path).unwrap(), newer_source);
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn valid_backup_does_not_authorize_overwriting_an_invalid_primary() {
+        let test_dir = unique_test_dir("invalid-primary-valid-backup");
+        fs::create_dir_all(&test_dir).unwrap();
+        let toml_path = test_dir.join(SETTINGS_FILE_NAME);
+        let backup_path = toml_path.with_extension("toml.bak");
+        let json_path = test_dir.join(LEGACY_SETTINGS_FILE_NAME);
+        let invalid_source = "schema_version = 6\n[receive\n";
+        fs::write(&toml_path, invalid_source).unwrap();
+        let backup_preferences = UiPreferences {
+            receive_mode: ReceiveMode::Terminal,
+            ..Default::default()
+        };
+        let backup_source = render_toml(&backup_preferences).unwrap();
+        fs::write(&backup_path, &backup_source).unwrap();
+
+        let loaded = load_at(&toml_path, &json_path);
+
+        assert_eq!(loaded.preferences.receive_mode, ReceiveMode::Terminal);
+        assert!(!loaded.persistence.automatic_save_allowed());
+        assert!(loaded.warning.as_deref().is_some_and(|warning| {
+            warning.contains("已使用备份") && warning.contains("不会自动保存")
+        }));
+        assert_eq!(
+            loaded.persistence.save(&loaded.preferences).unwrap(),
+            SettingsSaveOutcome::SkippedToProtectInvalidConfig
+        );
+        assert_eq!(fs::read_to_string(&toml_path).unwrap(), invalid_source);
+        assert_eq!(fs::read_to_string(&backup_path).unwrap(), backup_source);
         let _ = fs::remove_dir_all(test_dir);
     }
 
@@ -810,11 +963,15 @@ mode = "hex"
         };
         fs::write(&json_path, serde_json::to_vec_pretty(&preferences).unwrap()).unwrap();
 
-        let (loaded, warning) = load_at(&toml_path, &json_path);
+        let loaded = load_at(&toml_path, &json_path);
 
-        assert!(warning.is_none(), "{warning:?}");
-        assert_eq!(loaded.receive_mode, ReceiveMode::Terminal);
-        assert_eq!(loaded.background_source, AppBackgroundSource::Online);
+        assert!(loaded.warning.is_none(), "{:?}", loaded.warning);
+        assert!(loaded.persistence.automatic_save_allowed());
+        assert_eq!(loaded.preferences.receive_mode, ReceiveMode::Terminal);
+        assert_eq!(
+            loaded.preferences.background_source,
+            AppBackgroundSource::Online
+        );
         assert!(toml_path.is_file());
         assert!(!json_path.exists());
         assert!(json_path.with_extension("json.migrated.bak").is_file());
