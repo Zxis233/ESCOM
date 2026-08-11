@@ -403,7 +403,7 @@ impl EscomApp {
         let export_button = toolbar_button(ui, "导出 TXT", 80.0);
         if ui
             .add_enabled(
-                self.receive_bytes_len() > 0 && !self.export_in_progress,
+                self.receive_bytes_len() > 0 && !self.export_task.is_running(),
                 export_button,
             )
             .clicked()
@@ -552,6 +552,9 @@ impl EscomApp {
     }
 
     pub(super) fn export_snapshot(&mut self, context: &egui::Context) {
+        if self.export_task.is_running() {
+            return;
+        }
         let file_name = format!("ESCOM_{}.txt", Local::now().format("%Y%m%d_%H%M%S"));
         let Some(path) = rfd::FileDialog::new()
             .set_title("导出接收数据")
@@ -580,7 +583,6 @@ impl EscomApp {
         let timestamp_format = self.preferences.timestamp_format.clone();
         let sender = self.background_tx.clone();
         let repaint_context = context.clone();
-        self.export_in_progress = true;
         let snapshot_bytes = snapshot.bytes_len;
         let spawn_result = thread::Builder::new()
             .name("escom-export".into())
@@ -608,13 +610,15 @@ impl EscomApp {
                         started.elapsed().as_millis()
                     ),
                 }
-                let _ = sender.send(BackgroundEvent::Exported(result));
                 repaint_context.request_repaint();
+                let _ = sender.send(BackgroundEvent::Exported(result));
             });
-        if let Err(error) = spawn_result {
-            self.export_in_progress = false;
-            log::error!(target: "escom::export", "failed to start export task: {error}");
-            self.set_notice(format!("无法启动导出任务：{error}"), true);
+        match spawn_result {
+            Ok(thread) => self.export_task.start(thread),
+            Err(error) => {
+                log::error!(target: "escom::export", "failed to start export task: {error}");
+                self.set_notice(format!("无法启动导出任务：{error}"), true);
+            }
         }
     }
 

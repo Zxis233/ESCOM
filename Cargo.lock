@@ -1310,6 +1310,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serialport",
+ "tempfile",
  "toml",
  "unicode-width",
  "vte",

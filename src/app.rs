@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use chrono::Local;
@@ -113,6 +113,35 @@ struct Notice {
     error: bool,
 }
 
+#[derive(Default)]
+struct ExportTask {
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ExportTask {
+    fn is_running(&self) -> bool {
+        self.thread.is_some()
+    }
+
+    fn start(&mut self, thread: JoinHandle<()>) {
+        debug_assert!(self.thread.is_none());
+        self.thread = Some(thread);
+    }
+
+    fn join(&mut self) -> thread::Result<()> {
+        match self.thread.take() {
+            Some(thread) => thread.join(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for ExportTask {
+    fn drop(&mut self) {
+        let _ = self.join();
+    }
+}
+
 enum BackgroundEvent {
     Formatted {
         token: u64,
@@ -160,7 +189,7 @@ pub struct EscomApp {
     display_formatter: Option<DisplayFormatter>,
     terminal_cursor: Option<(usize, usize)>,
     display_task: DisplayTaskState,
-    export_in_progress: bool,
+    export_task: ExportTask,
     paused: bool,
     force_scroll_bottom: bool,
     search_query: String,
@@ -290,7 +319,7 @@ impl EscomApp {
             display_formatter: None,
             terminal_cursor: None,
             display_task: DisplayTaskState::new(FORMAT_DEBOUNCE),
-            export_in_progress: false,
+            export_task: ExportTask::default(),
             paused: false,
             force_scroll_bottom: false,
             search_query: String::new(),
@@ -447,7 +476,9 @@ impl EscomApp {
                     }
                 }
                 BackgroundEvent::Exported(result) => {
-                    self.export_in_progress = false;
+                    if self.export_task.join().is_err() {
+                        log::error!(target: "escom::export", "export task panicked after reporting its result");
+                    }
                     match result {
                         Ok(path) => {
                             self.set_notice(format!("已导出到 {}", path.display()), false);
@@ -556,6 +587,12 @@ impl Drop for EscomApp {
             }
         }
         self.worker.shutdown();
+        if self.export_task.is_running() {
+            log::info!(target: "escom::export", "waiting for active export before shutdown");
+        }
+        if self.export_task.join().is_err() {
+            log::error!(target: "escom::export", "export task panicked during shutdown");
+        }
     }
 }
 

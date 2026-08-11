@@ -1,12 +1,12 @@
 use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::fs::File;
 use std::io::{self, BufWriter, Write as _};
 use std::path::Path;
 
 use chrono::format::{Item, StrftimeItems};
 use chrono::{DateTime, Local};
 use encoding_rs::{CoderResult, GBK, UTF_8};
+use tempfile::Builder as TempFileBuilder;
 
 use crate::model::{LineEnding, ReceiveMode, SendMode, TextEncoding};
 use crate::store::{ReceiveCursor, ReceiveDelta, ReceiveSnapshot, RxChunk};
@@ -721,17 +721,41 @@ pub fn export_snapshot_to_file(
     timestamps: bool,
     timestamp_format: &str,
 ) -> io::Result<()> {
-    let file = File::create(path)?;
-    let mut writer = BufWriter::with_capacity(EXPORT_BUFFER_BYTES, file);
-    write_export(
-        &mut writer,
-        snapshot,
-        mode,
-        encoding,
-        timestamps,
-        timestamp_format,
-    )?;
-    writer.flush()
+    write_file_atomically(path, |writer| {
+        write_export(
+            writer,
+            snapshot,
+            mode,
+            encoding,
+            timestamps,
+            timestamp_format,
+        )
+    })
+}
+
+fn write_file_atomically(
+    path: &Path,
+    write_contents: impl FnOnce(&mut dyn io::Write) -> io::Result<()>,
+) -> io::Result<()> {
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = TempFileBuilder::new()
+        .prefix(".escom-export-")
+        .suffix(".tmp")
+        .tempfile_in(directory)?;
+
+    {
+        let mut writer = BufWriter::with_capacity(EXPORT_BUFFER_BYTES, temporary.as_file_mut());
+        write_contents(&mut writer)?;
+        writer.flush()?;
+    }
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
 }
 
 pub fn write_export<W: io::Write + ?Sized>(
@@ -1891,6 +1915,35 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn atomic_export_replaces_an_existing_target_after_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("export.txt");
+        std::fs::write(&target, b"previous export").unwrap();
+
+        write_file_atomically(&target, |writer| writer.write_all(b"complete export")).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"complete export");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn atomic_export_preserves_the_target_and_removes_partial_temp_files_on_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("export.txt");
+        std::fs::write(&target, b"previous export").unwrap();
+
+        let error = write_file_atomically(&target, |writer| {
+            writer.write_all(b"partial export")?;
+            Err(io::Error::other("simulated disk failure"))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(std::fs::read(&target).unwrap(), b"previous export");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]

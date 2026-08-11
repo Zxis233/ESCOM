@@ -64,7 +64,7 @@ impl EscomApp {
                             if self.display_task.is_running() {
                                 ui.label("正在整理显示...");
                             }
-                            if self.export_in_progress {
+                            if self.export_task.is_running() {
                                 ui.label("正在导出...");
                             }
 

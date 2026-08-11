@@ -403,3 +403,18 @@ fn terminal_text_respects_selected_encoding() {
         .is_err()
     );
 }
+
+#[test]
+fn dropping_export_task_waits_for_its_thread() {
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_completed = Arc::clone(&completed);
+    let mut task = ExportTask::default();
+    task.start(thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        thread_completed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }));
+
+    drop(task);
+
+    assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+}
