@@ -9,6 +9,7 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 
 use crate::budget::{ByteBudget, Reservation};
 use crate::capture::CaptureSink;
+use crate::error::{CoreError, ErrorKind, Operation};
 use crate::model::SerialConfig;
 use crate::store::ReceiveStore;
 
@@ -28,22 +29,25 @@ impl Drop for WorkerLifecycleLog {
 pub type UiWake = Arc<dyn Fn() + Send + Sync + 'static>;
 
 pub trait PortIo: Read + Write + Send {
-    fn set_dtr(&mut self, level: bool) -> Result<(), String>;
-    fn set_rts(&mut self, level: bool) -> Result<(), String>;
+    fn set_dtr(&mut self, level: bool) -> Result<(), CoreError>;
+    fn set_rts(&mut self, level: bool) -> Result<(), CoreError>;
 }
 
 pub trait SerialBackend: Send + Sync + 'static {
-    fn list_ports(&self) -> Result<Vec<String>, String>;
-    fn open(&self, config: &SerialConfig) -> Result<Box<dyn PortIo>, String>;
+    fn list_ports(&self) -> Result<Vec<String>, CoreError>;
+    fn open(&self, config: &SerialConfig) -> Result<Box<dyn PortIo>, CoreError>;
 }
 
 #[derive(Default)]
 pub struct ProductionBackend;
 
 impl SerialBackend for ProductionBackend {
-    fn list_ports(&self) -> Result<Vec<String>, String> {
+    fn list_ports(&self) -> Result<Vec<String>, CoreError> {
         let mut ports: Vec<_> = serialport::available_ports()
-            .map_err(|error| format!("无法枚举串口：{error}"))?
+            .map_err(|error| CoreError::Operation {
+                operation: Operation::ListPorts,
+                detail: error.to_string(),
+            })?
             .into_iter()
             .map(|port| port.port_name)
             .collect();
@@ -51,7 +55,7 @@ impl SerialBackend for ProductionBackend {
         Ok(ports)
     }
 
-    fn open(&self, config: &SerialConfig) -> Result<Box<dyn PortIo>, String> {
+    fn open(&self, config: &SerialConfig) -> Result<Box<dyn PortIo>, CoreError> {
         let port = serialport::new(&config.port_name, config.baud_rate)
             .data_bits(config.data_bits)
             .stop_bits(config.stop_bits)
@@ -60,7 +64,10 @@ impl SerialBackend for ProductionBackend {
             .timeout(Duration::from_millis(20))
             .dtr_on_open(config.dtr)
             .open()
-            .map_err(|error| format!("打开 {} 失败：{error}", config.port_name))?;
+            .map_err(|error| CoreError::Open {
+                port: config.port_name.clone(),
+                detail: error.to_string(),
+            })?;
 
         let mut port = NativePort(port);
         port.set_dtr(config.dtr)?;
@@ -90,16 +97,22 @@ impl Write for NativePort {
 }
 
 impl PortIo for NativePort {
-    fn set_dtr(&mut self, level: bool) -> Result<(), String> {
+    fn set_dtr(&mut self, level: bool) -> Result<(), CoreError> {
         self.0
             .write_data_terminal_ready(level)
-            .map_err(|error| format!("设置 DTR 失败：{error}"))
+            .map_err(|error| CoreError::Operation {
+                operation: Operation::SetDtr,
+                detail: error.to_string(),
+            })
     }
 
-    fn set_rts(&mut self, level: bool) -> Result<(), String> {
+    fn set_rts(&mut self, level: bool) -> Result<(), CoreError> {
         self.0
             .write_request_to_send(level)
-            .map_err(|error| format!("设置 RTS 失败：{error}"))
+            .map_err(|error| CoreError::Operation {
+                operation: Operation::SetRts,
+                detail: error.to_string(),
+            })
     }
 }
 
@@ -132,10 +145,10 @@ struct PendingWrite {
 pub enum WorkerEvent {
     Ports(Vec<String>),
     Opened(String),
-    Closed { error: Option<String> },
+    Closed { error: Option<CoreError> },
     TxCompleted { id: u64, count: usize },
-    TxFailed { id: u64, message: String },
-    ControlError(String),
+    TxFailed { id: u64, message: CoreError },
+    ControlError(CoreError),
 }
 
 struct WorkerNotifier {
@@ -266,26 +279,28 @@ impl WorkerHandle {
         }
     }
 
-    pub fn refresh_ports(&self) -> Result<(), String> {
+    pub fn refresh_ports(&self) -> Result<(), CoreError> {
         self.send_command(WorkerCommand::RefreshPorts)
     }
 
-    pub fn open(&self, config: SerialConfig) -> Result<(), String> {
+    pub fn open(&self, config: SerialConfig) -> Result<(), CoreError> {
         self.send_command(WorkerCommand::Open(config))
     }
 
-    pub fn close(&self) -> Result<(), String> {
+    pub fn close(&self) -> Result<(), CoreError> {
         self.send_command(WorkerCommand::Close)
     }
 
-    pub fn send(&self, id: u64, bytes: Vec<u8>) -> Result<(), String> {
+    pub fn send(&self, id: u64, bytes: Vec<u8>) -> Result<(), CoreError> {
         if bytes.len() > self.max_write_bytes {
-            return Err(format!("单次发送超过 {} 字节限制", self.max_write_bytes));
+            return Err(CoreError::SendTooLarge {
+                limit: self.max_write_bytes,
+            });
         }
         let reservation = self
             .write_budget
             .reserve(bytes.len())
-            .ok_or_else(|| "串口发送积压已达到字节上限，请稍后重试".to_owned())?;
+            .ok_or(ErrorKind::TxBudget)?;
         self.write_requests
             .try_send(WriteRequest {
                 id,
@@ -293,8 +308,8 @@ impl WorkerHandle {
                 reservation,
             })
             .map_err(|error| match error {
-                crossbeam_channel::TrySendError::Full(_) => "串口发送队列已满，请稍后重试".into(),
-                crossbeam_channel::TrySendError::Disconnected(_) => "串口任务已停止".into(),
+                crossbeam_channel::TrySendError::Full(_) => ErrorKind::QueueFull.into(),
+                crossbeam_channel::TrySendError::Disconnected(_) => ErrorKind::WorkerStopped.into(),
             })
     }
 
@@ -302,26 +317,26 @@ impl WorkerHandle {
         self.write_budget.used()
     }
 
-    pub fn set_capture(&self, sink: Option<CaptureSink>) -> Result<(), String> {
+    pub fn set_capture(&self, sink: Option<CaptureSink>) -> Result<(), CoreError> {
         let (sender, receiver) = bounded(1);
         self.send_command(WorkerCommand::SetCapture(sink, sender))?;
         receiver
             .recv_timeout(Duration::from_secs(2))
-            .map_err(|_| "串口任务未确认记录切换".to_owned())
+            .map_err(|_| ErrorKind::CaptureAck.into())
     }
 
-    pub fn set_dtr(&self, level: bool) -> Result<(), String> {
+    pub fn set_dtr(&self, level: bool) -> Result<(), CoreError> {
         self.send_command(WorkerCommand::SetDtr(level))
     }
 
-    pub fn set_rts(&self, level: bool) -> Result<(), String> {
+    pub fn set_rts(&self, level: bool) -> Result<(), CoreError> {
         self.send_command(WorkerCommand::SetRts(level))
     }
 
-    fn send_command(&self, command: WorkerCommand) -> Result<(), String> {
+    fn send_command(&self, command: WorkerCommand) -> Result<(), CoreError> {
         self.commands
             .send(command)
-            .map_err(|_| "串口任务已停止".into())
+            .map_err(|_| ErrorKind::WorkerStopped.into())
     }
 
     pub fn shutdown(&mut self) {
@@ -364,7 +379,7 @@ fn worker_loop(
 
     'worker: loop {
         if port.is_none() {
-            reject_queued_writes(&write_requests, &events, "串口尚未连接");
+            reject_queued_writes(&write_requests, &events, ErrorKind::Disconnected);
             match commands.recv_timeout(DISCONNECTED_POLL_INTERVAL) {
                 Ok(command) => {
                     if handle_command(
@@ -425,7 +440,7 @@ fn worker_loop(
             mark_receive_boundary(&store);
             discard_writes(&mut pending_write, &write_requests, &events);
             events.emit(WorkerEvent::Closed {
-                error: Some(format!("串口写入失败：{error}")),
+                error: Some(CoreError::io(Operation::Write, error)),
             });
             continue;
         }
@@ -462,7 +477,7 @@ fn worker_loop(
                 mark_receive_boundary(&store);
                 discard_writes(&mut pending_write, &write_requests, &events);
                 events.emit(WorkerEvent::Closed {
-                    error: Some(format!("串口读取失败：{error}")),
+                    error: Some(CoreError::io(Operation::Read, error)),
                 });
             }
         }
@@ -599,7 +614,7 @@ fn write_next_slice(
         Ok(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "串口驱动返回了无效的写入字节数",
+                CoreError::Simple(ErrorKind::InvalidWrite),
             ));
         }
         Err(error)
@@ -632,25 +647,20 @@ fn discard_writes(
     if let Some(pending) = pending_write.take() {
         events.emit(WorkerEvent::TxFailed {
             id: pending.id,
-            message: format!(
-                "发送 #{} 已取消：已写入 {}/{} 字节",
-                pending.id,
-                pending.offset,
-                pending.bytes.len()
-            ),
+            message: CoreError::Cancelled {
+                id: pending.id,
+                written: pending.offset,
+                total: pending.bytes.len(),
+            },
         });
     }
-    reject_queued_writes(
-        write_requests,
-        events,
-        "发送已取消：串口关闭或重新连接，已写入 0 字节",
-    );
+    reject_queued_writes(write_requests, events, ErrorKind::QueueCancelled);
 }
 
 fn reject_queued_writes(
     write_requests: &Receiver<WriteRequest>,
     events: &WorkerNotifier,
-    message: &str,
+    message: ErrorKind,
 ) {
     while let Ok(request) = write_requests.try_recv() {
         events.emit(WorkerEvent::TxFailed {
@@ -708,7 +718,7 @@ mod tests {
         discard_writes(&mut active, &requests, &notifier);
         assert_eq!(worker.queued_write_bytes(), 0);
         assert!(
-            matches!(receiver.recv().unwrap(), WorkerEvent::TxFailed { id: 1, message } if message.contains("2/8"))
+            matches!(receiver.recv().unwrap(), WorkerEvent::TxFailed { id: 1, message } if message.to_string().contains("2/8"))
         );
         worker.send(3, vec![0; 4]).unwrap();
         assert!(worker.send(4, vec![0; 4]).is_err()); // item limit also refunds reservation
@@ -761,11 +771,11 @@ mod tests {
     }
 
     impl SerialBackend for MockBackend {
-        fn list_ports(&self) -> Result<Vec<String>, String> {
+        fn list_ports(&self) -> Result<Vec<String>, CoreError> {
             Ok(vec!["COM12".into(), "COM3".into()])
         }
 
-        fn open(&self, _config: &SerialConfig) -> Result<Box<dyn PortIo>, String> {
+        fn open(&self, _config: &SerialConfig) -> Result<Box<dyn PortIo>, CoreError> {
             self.opened.store(true, Ordering::Relaxed);
             Ok(Box::new(MockPort {
                 reads: self.reads.clone(),
@@ -778,12 +788,15 @@ mod tests {
     struct FailingOpenBackend;
 
     impl SerialBackend for FailingOpenBackend {
-        fn list_ports(&self) -> Result<Vec<String>, String> {
+        fn list_ports(&self) -> Result<Vec<String>, CoreError> {
             Ok(vec!["COM3".into()])
         }
 
-        fn open(&self, config: &SerialConfig) -> Result<Box<dyn PortIo>, String> {
-            Err(format!("打开 {} 失败：端口被占用", config.port_name))
+        fn open(&self, config: &SerialConfig) -> Result<Box<dyn PortIo>, CoreError> {
+            Err(CoreError::Open {
+                port: config.port_name.clone(),
+                detail: "端口被占用".into(),
+            })
         }
     }
 
@@ -823,11 +836,11 @@ mod tests {
     }
 
     impl PortIo for MockPort {
-        fn set_dtr(&mut self, _level: bool) -> Result<(), String> {
+        fn set_dtr(&mut self, _level: bool) -> Result<(), CoreError> {
             Ok(())
         }
 
-        fn set_rts(&mut self, _level: bool) -> Result<(), String> {
+        fn set_rts(&mut self, _level: bool) -> Result<(), CoreError> {
             Ok(())
         }
     }
@@ -843,11 +856,11 @@ mod tests {
     }
 
     impl SerialBackend for SchedulingBackend {
-        fn list_ports(&self) -> Result<Vec<String>, String> {
+        fn list_ports(&self) -> Result<Vec<String>, CoreError> {
             Ok(vec!["COM3".into()])
         }
 
-        fn open(&self, _config: &SerialConfig) -> Result<Box<dyn PortIo>, String> {
+        fn open(&self, _config: &SerialConfig) -> Result<Box<dyn PortIo>, CoreError> {
             Ok(Box::new(SchedulingPort {
                 total_bytes: self.total_bytes,
                 max_write_bytes: self.max_write_bytes,
@@ -904,11 +917,11 @@ mod tests {
     }
 
     impl PortIo for SchedulingPort {
-        fn set_dtr(&mut self, _level: bool) -> Result<(), String> {
+        fn set_dtr(&mut self, _level: bool) -> Result<(), CoreError> {
             Ok(())
         }
 
-        fn set_rts(&mut self, _level: bool) -> Result<(), String> {
+        fn set_rts(&mut self, _level: bool) -> Result<(), CoreError> {
             Ok(())
         }
     }
@@ -1016,7 +1029,7 @@ mod tests {
             .expect("open failure event");
         match event {
             WorkerEvent::Closed { error: Some(error) } => {
-                assert_eq!(error, "打开 COM3 失败：端口被占用");
+                assert_eq!(error.to_string(), "打开 COM3 失败：端口被占用");
             }
             other => panic!("unexpected worker event: {other:?}"),
         }

@@ -1,3 +1,4 @@
+use crate::error::{CoreError, Operation};
 use std::ops::Range;
 
 use regex::{Regex, RegexBuilder};
@@ -75,6 +76,17 @@ impl SearchMatcher {
         program_bytes: usize,
         dfa_bytes: usize,
     ) -> Result<Option<Self>, String> {
+        Self::new_with_limits_typed(query, case_sensitive, regex_mode, program_bytes, dfa_bytes)
+            .map_err(Into::into)
+    }
+
+    pub fn new_with_limits_typed(
+        query: &str,
+        case_sensitive: bool,
+        regex_mode: bool,
+        program_bytes: usize,
+        dfa_bytes: usize,
+    ) -> Result<Option<Self>, CoreError> {
         if query.is_empty() {
             return Ok(None);
         }
@@ -90,7 +102,10 @@ impl SearchMatcher {
             .dfa_size_limit(dfa_bytes)
             .build()
             .map(|matcher| Some(Self { matcher }))
-            .map_err(|error| format!("正则表达式无效：{error}"))
+            .map_err(|error| CoreError::Operation {
+                operation: Operation::Regex,
+                detail: error.to_string(),
+            })
     }
 }
 

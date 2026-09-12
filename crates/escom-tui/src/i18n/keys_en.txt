@@ -1,0 +1,29 @@
+ESCOM TUI / KEYBOARD
+
+F2       Cycle detected ports       F3       Connect / disconnect
+F4       Text / HEX / Terminal      F5       UTF-8 / GBK
+F6       Start / stop raw recording F7       Send text / HEX
+F8       Direct terminal input (Esc returns to viewer)
+s        Compose a send            Enter    Submit editor
+/        Search frozen history     Ctrl+R   Toggle regex in search editor
+n / N    Next / previous hit row   Esc      Close editor
+Space    Pause / resume display    End      Follow live output
+Arrows   Scroll rows / columns     PgUp/Dn  Scroll a page
+Home     Oldest displayed row      t        Toggle timestamps
+c        Clear memory history      q        Quit (Ctrl+Q from any mode)
+Ctrl+U   Clear editor              :        Command editor
+
+COMMANDS (type : then a command; changes last for this run)
+port COM3    baud 115200    data 8    stop 1    parity none|odd|even
+flow none|software|hardware    dtr on|off    rts on|off
+mode text|hex|terminal    encoding utf8|gbk    eol none|cr|lf|crlf
+lang en|zh-CN    (switch interface language without changing serial encoding)
+ports    connect    disconnect    record path with spaces.bin    stop-record
+
+Search: case-insensitive, current formatted history only; no background index.
+Pausing freezes the view, not reception or recording. Resume clears search hits.
+Long lines are clipped: scroll horizontally. History eviction is shown below.
+Recording: exact RX bytes, new file only; queue/disk failure marks it incomplete.
+Direct mode: Enter sends CR, Ctrl+C sends 0x03; Esc returns, Ctrl+Q exits.
+
+Press any key to close help.

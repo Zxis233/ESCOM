@@ -1,0 +1,29 @@
+ESCOM TUI / 按键说明
+
+F2       轮换检测到的串口           F3       连接 / 断开
+F4       文本 / HEX / 终端          F5       UTF-8 / GBK
+F6       开始 / 停止原始记录        F7       文本 / HEX 发送
+F8       直接输入到串口（Esc 返回查看模式）
+s        编辑发送内容              Enter    提交
+/        搜索暂停的历史            Ctrl+R   搜索编辑时切换正则
+n / N    下一个 / 上一个命中行      Esc      关闭编辑器
+Space    暂停 / 恢复显示            End      跟随最新数据
+方向键   上下滚动 / 左右横移        PgUp/Dn  翻页
+Home     最早显示行                t        显示 / 隐藏时间戳
+c        清空内存历史              q        退出（任何模式可用 Ctrl+Q）
+Ctrl+U   清空编辑内容              :        命令编辑器
+
+命令（先按 :，修改仅在本次运行生效）
+port COM3    baud 115200    data 8    stop 1    parity none|odd|even
+flow none|software|hardware    dtr on|off    rts on|off
+mode text|hex|terminal    encoding utf8|gbk    eol none|cr|lf|crlf
+lang en|zh-CN    （仅切换界面语言，串口编码不变）
+ports    connect    disconnect    record 路径.bin    stop-record
+
+搜索不区分大小写，仅覆盖格式化历史，不建立后台索引。
+暂停只冻结显示，接收和记录继续；恢复后清除搜索结果。
+长行会裁剪，可左右滚动；状态栏显示历史淘汰字节数。
+记录保存原始 RX 字节，不覆盖已有文件；队列或磁盘失败会明确报错。
+直接输入：Enter 发送 CR，Ctrl+C 发送 0x03；Esc 返回，Ctrl+Q 退出。
+
+按任意键关闭帮助。

@@ -1,0 +1,29 @@
+ESCOM TUI - 有界内存串口查看器
+
+用法：escom-tui [--config 文件] [选项]
+  --lang en|zh-CN         界面语言（默认：en）
+  --port COM3            启动时连接（Linux：/dev/ttyUSB0）
+  --baud 115200          波特率；其他参数可通过配置文件或 :命令 设置
+  --mode text|hex|terminal 接收显示模式
+  --encoding utf8|gbk    串口收发编码，与界面语言独立
+  --history-kib 2048     原始历史字节预算，单位 KiB
+  --history-records 8192 原始记录数上限（含会话边界）
+  --display-kib 512      格式化历史文本预算，单位 KiB
+  --display-rows 2000    格式化历史行数上限
+  --line-kib 8           单行上限，单位 KiB
+  --tx-kib 256           排队和发送中的总字节预算，单位 KiB
+  --send-kib 64          单次发送及编辑器上限，单位 KiB
+  --record-queue-kib 256 写盘队列及活动块预算，单位 KiB
+  --record 文件         将原始 RX 字节流式写入新文件
+  --list                列出串口后退出
+  --demo                无需硬件的演示串口
+  --print-config        输出生效的 TOML 配置后退出
+  --help / --version    帮助 / 版本
+
+按键：F2 串口，F3 连接，F4 模式，F5 编码，F6 记录，F7 发送模式，
+F8 直接输入，s 编辑发送，/ 搜索，: 命令，Space 暂停或恢复，
+方向键和 PgUp/PgDn 滚动，End 跟随，c 清空，? 帮助，q 退出。
+搜索在 Enter 后扫描暂停的格式化历史；n/N 在命中行之间跳转。
+暂停时接收和记录继续。Ctrl+Q 可在任何模式退出。
+用 :lang en 或 :lang zh-CN 切换语言；本次切换不自动保存。
+

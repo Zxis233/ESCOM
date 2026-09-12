@@ -1,3 +1,4 @@
+use escom_core::error::CoreError;
 use escom_core::{
     model::SerialConfig,
     serial_worker::{PortIo, SerialBackend},
@@ -7,10 +8,10 @@ use std::time::{Duration, Instant};
 
 pub struct DemoBackend;
 impl SerialBackend for DemoBackend {
-    fn list_ports(&self) -> Result<Vec<String>, String> {
+    fn list_ports(&self) -> Result<Vec<String>, CoreError> {
         Ok(vec!["DEMO".into()])
     }
-    fn open(&self, _: &SerialConfig) -> Result<Box<dyn PortIo>, String> {
+    fn open(&self, _: &SerialConfig) -> Result<Box<dyn PortIo>, CoreError> {
         Ok(Box::new(DemoPort {
             next: Instant::now(),
             sequence: 0,
@@ -63,10 +64,10 @@ impl Write for DemoPort {
     }
 }
 impl PortIo for DemoPort {
-    fn set_dtr(&mut self, _: bool) -> Result<(), String> {
+    fn set_dtr(&mut self, _: bool) -> Result<(), CoreError> {
         Ok(())
     }
-    fn set_rts(&mut self, _: bool) -> Result<(), String> {
+    fn set_rts(&mut self, _: bool) -> Result<(), CoreError> {
         Ok(())
     }
 }

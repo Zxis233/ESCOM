@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::i18n::{Key, Message};
 use escom_core::formatting::{DisplayFormatter, DisplayLimits, FormattedRow};
 use escom_core::model::{ReceiveMode, TextEncoding};
 use escom_core::store::ReceiveStore;
@@ -30,11 +31,11 @@ impl Display {
         self.generation = u64::MAX;
     }
 
-    pub fn update(&mut self, store: &Mutex<ReceiveStore>, config: &Config) -> Result<(), String> {
+    pub fn update(&mut self, store: &Mutex<ReceiveStore>, config: &Config) -> Result<(), Message> {
         if self.generation
             == store
                 .lock()
-                .map_err(|_| "Receive store unavailable")?
+                .map_err(|_| Key::ReceiveStoreUnavailable)?
                 .generation()
         {
             return Ok(());
@@ -42,7 +43,7 @@ impl Display {
         if let Some(formatter) = &mut self.formatter {
             let delta = store
                 .lock()
-                .map_err(|_| "Receive store unavailable")?
+                .map_err(|_| Key::ReceiveStoreUnavailable)?
                 .delta_since_bounded(formatter.cursor(), INCREMENT_BYTES);
             if let Ok(update) = formatter.apply_delta(&delta) {
                 self.rows.drain(..update.remove_prefix.min(self.rows.len()));
@@ -61,7 +62,7 @@ impl Display {
         };
         let snapshot = store
             .lock()
-            .map_err(|_| "Receive store unavailable")?
+            .map_err(|_| Key::ReceiveStoreUnavailable)?
             .tail_snapshot(rebuild_bytes);
         let (formatter, rows) = DisplayFormatter::rebuild_with_limits(
             &snapshot,

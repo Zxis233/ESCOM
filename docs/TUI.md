@@ -26,6 +26,28 @@ cargo build --release -p escom-tui
 
 ## TUI 操作
 
+### 界面语言
+
+仅支持英文和简体中文，默认英文。配置文件可设 `language = "zh-CN"`；
+命令行 `--lang en` / `--lang zh-CN` 优先于配置文件，参数先后顺序不影响优先级。
+`--help` 与 `--list` 也使用所选语言。
+
+```powershell
+.\target\release\escom-tui.exe --demo --lang zh-CN
+.\target\release\escom-tui.exe --lang zh-CN --help
+```
+
+运行时输入 `:lang en` 或 `:lang zh-CN` 即时切换；本次修改不自动写回文件。
+切换不会重连串口、清空历史、改变搜索结果或停止记录。界面语言与 UTF-8/GBK 编码独立，
+接收正文、输入内容、端口名称、路径、命令名称和配置键均保持原样。
+应用提示按消息标识及参数重新渲染；底层操作系统、驱动和解析器的错误详情保留原文。
+
+语言资源位于 `crates/escom-tui/src/i18n/`，随可执行文件静态编译，无新增运行时依赖。
+`catalog.rs` 的每个消息必须同时提供中英文，含参数文案按整句翻译；
+帮助资源分别放在 `help_*.txt` 和 `keys_*.txt`。
+共享核心通过 `CoreError` / `ErrorKind` 传递错误类型和参数，TUI 不匹配错误文案来判断含义。
+核心错误的默认 Display 保留 GUI 中文显示，原有字符串形式的解码、校验和搜索入口也保留兼容包装。
+
 | 按键 | 操作 |
 | --- | --- |
 | F2 / F3 | 轮换检测到的串口 / 连接或断开 |

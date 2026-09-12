@@ -1,40 +1,17 @@
-use escom_core::model::{LineEnding, ReceiveMode, SerialConfig, TextEncoding, parse_baud_rate};
+use crate::i18n::{Key, Language, Message};
+use crate::msg;
+use escom_core::model::{
+    LineEnding, ReceiveMode, SerialConfig, TextEncoding, parse_baud_rate_typed,
+};
 use serde::{Deserialize, Serialize};
 use serialport::{DataBits, FlowControl, Parity, StopBits};
-use std::io::{self, Read};
+use std::io::Read;
 use std::path::PathBuf;
-
-pub const HELP: &str = "ESCOM TUI - bounded-memory serial viewer
-
-Usage: escom-tui [--config FILE] [options]
-  --port COM3              Connect on startup (Linux: /dev/ttyUSB0)
-  --baud 115200            Baud rate; other serial settings in TOML or :commands
-  --mode text|hex|terminal Receive presentation
-  --encoding utf8|gbk      Receive and send encoding
-  --history-kib 2048       Raw RX history payload budget
-  --history-records 8192   Raw record count budget (includes boundaries)
-  --display-kib 512        Formatted text budget
-  --display-rows 2000      Formatted row count budget
-  --line-kib 8             Maximum formatted line length
-  --tx-kib 256             Queued + active TX payload budget
-  --send-kib 64            Maximum single send / editor payload budget
-  --record-queue-kib 256   Recording queue + active block payload budget
-  --record FILE            Stream raw RX bytes to a NEW file
-  --list                   List ports and exit
-  --demo                   Synthetic port for trying the UI without hardware
-  --print-config           Print effective TOML and exit
-  --help / --version
-
-Keys: F2 port, F3 connect/disconnect, F4 RX mode, F5 encoding, F6 record,
-F7 TX text/hex, F8 direct terminal input, s send, / search, : command,
-Space pause/resume, arrows/PgUp/PgDn scroll, End follow, c clear, ? help, q quit.
-Search runs on Enter over the frozen formatted history; n/N moves between rows.
-Recording continues while paused. Ctrl+Q always exits. See README.md for budgets.
-";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub language: Language,
     pub port: String,
     pub baud: u32,
     pub data_bits: u8,
@@ -62,6 +39,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            language: Language::En,
             port: String::new(),
             baud: 115200,
             data_bits: 8,
@@ -98,55 +76,68 @@ pub enum Action {
 }
 
 impl Config {
-    pub fn parse(args: impl IntoIterator<Item = String>) -> Result<(Self, Action), String> {
+    pub fn parse(args: impl IntoIterator<Item = String>) -> Result<(Self, Action), ConfigError> {
         let args: Vec<_> = args.into_iter().collect();
-        if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-            return Ok((Self::default(), Action::Help));
-        }
-        if args.iter().any(|arg| arg == "--version") {
-            return Ok((Self::default(), Action::Version));
+        let mut language = Language::En;
+        Self::parse_inner(&args, &mut language).map_err(|message| ConfigError { language, message })
+    }
+
+    fn parse_inner(args: &[String], language: &mut Language) -> Result<(Self, Action), Message> {
+        let mut options = Vec::new();
+        let mut iter = args.iter();
+        let mut override_language = None;
+        while let Some(arg) = iter.next() {
+            if matches!(
+                arg.as_str(),
+                "--demo" | "--list" | "--print-config" | "--help" | "-h" | "--version"
+            ) {
+                options.push((arg.as_str(), None));
+            } else {
+                let value = iter.next().ok_or_else(|| msg!(MissingValue, arg))?;
+                if arg == "--lang" {
+                    let selected = Language::parse(value)?;
+                    override_language = Some(selected);
+                    *language = selected;
+                }
+                options.push((arg.as_str(), Some(value.as_str())));
+            }
         }
         let mut config = Self::default();
-        let mut i = 0;
-        while i < args.len() {
-            if args[i] == "--config" {
-                let path = args.get(i + 1).ok_or("--config needs a file path")?;
-                let file = std::fs::File::open(path).map_err(|e| format!("Config {path}: {e}"))?;
+        for (arg, value) in &options {
+            if *arg == "--config" {
+                let path = value.expect("value options have a value");
+                let file = std::fs::File::open(path).map_err(|e| msg!(ConfigError, path, e))?;
                 let mut source = String::new();
                 file.take(65537)
                     .read_to_string(&mut source)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| msg!(ConfigError, path, e))?;
                 if source.len() > 65536 {
-                    return Err("Config exceeds 64 KiB".into());
+                    return Err(Key::ConfigTooLarge.into());
                 }
                 config = toml::from_str(source.trim_start_matches('\u{feff}'))
-                    .map_err(|e| format!("Config {path}: {e}"))?;
-                i += 1;
+                    .map_err(|e| msg!(ConfigError, path, e))?;
+                *language = override_language.unwrap_or(config.language);
             }
-            i += 1;
         }
+        config.language = override_language.unwrap_or(config.language);
+        *language = config.language;
         let mut action = Action::Run;
-        let mut args = args.into_iter();
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
+        for (arg, value) in options {
+            match arg {
                 "--demo" => config.demo = true,
                 "--list" => action = Action::List,
                 "--print-config" => action = Action::PrintConfig,
-                "--config" => {
-                    args.next().ok_or("--config needs a path")?;
-                }
+                "--help" | "-h" => action = Action::Help,
+                "--version" => action = Action::Version,
+                "--config" | "--lang" => {}
                 _ => {
-                    let value = args.next().ok_or_else(|| format!("{arg} needs a value"))?;
-                    let number = || {
-                        value
-                            .parse::<usize>()
-                            .map_err(|_| format!("Invalid number for {arg}"))
-                    };
-                    match arg.as_str() {
-                        "--port" => config.port = value,
-                        "--baud" => config.baud = parse_baud_rate(&value).map_err(str::to_owned)?,
-                        "--mode" => config.mode = value,
-                        "--encoding" => config.encoding = value,
+                    let value = value.expect("value options have a value");
+                    let number = || value.parse::<usize>().map_err(|_| msg!(InvalidNumber, arg));
+                    match arg {
+                        "--port" => config.port = value.into(),
+                        "--baud" => config.baud = parse_baud_rate_typed(value)?,
+                        "--mode" => config.mode = value.into(),
+                        "--encoding" => config.encoding = value.into(),
                         "--history-kib" => config.history_kib = number()?,
                         "--history-records" => config.history_records = number()?,
                         "--display-kib" => config.display_kib = number()?,
@@ -156,7 +147,7 @@ impl Config {
                         "--send-kib" => config.send_kib = number()?,
                         "--record-queue-kib" => config.record_queue_kib = number()?,
                         "--record" => config.record = Some(value.into()),
-                        _ => return Err(format!("Unknown option: {arg}")),
+                        _ => return Err(msg!(UnknownOption, arg)),
                     }
                 }
             }
@@ -165,7 +156,7 @@ impl Config {
         Ok((config, action))
     }
 
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), Message> {
         self.serial_config()?;
         self.receive_mode()?;
         self.text_encoding()?;
@@ -181,69 +172,69 @@ impl Config {
             ("record_queue_kib", self.record_queue_kib, 8, 65536),
         ] {
             if !(min..=max).contains(&value) {
-                return Err(format!("{name} must be {min}..{max}"));
+                return Err(msg!(Range, name, min, max));
             }
         }
         if self.line_kib > self.display_kib {
-            return Err("line_kib must not exceed display_kib".into());
+            return Err(Key::LineBudget.into());
         }
         if self.send_kib > self.tx_kib {
-            return Err("send_kib must not exceed tx_kib".into());
+            return Err(Key::SendBudget.into());
         }
         Ok(())
     }
 
-    pub fn receive_mode(&self) -> Result<ReceiveMode, String> {
+    pub fn receive_mode(&self) -> Result<ReceiveMode, Message> {
         match self.mode.as_str() {
             "text" => Ok(ReceiveMode::Text),
             "hex" => Ok(ReceiveMode::Hex),
             "terminal" => Ok(ReceiveMode::Terminal),
-            _ => Err("mode must be text, hex or terminal".into()),
+            _ => Err(Key::ModeValues.into()),
         }
     }
-    pub fn text_encoding(&self) -> Result<TextEncoding, String> {
+    pub fn text_encoding(&self) -> Result<TextEncoding, Message> {
         match self.encoding.as_str() {
             "utf8" => Ok(TextEncoding::Utf8),
             "gbk" => Ok(TextEncoding::Gbk),
-            _ => Err("encoding must be utf8 or gbk".into()),
+            _ => Err(Key::EncodingValues.into()),
         }
     }
-    pub fn ending(&self) -> Result<LineEnding, String> {
+    pub fn ending(&self) -> Result<LineEnding, Message> {
         match self.line_ending.as_str() {
             "none" => Ok(LineEnding::None),
             "cr" => Ok(LineEnding::Cr),
             "lf" => Ok(LineEnding::Lf),
             "crlf" => Ok(LineEnding::CrLf),
-            _ => Err("line_ending must be none, cr, lf or crlf".into()),
+            _ => Err(Key::EndingValues.into()),
         }
     }
-    pub fn serial_config(&self) -> Result<SerialConfig, String> {
+    pub fn serial_config(&self) -> Result<SerialConfig, Message> {
         Ok(SerialConfig {
             port_name: self.port.clone(),
-            baud_rate: parse_baud_rate(&self.baud.to_string()).map_err(str::to_owned)?,
+            baud_rate: parse_baud_rate_typed(&self.baud.to_string())?,
             data_bits: match self.data_bits {
                 5 => DataBits::Five,
                 6 => DataBits::Six,
                 7 => DataBits::Seven,
                 8 => DataBits::Eight,
-                _ => return Err("data_bits must be 5..8".into()),
+                _ => return Err(Key::DataValues.into()),
             },
             stop_bits: match self.stop_bits {
                 1 => StopBits::One,
                 2 => StopBits::Two,
-                _ => return Err("stop_bits must be 1 or 2".into()),
+                _ => return Err(Key::StopValues.into()),
             },
             parity: match self.parity.as_str() {
                 "none" => Parity::None,
                 "odd" => Parity::Odd,
                 "even" => Parity::Even,
-                _ => return Err("parity must be none, odd or even".into()),
+                _ => return Err(Key::ParityValues.into()),
             },
             flow_control: match self.flow.as_str() {
                 "none" => FlowControl::None,
                 "software" => FlowControl::Software,
                 "hardware" => FlowControl::Hardware,
-                _ => return Err("flow must be none, software or hardware".into()),
+                _ => return Err(Key::FlowValues.into()),
             },
             dtr: self.dtr,
             rts: self.rts,
@@ -251,13 +242,66 @@ impl Config {
     }
 }
 
-pub fn io_error(message: String) -> io::Error {
-    io::Error::other(message)
+#[derive(Debug)]
+pub struct ConfigError {
+    pub language: Language,
+    pub message: Message,
 }
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message.render(self.language))
+    }
+}
+impl std::error::Error for ConfigError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn language_defaults_and_cli_override_are_explicit() {
+        assert_eq!(
+            Config::parse(Vec::<String>::new()).unwrap().0.language,
+            Language::En
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "language = \"zh-CN\"").unwrap();
+        let filename = path.to_string_lossy().into_owned();
+        let (config, action) =
+            Config::parse(["--config".into(), filename.clone(), "--help".into()]).unwrap();
+        assert_eq!(config.language, Language::ZhCn);
+        assert_eq!(action, Action::Help);
+        for args in [
+            vec![
+                "--lang".into(),
+                "en".into(),
+                "--config".into(),
+                filename.clone(),
+            ],
+            vec![
+                "--config".into(),
+                filename.clone(),
+                "--lang".into(),
+                "en".into(),
+            ],
+        ] {
+            assert_eq!(Config::parse(args).unwrap().0.language, Language::En);
+        }
+        let output = toml::to_string(&config).unwrap();
+        assert!(output.contains("language = \"zh-CN\""));
+    }
+
+    #[test]
+    fn invalid_inputs_use_selected_language() {
+        let error =
+            Config::parse(["--lang", "zh-CN", "--baud", "bad"].map(str::to_owned)).unwrap_err();
+        assert!(error.to_string().contains("波特率只能包含数字"));
+        let error =
+            Config::parse(["--lang", "en", "--baud", "bad"].map(str::to_owned)).unwrap_err();
+        assert!(error.to_string().contains("digits only"));
+        assert!(Config::parse(["--lang", "fr"].map(str::to_owned)).is_err());
+        assert!(Config::parse(["--lang".into()]).is_err());
+    }
     #[test]
     fn cli_overrides_file_independent_of_argument_order() {
         let dir = tempfile::tempdir().unwrap();

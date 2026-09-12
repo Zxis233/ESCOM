@@ -1,10 +1,11 @@
-use crate::text::english_error;
+use crate::i18n::{Key, Language, Message};
+use crate::msg;
 use crate::{config::Config, demo::DemoBackend, display::Display};
 use chrono::Local;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use escom_core::{
     capture::CaptureHandle,
-    formatting::{encode_text, parse_send_input},
+    formatting::{encode_text_typed, parse_send_input_typed},
     model::{LineEnding, SendMode},
     search::SearchMatcher,
     serial_worker::{ProductionBackend, SerialBackend, WorkerEvent, WorkerHandle, WorkerOptions},
@@ -42,12 +43,12 @@ pub struct App {
     pub matches: Vec<usize>,
     pub selected_match: usize,
     pub search_truncated: bool,
-    pub notice: String,
-    pub last_tx: String,
+    pub notice: Message,
+    pub last_tx: Message,
     pub help: bool,
     pub capture: Option<CaptureHandle>,
     pub capture_path: Option<PathBuf>,
-    pub capture_result: String,
+    pub capture_result: Message,
     pub capture_failed: bool,
     next_id: u64,
     cycle_port_on_refresh: bool,
@@ -57,7 +58,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(mut config: Config) -> Result<Self, String> {
+    pub fn new(mut config: Config) -> Result<Self, Message> {
         let backend: Arc<dyn SerialBackend> = if config.demo {
             config.port = "DEMO".into();
             Arc::new(DemoBackend)
@@ -96,12 +97,12 @@ impl App {
             matches: Vec::new(),
             selected_match: 0,
             search_truncated: false,
-            notice: "F2 choose port | F3 connect | ? help".into(),
-            last_tx: String::new(),
+            notice: Key::Startup.into(),
+            last_tx: Key::Empty.into(),
             help: false,
             capture: None,
             capture_path: None,
-            capture_result: "Recording off".into(),
+            capture_result: Key::RecordingOff.into(),
             capture_failed: false,
             next_id: 1,
             cycle_port_on_refresh: false,
@@ -132,8 +133,7 @@ impl App {
                     self.ports = ports;
                     if self.cycle_port_on_refresh && !self.connected && !self.connecting {
                         if self.ports.is_empty() {
-                            self.notice =
-                                "No ports found; use :port COM3 to enter one manually".into();
+                            self.notice = Key::NoPortsHint.into();
                         } else {
                             let next = self
                                 .ports
@@ -141,7 +141,7 @@ impl App {
                                 .position(|p| p == &self.config.port)
                                 .map_or(0, |i| (i + 1) % self.ports.len());
                             self.config.port.clone_from(&self.ports[next]);
-                            self.notice = format!("Selected {} | F3 connect", self.config.port);
+                            self.notice = msg!(PortSelected, self.config.port);
                         }
                     } else if self.config.port.is_empty() {
                         self.config.port = self.ports.first().cloned().unwrap_or_default();
@@ -151,22 +151,22 @@ impl App {
                 WorkerEvent::Opened(port) => {
                     self.connected = true;
                     self.connecting = false;
-                    self.notice = format!("Connected: {port}");
+                    self.notice = msg!(PortConnected, port);
                 }
                 WorkerEvent::Closed { error } => {
                     self.connected = false;
                     self.connecting = false;
                     self.notice = error
-                        .map(|error| english_error(&error))
-                        .unwrap_or_else(|| "Disconnected".into());
+                        .map(Message::from)
+                        .unwrap_or_else(|| Key::Disconnected.into());
                 }
                 WorkerEvent::TxCompleted { id, count } => {
-                    self.last_tx = format!("TX #{id}: {count} bytes written")
+                    self.last_tx = msg!(TxCompleted, id, count)
                 }
                 WorkerEvent::TxFailed { id, message } => {
-                    self.last_tx = format!("TX #{id}: {}", english_error(&message))
+                    self.last_tx = Message::TxFailed { id, error: message }
                 }
-                WorkerEvent::ControlError(message) => self.notice = english_error(&message),
+                WorkerEvent::ControlError(message) => self.notice = message.into(),
             }
         }
         if !self.paused {
@@ -196,51 +196,51 @@ impl App {
         changed
     }
 
-    pub fn toggle_connection(&mut self) -> Result<(), String> {
+    pub fn toggle_connection(&mut self) -> Result<(), Message> {
         if self.connected || self.connecting {
             self.worker.close()?;
-            self.notice = "Disconnecting...".into();
+            self.notice = Key::Disconnecting.into();
         } else {
             let config = self.config.serial_config()?;
-            config.validate().map_err(str::to_owned)?;
+            config.validate_typed()?;
             self.worker.open(config)?;
             self.connecting = true;
-            self.notice = "Connecting...".into();
+            self.notice = Key::ConnectingNotice.into();
         }
         Ok(())
     }
 
-    fn choose_port(&mut self) -> Result<(), String> {
+    fn choose_port(&mut self) -> Result<(), Message> {
         if self.connected || self.connecting {
-            return Err("Disconnect before changing port".into());
+            return Err(Key::DisconnectPort.into());
         }
         self.worker.refresh_ports()?;
         self.cycle_port_on_refresh = true;
-        self.notice = "Refreshing ports...".into();
+        self.notice = Key::RefreshingPorts.into();
         Ok(())
     }
 
-    pub fn start_capture(&mut self, path: &Path) -> Result<(), String> {
+    pub fn start_capture(&mut self, path: &Path) -> Result<(), Message> {
         if self.capture.is_some() {
-            return Err("Stop the current recording first (:stop-record)".into());
+            return Err(Key::StopRecordingFirst.into());
         }
         let capture = CaptureHandle::start(path, self.config.record_queue_kib * 1024)
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| Message::Context(Key::RecordStartError, Box::new(error.into())))?;
         self.worker.set_capture(Some(capture.sink()))?;
         self.capture = Some(capture);
         self.capture_path = Some(path.into());
-        self.capture_result = "Recording RX bytes".into();
+        self.capture_result = Key::RecordingRx.into();
         self.capture_failed = false;
         Ok(())
     }
 
-    pub fn stop_capture(&mut self) -> Result<(), String> {
+    pub fn stop_capture(&mut self) -> Result<(), Message> {
         self.worker.set_capture(None)?;
         if let Some(mut capture) = self.capture.take() {
-            let result = capture.finish().map_err(|e| e.to_string());
+            let result = capture.finish().map_err(Message::from);
             self.capture_failed = result.is_err();
             self.capture_result = match &result {
-                Ok(()) => format!("Saved {} bytes", capture.progress().written_bytes),
+                Ok(()) => msg!(SavedBytes, capture.progress().written_bytes),
                 Err(error) => error.clone(),
             };
             result?;
@@ -248,30 +248,30 @@ impl App {
         Ok(())
     }
 
-    pub fn shutdown(&mut self) -> Result<(), String> {
+    pub fn shutdown(&mut self) -> Result<(), Message> {
         self.worker.shutdown();
         if let Some(mut capture) = self.capture.take() {
-            capture.finish().map_err(|e| e.to_string())?;
+            capture.finish().map_err(Message::from)?;
         }
         Ok(())
     }
 
-    fn send_bytes(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+    fn send_bytes(&mut self, bytes: Vec<u8>) -> Result<(), Message> {
         if !self.connected {
-            return Err("Connect before sending".into());
+            return Err(Key::ConnectBeforeSend.into());
         }
         let id = self.next_id;
         self.worker.send(id, bytes)?;
         self.next_id = self.next_id.wrapping_add(1).max(1);
-        self.last_tx = format!("TX #{id}: queued");
+        self.last_tx = msg!(TxQueued, id);
         Ok(())
     }
 
-    pub fn search(&mut self) -> Result<(), String> {
+    pub fn search(&mut self) -> Result<(), Message> {
         self.matches.clear();
         self.selected_match = 0;
         self.search_truncated = false;
-        if let Some(matcher) = SearchMatcher::new_with_limits(
+        if let Some(matcher) = SearchMatcher::new_with_limits_typed(
             &self.input,
             false,
             self.search_regex,
@@ -289,15 +289,10 @@ impl App {
             }
         }
         self.jump_match();
-        self.notice = format!(
-            "{} matching rows{} | n/N navigate | Space resume (clears results)",
-            self.matches.len(),
-            if self.search_truncated {
-                " (capped)"
-            } else {
-                ""
-            }
-        );
+        self.notice = Message::SearchResults {
+            count: self.matches.len(),
+            capped: self.search_truncated,
+        };
         Ok(())
     }
 
@@ -310,7 +305,7 @@ impl App {
         self.paused = false;
         self.matches.clear();
         self.search_truncated = false;
-        self.notice = "Following latest RX; search results cleared".into();
+        self.notice = Key::Following.into();
     }
 
     fn begin_input(&mut self, mode: InputMode) {
@@ -330,7 +325,7 @@ impl App {
         };
         // Reject the whole paste rather than silently sending a truncated command.
         if text.len() > limit.saturating_sub(self.input.len()) {
-            self.notice = format!("Input rejected: editor limit is {limit} UTF-8 bytes");
+            self.notice = msg!(InputLimit, limit);
             return;
         }
         self.input.push_str(text);
@@ -355,11 +350,13 @@ impl App {
             }
             Event::Paste(text) if self.input_mode == InputMode::Direct => {
                 if text.len() > self.config.send_kib * 1024 {
-                    Err("Paste exceeds send limit".into())
+                    Err(Key::PasteLimit.into())
                 } else {
                     self.config
                         .text_encoding()
-                        .and_then(|encoding| encode_text(&text, encoding, LineEnding::None))
+                        .and_then(|encoding| {
+                            encode_text_typed(&text, encoding, LineEnding::None).map_err(Into::into)
+                        })
                         .and_then(|bytes| self.send_bytes(bytes))
                         .map(|()| false)
                 }
@@ -369,13 +366,13 @@ impl App {
         match result {
             Ok(quit) => quit,
             Err(error) => {
-                self.notice = english_error(&error);
+                self.notice = error;
                 false
             }
         }
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> Result<bool, String> {
+    fn handle_key(&mut self, key: KeyEvent) -> Result<bool, Message> {
         if self.help {
             self.help = false;
             return Ok(false);
@@ -401,7 +398,7 @@ impl App {
                 }
                 KeyCode::Enter => {
                     match self.input_mode {
-                        InputMode::Send => self.send_bytes(parse_send_input(
+                        InputMode::Send => self.send_bytes(parse_send_input_typed(
                             &self.input,
                             self.send_mode,
                             self.config.text_encoding()?,
@@ -481,7 +478,7 @@ impl App {
             }
             KeyCode::F(8) => {
                 if !self.connected {
-                    return Err("Connect before entering direct input".into());
+                    return Err(Key::ConnectBeforeDirect.into());
                 }
                 self.config.mode = "terminal".into();
                 self.display.invalidate();
@@ -536,18 +533,18 @@ impl App {
             KeyCode::Char('c') => {
                 self.store
                     .lock()
-                    .map_err(|_| "Receive store unavailable")?
+                    .map_err(|_| Key::ReceiveStoreUnavailable)?
                     .clear();
                 self.display = Display::default();
                 self.resume();
-                self.notice = "History cleared; recording continues".into();
+                self.notice = Key::HistoryCleared.into();
             }
             _ => {}
         }
         Ok(false)
     }
 
-    fn command(&mut self) -> Result<(), String> {
+    fn command(&mut self) -> Result<(), Message> {
         let input = self.input.clone();
         let (name, value) = input.trim().split_once(' ').unwrap_or((input.trim(), ""));
         let value = value.trim();
@@ -560,10 +557,14 @@ impl App {
                 }
                 return Ok(());
             }
-            "disconnect" => return self.worker.close(),
+            "disconnect" => return self.worker.close().map_err(Into::into),
+            "lang" => {
+                self.config.language = Language::parse(value)?;
+                return Ok(());
+            }
             "ports" => {
                 self.worker.refresh_ports()?;
-                self.notice = self.ports.join(" | ");
+                self.notice = Message::Raw(self.ports.join(" | "));
                 return Ok(());
             }
             _ => {}
@@ -571,23 +572,23 @@ impl App {
         let mut config = self.config.clone();
         match name {
             "port" => config.port = value.into(),
-            "baud" => config.baud = value.parse().map_err(|_| "Invalid baud")?,
-            "data" => config.data_bits = value.parse().map_err(|_| "Invalid data bits")?,
-            "stop" => config.stop_bits = value.parse().map_err(|_| "Invalid stop bits")?,
+            "baud" => config.baud = value.parse().map_err(|_| Key::InvalidBaud)?,
+            "data" => config.data_bits = value.parse().map_err(|_| Key::InvalidDataBits)?,
+            "stop" => config.stop_bits = value.parse().map_err(|_| Key::InvalidStopBits)?,
             "parity" => config.parity = value.into(),
             "flow" => config.flow = value.into(),
             "dtr" | "rts" => {
                 let level = match value {
                     "on" => true,
                     "off" => false,
-                    _ => return Err("Use on or off".into()),
+                    _ => return Err(Key::UseOnOff.into()),
                 };
                 if name == "dtr" {
                     self.worker.set_dtr(level)?;
                     config.dtr = level;
                 } else {
                     if config.flow == "hardware" {
-                        return Err("RTS is controlled by hardware flow control".into());
+                        return Err(Key::HardwareRts.into());
                     }
                     self.worker.set_rts(level)?;
                     config.rts = level;
@@ -596,12 +597,12 @@ impl App {
             "mode" => config.mode = value.into(),
             "encoding" => config.encoding = value.into(),
             "eol" => config.line_ending = value.into(),
-            _ => return Err("Unknown command; ? shows command help".into()),
+            _ => return Err(Key::UnknownCommand.into()),
         }
         if matches!(name, "port" | "baud" | "data" | "stop" | "parity" | "flow")
             && (self.connected || self.connecting)
         {
-            return Err("Disconnect before changing serial settings".into());
+            return Err(Key::DisconnectSettings.into());
         }
         config.validate()?;
         self.config = config;
@@ -609,7 +610,7 @@ impl App {
             self.display.invalidate();
             self.resume();
         }
-        self.notice = format!("Set {name} = {value}");
+        self.notice = msg!(SettingChanged, name, value);
         Ok(())
     }
 }
@@ -617,7 +618,7 @@ impl App {
 fn direct_key(
     key: KeyEvent,
     encoding: escom_core::model::TextEncoding,
-) -> Result<Option<Vec<u8>>, String> {
+) -> Result<Option<Vec<u8>>, Message> {
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && let KeyCode::Char(ch) = key.code
     {
@@ -638,7 +639,9 @@ fn direct_key(
         KeyCode::End => b"\x1b[F",
         KeyCode::Delete => b"\x1b[3~",
         KeyCode::Char(ch) => {
-            return encode_text(&ch.to_string(), encoding, LineEnding::None).map(Some);
+            return encode_text_typed(&ch.to_string(), encoding, LineEnding::None)
+                .map(Some)
+                .map_err(Into::into);
         }
         _ => return Ok(None),
     };
@@ -651,6 +654,49 @@ mod tests {
     use escom_core::model::TextEncoding;
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn switching_language_preserves_history_search_encoding_and_recording() {
+        let mut app = App::new(Config {
+            encoding: "gbk".into(),
+            ..Config::default()
+        })
+        .unwrap();
+        app.store
+            .lock()
+            .unwrap()
+            .append(Local::now(), vec![0xd6, 0xd0, b'\n']);
+        app.tick();
+        app.paused = true;
+        app.matches = vec![0];
+        app.notice = msg!(PortSelected, "设备{0}");
+        let original_rows = app.display.rows.clone();
+        let dir = tempfile::tempdir().unwrap();
+        app.start_capture(&dir.path().join("rx.bin")).unwrap();
+        app.handle_event(key(KeyCode::Char(':')));
+        app.append_input("lang zh-CN");
+        app.handle_event(key(KeyCode::Enter));
+        assert_eq!(app.config.language, Language::ZhCn);
+        assert_eq!(app.config.encoding, "gbk");
+        assert!(app.paused);
+        assert_eq!(app.display.rows, original_rows);
+        assert_eq!(app.matches, vec![0]);
+        assert!(app.capture.is_some());
+        assert_eq!(
+            app.notice.render(app.config.language),
+            "已选择 设备{0} | F3 连接"
+        );
+        app.handle_event(key(KeyCode::Char(':')));
+        app.append_input("lang fr");
+        app.handle_event(key(KeyCode::Enter));
+        assert_eq!(app.config.language, Language::ZhCn);
+        assert!(
+            app.notice
+                .render(app.config.language)
+                .contains("不支持的语言")
+        );
+        app.shutdown().unwrap();
     }
 
     #[test]

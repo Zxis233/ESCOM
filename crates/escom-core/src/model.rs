@@ -1,3 +1,4 @@
+use crate::error::ErrorKind;
 use serde::{Deserialize, Serialize};
 use serialport::{DataBits, FlowControl, Parity, StopBits};
 
@@ -108,29 +109,35 @@ impl Default for SerialConfig {
 
 impl SerialConfig {
     pub fn validate(&self) -> Result<(), &'static str> {
+        self.validate_typed().map_err(ErrorKind::chinese)
+    }
+
+    pub fn validate_typed(&self) -> Result<(), ErrorKind> {
         if self.port_name.trim().is_empty() {
-            return Err("请选择串口");
+            return Err(ErrorKind::MissingPort);
         }
         if !(MIN_BAUD_RATE..=MAX_BAUD_RATE).contains(&self.baud_rate) {
-            return Err("波特率必须在 1 到 4,000,000 之间");
+            return Err(ErrorKind::BaudRange);
         }
         Ok(())
     }
 }
 
 pub fn parse_baud_rate(input: &str) -> Result<u32, &'static str> {
+    parse_baud_rate_typed(input).map_err(ErrorKind::chinese)
+}
+
+pub fn parse_baud_rate_typed(input: &str) -> Result<u32, ErrorKind> {
     let input = input.trim();
     if input.is_empty() {
-        return Err("请输入波特率");
+        return Err(ErrorKind::BaudMissing);
     }
     if !input.chars().all(|character| character.is_ascii_digit()) {
-        return Err("波特率只能包含数字");
+        return Err(ErrorKind::BaudDigits);
     }
-    let value = input
-        .parse::<u32>()
-        .map_err(|_| "波特率必须在 1 到 4,000,000 之间")?;
+    let value = input.parse::<u32>().map_err(|_| ErrorKind::BaudRange)?;
     if !(MIN_BAUD_RATE..=MAX_BAUD_RATE).contains(&value) {
-        return Err("波特率必须在 1 到 4,000,000 之间");
+        return Err(ErrorKind::BaudRange);
     }
     Ok(value)
 }

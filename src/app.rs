@@ -401,7 +401,7 @@ impl EscomApp {
                     self.repeat = None;
                     self.pending_history.clear();
                     if let Some(message) = error {
-                        self.send_error = Some(message.clone());
+                        self.send_error = Some(message.to_string());
                         self.set_notice(message, true);
                     } else if was_active {
                         self.set_notice("串口已断开", false);
@@ -419,7 +419,7 @@ impl EscomApp {
                 WorkerEvent::TxFailed { id, message } => {
                     self.pending_history.remove(&id);
                     self.repeat = None;
-                    self.send_error = Some(message.clone());
+                    self.send_error = Some(message.to_string());
                     self.set_notice(message, true);
                 }
                 WorkerEvent::ControlError(message) => self.set_notice(message, true),

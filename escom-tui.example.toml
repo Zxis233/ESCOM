@@ -1,5 +1,6 @@
 # Copy/edit this file; load explicitly with --config <file>.
 # CLI options override TOML. Runtime :commands are not saved automatically.
+language = "en" # en or zh-CN; independent of serial encoding
 port = ""
 baud = 115200
 data_bits = 8

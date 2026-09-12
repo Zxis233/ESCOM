@@ -1,3 +1,4 @@
+use crate::error::{CoreError, ErrorKind};
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::io::{self, BufWriter, Write as _};
@@ -748,13 +749,26 @@ pub fn parse_send_input(
     encoding: TextEncoding,
     line_ending: LineEnding,
 ) -> Result<Vec<u8>, String> {
+    parse_send_input_typed(input, mode, encoding, line_ending).map_err(Into::into)
+}
+
+pub fn parse_send_input_typed(
+    input: &str,
+    mode: SendMode,
+    encoding: TextEncoding,
+    line_ending: LineEnding,
+) -> Result<Vec<u8>, CoreError> {
     match mode {
-        SendMode::Text => encode_text(input, encoding, line_ending),
-        SendMode::Hex => parse_hex(input),
+        SendMode::Text => encode_text_typed(input, encoding, line_ending),
+        SendMode::Hex => parse_hex_typed(input),
     }
 }
 
 pub fn parse_hex(input: &str) -> Result<Vec<u8>, String> {
+    parse_hex_typed(input).map_err(Into::into)
+}
+
+pub fn parse_hex_typed(input: &str) -> Result<Vec<u8>, CoreError> {
     let compact: String = input
         .split_whitespace()
         .map(|token| {
@@ -766,13 +780,13 @@ pub fn parse_hex(input: &str) -> Result<Vec<u8>, String> {
         .collect();
 
     if compact.is_empty() {
-        return Err("请输入要发送的 HEX 数据".into());
+        return Err(ErrorKind::HexEmpty.into());
     }
     if !compact.len().is_multiple_of(2) {
-        return Err("HEX 字符数量必须为偶数".into());
+        return Err(ErrorKind::HexOdd.into());
     }
     if !compact.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("HEX 数据只能包含 0-9、A-F 和空格".into());
+        return Err(ErrorKind::HexChars.into());
     }
 
     compact
@@ -780,7 +794,7 @@ pub fn parse_hex(input: &str) -> Result<Vec<u8>, String> {
         .chunks_exact(2)
         .map(|pair| {
             let token = std::str::from_utf8(pair).expect("ASCII hex was validated");
-            u8::from_str_radix(token, 16).map_err(|_| "HEX 数据格式无效".to_owned())
+            u8::from_str_radix(token, 16).map_err(|_| ErrorKind::HexInvalid.into())
         })
         .collect()
 }
@@ -790,12 +804,20 @@ pub fn encode_text(
     encoding: TextEncoding,
     line_ending: LineEnding,
 ) -> Result<Vec<u8>, String> {
+    encode_text_typed(input, encoding, line_ending).map_err(Into::into)
+}
+
+pub fn encode_text_typed(
+    input: &str,
+    encoding: TextEncoding,
+    line_ending: LineEnding,
+) -> Result<Vec<u8>, CoreError> {
     let mut bytes = match encoding {
         TextEncoding::Utf8 => input.as_bytes().to_vec(),
         TextEncoding::Gbk => {
             let (encoded, _, had_errors) = GBK.encode(input);
             if had_errors {
-                return Err("文本包含 GBK 无法表示的字符".into());
+                return Err(ErrorKind::Unencodable.into());
             }
             encoded.into_owned()
         }
@@ -803,7 +825,7 @@ pub fn encode_text(
     bytes.extend_from_slice(line_ending.bytes());
 
     if bytes.is_empty() {
-        return Err("请输入要发送的数据".into());
+        return Err(ErrorKind::SendEmpty.into());
     }
     Ok(bytes)
 }

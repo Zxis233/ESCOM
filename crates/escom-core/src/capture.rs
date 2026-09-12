@@ -11,6 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::budget::{ByteBudget, Reservation};
+use crate::error::{CoreError, ErrorKind, Operation};
 use crossbeam_channel::{Receiver, Sender, bounded};
 
 const BLOCK_BYTES: usize = 8192;
@@ -27,11 +28,11 @@ struct Status {
     failed: AtomicBool,
     finished: AtomicBool,
     written: AtomicU64,
-    error: Mutex<Option<String>>,
+    error: Mutex<Option<CoreError>>,
 }
 
 impl Status {
-    fn fail(&self, message: String) {
+    fn fail(&self, message: CoreError) {
         if let Ok(mut error) = self.error.lock() {
             if error.is_none() {
                 *error = Some(message);
@@ -58,9 +59,7 @@ impl CaptureSink {
                 return;
             }
             let Some(reservation) = self.budget.reserve(bytes.len()) else {
-                self.status.fail(
-                    "Recording stopped: disk queue byte limit reached; file is incomplete".into(),
-                );
+                self.status.fail(ErrorKind::CaptureBudget.into());
                 return;
             };
             let block = Block {
@@ -68,9 +67,7 @@ impl CaptureSink {
                 _reservation: reservation,
             };
             if self.sender.try_send(block).is_err() {
-                self.status.fail(
-                    "Recording stopped: disk queue unavailable/full; file is incomplete".into(),
-                );
+                self.status.fail(ErrorKind::CaptureQueue.into());
                 return;
             }
         }
@@ -82,7 +79,7 @@ pub struct CaptureProgress {
     pub written_bytes: u64,
     pub queued_bytes: usize,
     pub finished: bool,
-    pub error: Option<String>,
+    pub error: Option<CoreError>,
 }
 
 pub struct CaptureHandle {
@@ -96,7 +93,7 @@ impl CaptureHandle {
         if !(BLOCK_BYTES..=64 * 1024 * 1024).contains(&queue_bytes) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "capture queue must be 8 KiB..64 MiB",
+                CoreError::Simple(ErrorKind::CaptureRange),
             ));
         }
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
@@ -145,7 +142,7 @@ impl CaptureHandle {
         if let Some(thread) = self.thread.take() {
             thread
                 .join()
-                .map_err(|_| io::Error::other("capture thread panicked"))?;
+                .map_err(|_| io::Error::other(CoreError::Simple(ErrorKind::CapturePanic)))?;
         }
         match self.progress().error {
             Some(error) => Err(io::Error::other(error)),
@@ -167,9 +164,10 @@ fn write_capture(file: File, receiver: Receiver<Block>, status: &Status) {
         match receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(block) => {
                 if let Err(error) = writer.write_all(&block.bytes) {
-                    status.fail(format!(
-                        "Recording write failed: {error}; file is incomplete"
-                    ));
+                    status.fail(CoreError::Operation {
+                        operation: Operation::CaptureWrite,
+                        detail: error.to_string(),
+                    });
                     break;
                 }
                 status
@@ -185,18 +183,20 @@ fn write_capture(file: File, receiver: Receiver<Block>, status: &Status) {
         }
         if last_flush.elapsed() >= Duration::from_secs(1) {
             if let Err(error) = writer.flush() {
-                status.fail(format!(
-                    "Recording flush failed: {error}; file is incomplete"
-                ));
+                status.fail(CoreError::Operation {
+                    operation: Operation::CaptureFlush,
+                    detail: error.to_string(),
+                });
                 break;
             }
             last_flush = Instant::now();
         }
     }
     if let Err(error) = writer.flush().and_then(|()| writer.get_ref().sync_all()) {
-        status.fail(format!(
-            "Recording final flush failed: {error}; file may be incomplete"
-        ));
+        status.fail(CoreError::Operation {
+            operation: Operation::CaptureSync,
+            detail: error.to_string(),
+        });
     }
 }
 

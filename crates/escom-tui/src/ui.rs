@@ -1,5 +1,7 @@
 use crate::app::{App, InputMode};
-use crate::text::send_mode_label;
+use crate::i18n::{Key, Message};
+use crate::msg;
+use escom_core::model::SendMode;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -11,34 +13,6 @@ use std::borrow::Cow;
 use unicode_width::UnicodeWidthChar;
 
 const ACCENT: Color = Color::Cyan;
-pub const HELP_TEXT: &str = "ESCOM TUI / KEYBOARD
-
-F2       Cycle detected ports       F3       Connect / disconnect
-F4       Text / HEX / Terminal      F5       UTF-8 / GBK
-F6       Start / stop raw recording F7       Send text / HEX
-F8       Direct terminal input (Esc returns to viewer)
-s        Compose a send            Enter    Submit editor
-/        Search frozen history     Ctrl+R   Toggle regex in search editor
-n / N    Next / previous hit row   Esc      Close editor
-Space    Pause / resume display    End      Follow live output
-Arrows   Scroll rows / columns     PgUp/Dn  Scroll a page
-Home     Oldest displayed row      t        Toggle timestamps
-c        Clear memory history      q        Quit (Ctrl+Q from any mode)
-Ctrl+U   Clear editor              :        Command editor
-
-COMMANDS (type : then a command; changes last for this run)
-port COM3    baud 115200    data 8    stop 1    parity none|odd|even
-flow none|software|hardware    dtr on|off    rts on|off
-mode text|hex|terminal    encoding utf8|gbk    eol none|cr|lf|crlf
-ports    connect    disconnect    record path with spaces.bin    stop-record
-
-Search: case-insensitive, current formatted history only; no background index.
-Pausing freezes the view, not reception or recording. Resume clears search hits.
-Long lines are clipped: scroll horizontally. History eviction is shown below.
-Recording: exact RX bytes, new file only; queue/disk failure marks it incomplete.
-Direct mode: Enter sends CR, Ctrl+C sends 0x03; Esc returns, Ctrl+Q exits.
-
-Press any key to close help.";
 
 /// Serial bytes must never be interpreted as host terminal escape sequences.
 pub fn safe_text(text: &str) -> Cow<'_, str> {
@@ -54,14 +28,15 @@ pub fn safe_text(text: &str) -> Cow<'_, str> {
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    let language = app.config.language;
+    let tr = |message: Message| message.render(language).into_owned();
+    let send_mode = language.text(match app.send_mode {
+        SendMode::Text => Key::Text,
+        SendMode::Hex => Key::Hex,
+    });
     let area = frame.area();
     if area.width < 48 || area.height < 12 {
-        frame.render_widget(
-            Paragraph::new(
-                "ESCOM TUI\nResize to at least 48 x 12.\nCtrl+Q exits; RX / recording continue.",
-            ),
-            area,
-        );
+        frame.render_widget(Paragraph::new(language.text(Key::SmallScreen)), area);
         return;
     }
     let [
@@ -85,21 +60,25 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(area);
     let connection = if app.connected {
-        "CONNECTED"
+        language.text(Key::Connected)
     } else if app.connecting {
-        "CONNECTING"
+        language.text(Key::Connecting)
     } else {
-        "OFFLINE"
+        language.text(Key::Offline)
     };
     frame.render_widget(
-        Paragraph::new(format!(
-            " ESCOM TUI  |  {} {} baud  |  {}  |  {} / {}",
+        Paragraph::new(tr(msg!(
+            Header,
             app.config.port,
             app.config.baud,
             connection,
-            app.config.mode.to_uppercase(),
+            language.text(match app.config.mode.as_str() {
+                "text" => Key::Text,
+                "hex" => Key::Hex,
+                _ => Key::Terminal,
+            }),
             app.config.encoding.to_uppercase()
-        ))
+        )))
         .style(
             Style::default()
                 .fg(Color::Black)
@@ -109,8 +88,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         header,
     );
     frame.render_widget(
-        Paragraph::new(" F2 Port  F3 Connect  F4 Mode  F5 Encoding  F6 Record  F8 Direct  ? Help")
-            .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(language.text(Key::Toolbar)).style(Style::default().fg(Color::DarkGray)),
         controls,
     );
 
@@ -146,9 +124,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Line::from(spans)
         })
         .collect();
-    let title = format!(
-        " RX / {} / rows {}-{} of {}{} ",
-        if app.paused { "PAUSED" } else { "LIVE" },
+    let title = tr(msg!(
+        RxTitle,
+        language.text(if app.paused { Key::Paused } else { Key::Live }),
         if app.display.rows.is_empty() {
             0
         } else {
@@ -157,11 +135,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         (app.offset + app.page_rows).min(app.display.rows.len()),
         app.display.rows.len(),
         if app.display.limited {
-            " / clipped"
+            language.text(Key::Clipped)
         } else {
             ""
         }
-    );
+    ));
     frame.render_widget(
         Paragraph::new(rows).scroll((0, app.horizontal)).block(
             Block::default()
@@ -178,8 +156,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .map(|s| (s.bytes_len(), s.records_len(), s.dropped_bytes()))
         .unwrap_or_default();
     frame.render_widget(
-        Paragraph::new(format!(
-            " RX {} B  TX {} B | Raw {}/{} KiB ({} records) | evicted {} B | TX queue {}/{} KiB",
+        Paragraph::new(tr(msg!(
+            Memory,
             app.worker.stats.rx_bytes(),
             app.worker.stats.tx_bytes(),
             raw / 1024,
@@ -188,24 +166,27 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             dropped,
             app.worker.queued_write_bytes().div_ceil(1024),
             app.config.tx_kib
-        ))
+        )))
         .style(Style::default().fg(Color::DarkGray)),
         memory,
     );
     let (record_text, failed) = if let Some(capture) = &app.capture {
         let progress = capture.progress();
         match progress.error {
-            Some(error) => (format!(" REC ERROR: {error}"), true),
+            Some(error) => (
+                tr(msg!(RecordingError, Message::Core(error).render(language))),
+                true,
+            ),
             None => (
-                format!(
-                    " REC {} B | queued {} B | {}",
+                tr(msg!(
+                    RecordingProgress,
                     progress.written_bytes,
                     progress.queued_bytes,
                     app.capture_path
                         .as_ref()
                         .map(|p| p.display().to_string())
                         .unwrap_or_default()
-                ),
+                )),
                 false,
             ),
         }
@@ -213,7 +194,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         (
             format!(
                 " {}{}",
-                app.capture_result,
+                app.capture_result.render(language),
                 app.capture_path
                     .as_ref()
                     .map(|p| format!(" | {}", p.display()))
@@ -231,39 +212,35 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         recording,
     );
     frame.render_widget(
-        Paragraph::new(safe_text(&app.notice)).style(Style::default().fg(Color::Yellow)),
+        Paragraph::new(safe_text(&app.notice.render(language)))
+            .style(Style::default().fg(Color::Yellow)),
         notice,
     );
+    let last_tx = app.last_tx.render(language);
     let (label, text) = match app.input_mode {
         InputMode::View => (
-            format!(
-                " TX {} / {} / s compose ",
-                send_mode_label(app.send_mode),
-                app.config.line_ending
-            ),
-            safe_text(&app.last_tx),
+            tr(msg!(TxTitle, send_mode, app.config.line_ending)),
+            safe_text(&last_tx),
         ),
-        InputMode::Send => (
-            format!(
-                " SEND {} / Enter submit / Esc cancel ",
-                send_mode_label(app.send_mode)
-            ),
-            safe_text(&app.input),
-        ),
+        InputMode::Send => (tr(msg!(SendTitle, send_mode)), safe_text(&app.input)),
         InputMode::Search => (
-            format!(
-                " SEARCH {} / Enter scan / Ctrl+R toggle ",
-                if app.search_regex { "REGEX" } else { "LITERAL" }
-            ),
+            tr(msg!(
+                SearchTitle,
+                language.text(if app.search_regex {
+                    Key::Regex
+                } else {
+                    Key::Literal
+                })
+            )),
             safe_text(&app.input),
         ),
         InputMode::Command => (
-            " COMMAND / Enter apply / Esc cancel ".into(),
+            language.text(Key::CommandTitle).into(),
             safe_text(&app.input),
         ),
         InputMode::Direct => (
-            " DIRECT INPUT / Esc viewer / Ctrl+Q quit ".into(),
-            Cow::Borrowed("Keys go to the serial port. Enter = CR; Ctrl+C = interrupt."),
+            language.text(Key::DirectTitle).into(),
+            Cow::Borrowed(language.text(Key::DirectHint)),
         ),
     };
     let width = editor.width.saturating_sub(2) as usize;
@@ -297,8 +274,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         frame.set_cursor_position((editor.x + 1 + tail_width as u16, editor.y + 1));
     }
     frame.render_widget(
-        Paragraph::new(" s Send   / Search   : Command   Space Pause   PgUp/PgDn Scroll   q Quit")
-            .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(language.text(Key::Footer)).style(Style::default().fg(Color::DarkGray)),
         footer,
     );
     if app.help {
@@ -310,9 +286,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
         frame.render_widget(Clear, rect);
         frame.render_widget(
-            Paragraph::new(HELP_TEXT).block(
+            Paragraph::new(language.text(Key::KeyboardHelp)).block(
                 Block::bordered()
-                    .title(" Help ")
+                    .title(language.text(Key::HelpTitle))
                     .border_style(Style::default().fg(ACCENT)),
             ),
             rect,
@@ -324,8 +300,66 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::i18n::Language;
     use chrono::Local;
     use ratatui::{Terminal, backend::TestBackend};
+    fn screen_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let mut result = String::new();
+        for row in buffer.content().chunks(usize::from(buffer.area.width)) {
+            let mut continuation = 0;
+            for cell in row {
+                if continuation > 0 {
+                    continuation -= 1;
+                    continue;
+                }
+                result.push_str(cell.symbol());
+                continuation =
+                    unicode_width::UnicodeWidthStr::width(cell.symbol()).saturating_sub(1);
+            }
+            result.push('\n');
+        }
+        result
+    }
+    #[test]
+    fn bilingual_layouts_preserve_device_text_and_display_localized_errors() {
+        for language in [Language::En, Language::ZhCn] {
+            let mut app = App::new(Config {
+                language,
+                ..Config::default()
+            })
+            .unwrap();
+            app.store.lock().unwrap().append(
+                Local::now(),
+                "设备返回：中文 / RAW DATA\n".as_bytes().to_vec(),
+            );
+            app.tick();
+            app.notice = escom_core::error::ErrorKind::HexOdd.into();
+            let mut terminal = Terminal::new(TestBackend::new(100, 34)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let screen = screen_text(&terminal);
+            assert!(screen.contains("设备返回：中文 / RAW DATA"));
+            assert!(screen.contains(if language == Language::En {
+                "TX Text"
+            } else {
+                "TX 文本"
+            }));
+            assert!(screen.contains(if language == Language::En {
+                "even number"
+            } else {
+                "偶数"
+            }));
+            app.help = true;
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let screen = screen_text(&terminal);
+            assert!(screen.contains("lang en|zh-CN"));
+            for (width, height) in [(48, 12), (20, 5)] {
+                let mut small = Terminal::new(TestBackend::new(width, height)).unwrap();
+                small.draw(|frame| draw(frame, &mut app)).unwrap();
+            }
+            app.shutdown().unwrap();
+        }
+    }
     #[test]
     fn renders_live_paused_search_editor_and_small_terminals() {
         let mut app = App::new(Config::default()).unwrap();

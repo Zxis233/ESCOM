@@ -1,0 +1,28 @@
+ESCOM TUI - bounded-memory serial viewer
+
+Usage: escom-tui [--config FILE] [options]
+  --lang en|zh-CN         Interface language (default: en)
+  --port COM3              Connect on startup (Linux: /dev/ttyUSB0)
+  --baud 115200            Baud rate; other serial settings in TOML or :commands
+  --mode text|hex|terminal Receive presentation
+  --encoding utf8|gbk      Receive and send encoding
+  --history-kib 2048       Raw RX history payload budget
+  --history-records 8192   Raw record count budget (includes boundaries)
+  --display-kib 512        Formatted text budget
+  --display-rows 2000      Formatted row count budget
+  --line-kib 8             Maximum formatted line length
+  --tx-kib 256             Queued + active TX payload budget
+  --send-kib 64            Maximum single send / editor payload budget
+  --record-queue-kib 256   Recording queue + active block payload budget
+  --record FILE            Stream raw RX bytes to a NEW file
+  --list                   List ports and exit
+  --demo                   Synthetic port for trying the UI without hardware
+  --print-config           Print effective TOML and exit
+  --help / --version
+
+Keys: F2 port, F3 connect/disconnect, F4 RX mode, F5 encoding, F6 record,
+F7 TX text/hex, F8 direct terminal input, s send, / search, : command,
+Space pause/resume, arrows/PgUp/PgDn scroll, End follow, c clear, ? help, q quit.
+Search runs on Enter over the frozen formatted history; n/N moves between rows.
+Recording continues while paused. Ctrl+Q always exits. See README.md for budgets.
+
