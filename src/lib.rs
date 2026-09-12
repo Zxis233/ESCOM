@@ -1,14 +1,9 @@
 pub mod app;
 pub mod fonts;
-pub mod formatting;
+pub use escom_core::{formatting, model, search, serial_worker, store};
 pub mod highlight;
 pub mod icon;
 pub mod logging;
-pub mod model;
-pub mod search;
-pub mod serial_worker;
 pub mod settings;
-pub mod store;
-mod terminal;
 pub mod theme;
 pub mod window_chrome;

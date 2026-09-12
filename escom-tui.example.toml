@@ -1,0 +1,27 @@
+# Copy/edit this file; load explicitly with --config <file>.
+# CLI options override TOML. Runtime :commands are not saved automatically.
+port = ""
+baud = 115200
+data_bits = 8
+stop_bits = 1
+parity = "none"
+flow = "none"
+dtr = false
+rts = false
+mode = "text"
+encoding = "utf8"
+line_ending = "crlf"
+timestamps = true
+
+history_kib = 2048
+history_records = 8192
+display_kib = 512
+display_rows = 2000
+line_kib = 8
+tx_kib = 256
+send_kib = 64
+record_queue_kib = 256
+
+# Optional: raw RX capture, create-new only. Paths are relative to working directory.
+# record = "session.bin"
+demo = false

@@ -48,10 +48,32 @@ impl<'a> SearchDisplayOptions<'a> {
 }
 
 impl SearchMatcher {
+    /// Allows frontends to keep a bounded row-only index instead of every match.
+    pub fn is_match(&self, text: &str) -> bool {
+        self.matcher.is_match(text)
+    }
+
     pub fn new(
         query: &str,
         case_sensitive: bool,
         regex_mode: bool,
+    ) -> Result<Option<Self>, String> {
+        Self::new_with_limits(
+            query,
+            case_sensitive,
+            regex_mode,
+            10 * 1024 * 1024,
+            2 * 1024 * 1024,
+        )
+    }
+
+    /// Bounds regex compilation and the lazy DFA cache for memory-sensitive frontends.
+    pub fn new_with_limits(
+        query: &str,
+        case_sensitive: bool,
+        regex_mode: bool,
+        program_bytes: usize,
+        dfa_bytes: usize,
     ) -> Result<Option<Self>, String> {
         if query.is_empty() {
             return Ok(None);
@@ -64,6 +86,8 @@ impl SearchMatcher {
         };
         RegexBuilder::new(&expression)
             .case_insensitive(!case_sensitive)
+            .size_limit(program_bytes)
+            .dfa_size_limit(dfa_bytes)
             .build()
             .map(|matcher| Some(Self { matcher }))
             .map_err(|error| format!("正则表达式无效：{error}"))

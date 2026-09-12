@@ -90,6 +90,7 @@ pub struct ReceiveStore {
     records: VecDeque<ReceiveRecord>,
     bytes_len: usize,
     limit_bytes: usize,
+    limit_records: usize,
     next_sequence: u64,
     session_bytes: u64,
     stream_id: u64,
@@ -99,10 +100,16 @@ pub struct ReceiveStore {
 
 impl ReceiveStore {
     pub fn new(limit_bytes: usize) -> Self {
+        Self::with_limits(limit_bytes, usize::MAX)
+    }
+
+    /// Both payload bytes and record metadata are bounded. Empty data is ignored.
+    pub fn with_limits(limit_bytes: usize, limit_records: usize) -> Self {
         Self {
             records: VecDeque::new(),
             bytes_len: 0,
             limit_bytes,
+            limit_records: limit_records.max(1),
             next_sequence: 0,
             session_bytes: 0,
             stream_id: 0,
@@ -143,6 +150,7 @@ impl ReceiveStore {
             }));
         self.next_sequence = self.next_sequence.wrapping_add(1);
         self.generation = self.generation.wrapping_add(1);
+        self.trim_to_limit();
         true
     }
 
@@ -167,6 +175,10 @@ impl ReceiveStore {
 
     pub const fn bytes_len(&self) -> usize {
         self.bytes_len
+    }
+
+    pub fn records_len(&self) -> usize {
+        self.records.len()
     }
 
     pub const fn dropped_bytes(&self) -> u64 {
@@ -283,7 +295,7 @@ impl ReceiveStore {
     }
 
     fn trim_to_limit(&mut self) {
-        while self.bytes_len > self.limit_bytes {
+        while self.bytes_len > self.limit_bytes || self.records.len() > self.limit_records {
             let Some(oldest) = self.records.pop_front() else {
                 break;
             };
@@ -299,6 +311,26 @@ mod tests {
     use chrono::Local;
 
     use super::*;
+
+    #[test]
+    fn record_budget_bounds_tiny_reads_and_session_metadata() {
+        let mut store = ReceiveStore::with_limits(1024, 8);
+        for _ in 0..1000 {
+            store.append(Local::now(), vec![1]);
+            store.mark_stream_boundary(Local::now());
+            assert!(store.records_len() <= 8);
+        }
+        assert!(store.bytes_len() <= 4);
+        assert!(store.dropped_bytes() >= 996);
+        assert!(
+            store
+                .delta_since(ReceiveCursor {
+                    stream_id: 0,
+                    next_sequence: 0
+                })
+                .reset_or_gap
+        );
+    }
 
     fn data(record: &ReceiveRecord) -> &RxChunk {
         record.as_data().expect("expected data record")

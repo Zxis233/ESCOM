@@ -49,11 +49,11 @@ pub const fn display_snapshot_limit(mode: ReceiveMode) -> usize {
     }
 }
 
-#[derive(Clone, Copy)]
-struct DisplayLimits {
-    max_rows: usize,
-    max_text_bytes: usize,
-    max_line_bytes: usize,
+#[derive(Debug, Clone, Copy)]
+pub struct DisplayLimits {
+    pub max_rows: usize,
+    pub max_text_bytes: usize,
+    pub max_line_bytes: usize,
 }
 
 const DEFAULT_DISPLAY_LIMITS: DisplayLimits = DisplayLimits {
@@ -128,7 +128,7 @@ impl DisplayFormatter {
         Self::rebuild_with_limits(snapshot, mode, encoding, DEFAULT_DISPLAY_LIMITS)
     }
 
-    fn rebuild_with_limits(
+    pub fn rebuild_with_limits(
         snapshot: &ReceiveSnapshot,
         mode: ReceiveMode,
         encoding: TextEncoding,
@@ -275,6 +275,11 @@ impl DisplayFormatter {
                             limited,
                             *limits,
                         );
+                        // Release discarded output per record, not after an entire rebuild.
+                        if removed_new_rows != 0 {
+                            rows.drain(..removed_new_rows.min(rows.len()));
+                            removed_new_rows = 0;
+                        }
                     }
                     let new_rows_start = rows.len();
                     state.push_partial_row(&mut rows, row_end_sequences);
@@ -305,6 +310,10 @@ impl DisplayFormatter {
                             limited,
                             *limits,
                         );
+                        if removed_new_rows != 0 {
+                            rows.drain(..removed_new_rows.min(rows.len()));
+                            removed_new_rows = 0;
+                        }
                     }
                     let new_rows_start = rows.len();
                     state.push_partial_row(&mut rows, row_end_sequences);

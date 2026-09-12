@@ -7,6 +7,8 @@ use std::time::Duration;
 use chrono::Local;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 
+use crate::budget::{ByteBudget, Reservation};
+use crate::capture::CaptureSink;
 use crate::model::SerialConfig;
 use crate::store::ReceiveStore;
 
@@ -103,6 +105,7 @@ impl PortIo for NativePort {
 
 #[derive(Debug)]
 enum WorkerCommand {
+    SetCapture(Option<CaptureSink>, Sender<()>),
     RefreshPorts,
     Open(SerialConfig),
     Close,
@@ -114,13 +117,15 @@ enum WorkerCommand {
 #[derive(Debug)]
 struct WriteRequest {
     id: u64,
-    bytes: Vec<u8>,
+    bytes: Box<[u8]>,
+    reservation: Reservation,
 }
 
 struct PendingWrite {
     id: u64,
-    bytes: Vec<u8>,
+    bytes: Box<[u8]>,
     offset: usize,
+    _reservation: Reservation,
 }
 
 #[derive(Debug, Clone)]
@@ -175,7 +180,24 @@ impl SerialStats {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct WorkerOptions {
+    pub max_queued_write_bytes: usize,
+    pub max_write_bytes: usize,
+}
+
+impl Default for WorkerOptions {
+    fn default() -> Self {
+        Self {
+            max_queued_write_bytes: 4 * 1024 * 1024,
+            max_write_bytes: 1024 * 1024,
+        }
+    }
+}
+
 pub struct WorkerHandle {
+    write_budget: Arc<ByteBudget>,
+    max_write_bytes: usize,
     commands: Sender<WorkerCommand>,
     write_requests: Sender<WriteRequest>,
     pub events: Receiver<WorkerEvent>,
@@ -204,6 +226,15 @@ impl WorkerHandle {
         backend: Arc<dyn SerialBackend>,
         wake_ui: UiWake,
     ) -> Self {
+        Self::spawn_with_options(store, backend, wake_ui, WorkerOptions::default())
+    }
+
+    pub fn spawn_with_options(
+        store: Arc<Mutex<ReceiveStore>>,
+        backend: Arc<dyn SerialBackend>,
+        wake_ui: UiWake,
+        options: WorkerOptions,
+    ) -> Self {
         let (command_tx, command_rx) = unbounded();
         let (write_tx, write_rx) = bounded(WRITE_QUEUE_CAPACITY);
         let (event_tx, event_rx) = unbounded();
@@ -225,6 +256,8 @@ impl WorkerHandle {
             .expect("failed to start serial worker");
 
         Self {
+            write_budget: ByteBudget::new(options.max_queued_write_bytes),
+            max_write_bytes: options.max_write_bytes,
             commands: command_tx,
             write_requests: write_tx,
             events: event_rx,
@@ -246,12 +279,35 @@ impl WorkerHandle {
     }
 
     pub fn send(&self, id: u64, bytes: Vec<u8>) -> Result<(), String> {
+        if bytes.len() > self.max_write_bytes {
+            return Err(format!("单次发送超过 {} 字节限制", self.max_write_bytes));
+        }
+        let reservation = self
+            .write_budget
+            .reserve(bytes.len())
+            .ok_or_else(|| "串口发送积压已达到字节上限，请稍后重试".to_owned())?;
         self.write_requests
-            .try_send(WriteRequest { id, bytes })
+            .try_send(WriteRequest {
+                id,
+                bytes: bytes.into_boxed_slice(),
+                reservation,
+            })
             .map_err(|error| match error {
                 crossbeam_channel::TrySendError::Full(_) => "串口发送队列已满，请稍后重试".into(),
                 crossbeam_channel::TrySendError::Disconnected(_) => "串口任务已停止".into(),
             })
+    }
+
+    pub fn queued_write_bytes(&self) -> usize {
+        self.write_budget.used()
+    }
+
+    pub fn set_capture(&self, sink: Option<CaptureSink>) -> Result<(), String> {
+        let (sender, receiver) = bounded(1);
+        self.send_command(WorkerCommand::SetCapture(sink, sender))?;
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| "串口任务未确认记录切换".to_owned())
     }
 
     pub fn set_dtr(&self, level: bool) -> Result<(), String> {
@@ -296,6 +352,7 @@ fn worker_loop(
     let events = WorkerNotifier::new(events, wake_ui);
     let mut port: Option<Box<dyn PortIo>> = None;
     let mut pending_write: Option<PendingWrite> = None;
+    let mut capture: Option<CaptureSink> = None;
     let mut read_buffer = vec![0_u8; 8192];
     let command_context = CommandContext {
         backend: backend.as_ref(),
@@ -310,7 +367,13 @@ fn worker_loop(
             reject_queued_writes(&write_requests, &events, "串口尚未连接");
             match commands.recv_timeout(DISCONNECTED_POLL_INTERVAL) {
                 Ok(command) => {
-                    if handle_command(command, &command_context, &mut port, &mut pending_write) {
+                    if handle_command(
+                        command,
+                        &command_context,
+                        &mut port,
+                        &mut pending_write,
+                        &mut capture,
+                    ) {
                         break;
                     }
                 }
@@ -323,7 +386,13 @@ fn worker_loop(
         loop {
             match commands.try_recv() {
                 Ok(command) => {
-                    if handle_command(command, &command_context, &mut port, &mut pending_write) {
+                    if handle_command(
+                        command,
+                        &command_context,
+                        &mut port,
+                        &mut pending_write,
+                        &mut capture,
+                    ) {
                         break 'worker;
                     }
                 }
@@ -343,6 +412,7 @@ fn worker_loop(
                 id: request.id,
                 bytes: request.bytes,
                 offset: 0,
+                _reservation: request.reservation,
             });
         }
 
@@ -353,7 +423,7 @@ fn worker_loop(
             log::error!(target: "escom::serial", "serial write failed: {error}");
             port = None;
             mark_receive_boundary(&store);
-            discard_writes(&mut pending_write, &write_requests);
+            discard_writes(&mut pending_write, &write_requests, &events);
             events.emit(WorkerEvent::Closed {
                 error: Some(format!("串口写入失败：{error}")),
             });
@@ -367,6 +437,9 @@ fn worker_loop(
         match active_port.read(&mut read_buffer) {
             Ok(0) => thread::sleep(EMPTY_READ_BACKOFF),
             Ok(count) => {
+                if let Some(sink) = &capture {
+                    sink.record(&read_buffer[..count]);
+                }
                 stats.rx_bytes.fetch_add(count as u64, Ordering::Relaxed);
                 let appended = if let Ok(mut receive_store) = store.lock() {
                     receive_store.append(Local::now(), read_buffer[..count].to_vec());
@@ -387,7 +460,7 @@ fn worker_loop(
                 log::error!(target: "escom::serial", "serial read failed: {error}");
                 port = None;
                 mark_receive_boundary(&store);
-                discard_writes(&mut pending_write, &write_requests);
+                discard_writes(&mut pending_write, &write_requests, &events);
                 events.emit(WorkerEvent::Closed {
                     error: Some(format!("串口读取失败：{error}")),
                 });
@@ -395,6 +468,7 @@ fn worker_loop(
         }
     }
 
+    discard_writes(&mut pending_write, &write_requests, &events);
     if port.take().is_some() {
         mark_receive_boundary(&store);
     }
@@ -413,8 +487,13 @@ fn handle_command(
     context: &CommandContext<'_>,
     port: &mut Option<Box<dyn PortIo>>,
     pending_write: &mut Option<PendingWrite>,
+    capture: &mut Option<CaptureSink>,
 ) -> bool {
     match command {
+        WorkerCommand::SetCapture(sink, acknowledged) => {
+            *capture = sink;
+            let _ = acknowledged.send(());
+        }
         WorkerCommand::RefreshPorts => match context.backend.list_ports() {
             Ok(ports) => {
                 context.events.emit(WorkerEvent::Ports(ports));
@@ -431,7 +510,7 @@ fn handle_command(
                 config.port_name,
                 config.baud_rate
             );
-            discard_writes(pending_write, context.write_requests);
+            discard_writes(pending_write, context.write_requests, context.events);
             if port.take().is_some() {
                 mark_receive_boundary(context.store);
             }
@@ -451,7 +530,7 @@ fn handle_command(
             }
         }
         WorkerCommand::Close => {
-            discard_writes(pending_write, context.write_requests);
+            discard_writes(pending_write, context.write_requests, context.events);
             let was_open = port.take().is_some();
             if was_open {
                 mark_receive_boundary(context.store);
@@ -548,9 +627,24 @@ fn write_next_slice(
 fn discard_writes(
     pending_write: &mut Option<PendingWrite>,
     write_requests: &Receiver<WriteRequest>,
+    events: &WorkerNotifier,
 ) {
-    *pending_write = None;
-    while write_requests.try_recv().is_ok() {}
+    if let Some(pending) = pending_write.take() {
+        events.emit(WorkerEvent::TxFailed {
+            id: pending.id,
+            message: format!(
+                "发送 #{} 已取消：已写入 {}/{} 字节",
+                pending.id,
+                pending.offset,
+                pending.bytes.len()
+            ),
+        });
+    }
+    reject_queued_writes(
+        write_requests,
+        events,
+        "发送已取消：串口关闭或重新连接，已写入 0 字节",
+    );
 }
 
 fn reject_queued_writes(
@@ -583,6 +677,82 @@ mod tests {
 
     use super::*;
     use crate::store::ReceiveRecord;
+
+    #[test]
+    fn send_budget_includes_active_request_and_refunds_cancellation() {
+        let (commands, _) = unbounded();
+        let (writes, requests) = bounded(1);
+        let (events, receiver) = unbounded();
+        let budget = ByteBudget::new(8);
+        let worker = WorkerHandle {
+            commands,
+            write_requests: writes,
+            events: receiver.clone(),
+            stats: Arc::new(SerialStats::default()),
+            thread: None,
+            write_budget: Arc::clone(&budget),
+            max_write_bytes: 8,
+        };
+        assert!(worker.send(0, vec![0; 9]).is_err());
+        worker.send(1, vec![0; 8]).unwrap();
+        assert_eq!(worker.queued_write_bytes(), 8);
+        let request = requests.recv().unwrap();
+        assert!(worker.send(2, vec![0; 1]).is_err());
+        let mut active = Some(PendingWrite {
+            id: request.id,
+            bytes: request.bytes,
+            offset: 2,
+            _reservation: request.reservation,
+        });
+        let notifier = WorkerNotifier::new(events, Arc::new(|| {}));
+        discard_writes(&mut active, &requests, &notifier);
+        assert_eq!(worker.queued_write_bytes(), 0);
+        assert!(
+            matches!(receiver.recv().unwrap(), WorkerEvent::TxFailed { id: 1, message } if message.contains("2/8"))
+        );
+        worker.send(3, vec![0; 4]).unwrap();
+        assert!(worker.send(4, vec![0; 4]).is_err()); // item limit also refunds reservation
+        assert_eq!(worker.queued_write_bytes(), 4);
+        drop(requests.recv().unwrap());
+        assert_eq!(worker.queued_write_bytes(), 0);
+    }
+
+    #[test]
+    fn capture_keeps_bytes_already_evicted_from_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rx.bin");
+        let mut capture = crate::capture::CaptureHandle::start(&path, 65536).unwrap();
+        let (read_tx, read_rx) = unbounded();
+        let backend = Arc::new(MockBackend {
+            opened: AtomicBool::new(false),
+            reads: read_rx,
+            writes: Arc::new(Mutex::new(Vec::new())),
+        });
+        let store = Arc::new(Mutex::new(ReceiveStore::with_limits(64, 8)));
+        let mut worker = WorkerHandle::spawn_with_backend(Arc::clone(&store), backend);
+        worker.set_capture(Some(capture.sink())).unwrap();
+        worker
+            .open(SerialConfig {
+                port_name: "COM3".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        wait_for_event(&worker.events, |event| {
+            matches!(event, WorkerEvent::Opened(_))
+        });
+        let bytes: Vec<u8> = (0..16384).map(|i| (i % 256) as u8).collect();
+        read_tx.send(bytes.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while worker.stats.rx_bytes() < bytes.len() as u64 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        worker.set_capture(None).unwrap();
+        capture.finish().unwrap();
+        worker.shutdown();
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert!(store.lock().unwrap().bytes_len() <= 64);
+        assert_eq!(store.lock().unwrap().dropped_bytes(), 16384);
+    }
 
     struct MockBackend {
         opened: AtomicBool,

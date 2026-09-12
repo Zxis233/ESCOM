@@ -6,7 +6,19 @@
 
 ESCOM 是一款使用 Rust 和 `eframe/egui` 编写的 Windows 串口查看器，面向嵌入式开发、设备联调和持续日志观察场景。串口读写在独立线程中执行，避免阻塞界面；接收数据采用有界缓存，并针对持续数据流进行了增量格式化和搜索优化。
 
-> 当前版本：`0.2.4`。项目处于早期开发阶段，欢迎提交 Issue 和 Pull Request。
+> 当前版本：`0.3.1`。项目处于早期开发阶段，欢迎提交 Issue 和 Pull Request。
+
+## 独立 TUI
+
+同仓库新增低内存终端版，与 GUI 共用 `escom-core`，单独构建不引入 GUI 依赖。
+
+```powershell
+cargo build --release -p escom-tui
+.\target\release\escom-tui.exe --demo
+.\target\release\escom-tui.exe --port COM3 --baud 115200
+```
+
+默认原始历史 2 MiB / 8192 条记录，格式化历史 512 KiB / 2000 行；支持按需搜索、原始 RX 流式记录和按字节限制的发送队列。详见 [TUI 使用与预算设计](docs/TUI.md) 和 [配置示例](escom-tui.example.toml)。以下功能与配置说明针对原有 GUI。
 
 ## 功能特性
 
@@ -65,8 +77,8 @@ ESCOM 不会自动连接设备。启动后请选择串口和通信参数，再�
 克隆或下载本仓库并进入项目目录后运行：
 
 ```powershell
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
+cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 cargo build --release
 ```
 
@@ -206,14 +218,13 @@ src/
 ├── app.rs            # 应用状态、后台事件与生命周期
 ├── app/              # 连接、接收、搜索、任务状态机、发送和设置界面
 ├── logging.rs        # 滚动诊断日志
-├── serial_worker.rs  # 串口后台任务
-├── store.rs          # 有界接收缓存
-├── formatting.rs     # 文本/HEX 格式化与导出
-├── search.rs         # 搜索与增量索引
 ├── highlight.rs      # TOML 高亮规则
 ├── settings.rs       # 用户偏好与配置存储
 ├── fonts.rs          # 系统字体加载
 └── window_chrome.rs  # 自绘标题栏与窗口交互
+crates/
+├── escom-core/       # 串口、缓存、格式化、终端、搜索、流式记录
+└── escom-tui/        # 独立终端界面与配置
 benches/
 └── pipeline.rs       # 格式化、搜索和导出性能基准
 ```
@@ -238,9 +249,9 @@ benches/
 提交前请运行：
 
 ```powershell
-cargo fmt --check
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## 许可证

@@ -1,0 +1,18 @@
+[package]
+name = "escom-core"
+version = "0.3.1"
+edition = "2024"
+license = "MIT"
+description = "Shared serial I/O and bounded display pipeline for ESCOM"
+
+[dependencies]
+chrono = { version = "0.4.41", features = ["clock", "serde"] }
+crossbeam-channel = "0.5.15"
+encoding_rs = "0.8.35"
+log = "0.4.33"
+regex = "1.12.2"
+serde = { version = "1.0.219", features = ["derive"] }
+serialport = "4.9.0"
+tempfile = "3.27.0"
+unicode-width = "0.2.2"
+vte = "0.15.0"
