@@ -1,6 +1,9 @@
 ESCOM TUI - bounded-memory serial viewer
 
 Usage: escom-tui [--config FILE] [options]
+  --config FILE           Use a different config file (also saved automatically)
+  --config-path            Print the active config path and exit
+  --connect                Connect using the saved port
   --lang en|zh-CN         Interface language (default: en)
   --port COM3              Connect on startup (Linux: /dev/ttyUSB0)
   --baud 115200            Baud rate; other serial settings in TOML or :commands
@@ -25,4 +28,6 @@ F7 TX text/hex, F8 direct terminal input, s send, / search, : command,
 Space pause/resume, arrows/PgUp/PgDn scroll, End follow, c clear, ? help, q quit.
 Search runs on Enter over the frozen formatted history; n/N moves between rows.
 Recording continues while paused. Ctrl+Q always exits. See README.md for budgets.
-
+Config is loaded/saved automatically in the GUI data folder: ESCOM/tui.toml.
+Settings save after 750 ms and on exit. Saved ports do not auto-connect by default.
+Use --port or --connect to connect on startup. Demo/recording paths are not saved.

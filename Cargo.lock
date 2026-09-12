@@ -1457,6 +1457,7 @@ version = "0.3.1"
 dependencies = [
  "chrono",
  "crossbeam-channel",
+ "directories",
  "encoding_rs",
  "log",
  "regex",

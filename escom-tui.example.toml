@@ -1,5 +1,6 @@
-# Copy/edit this file; load explicitly with --config <file>.
-# CLI options override TOML. Runtime :commands are not saved automatically.
+# Default: GUI data folder / ESCOM / tui.toml. Created automatically on first TUI run.
+# --config <file> selects a different file to load AND save. CLI overrides TOML.
+# Preferences are saved after 750 ms and on exit; saved ports require F3 or --connect.
 language = "en" # en or zh-CN; independent of serial encoding
 port = ""
 baud = 115200
@@ -12,6 +13,7 @@ rts = false
 mode = "text"
 encoding = "utf8"
 line_ending = "crlf"
+send_mode = "text"
 timestamps = true
 
 history_kib = 2048
@@ -23,6 +25,7 @@ tx_kib = 256
 send_kib = 64
 record_queue_kib = 256
 
-# Optional: raw RX capture, create-new only. Paths are relative to working directory.
+# Optional one-shot inputs: accepted on load, omitted when saving.
+# Raw RX capture is create-new only. Paths are relative to working directory.
 # record = "session.bin"
 demo = false

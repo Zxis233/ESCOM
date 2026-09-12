@@ -2,7 +2,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use directories::BaseDirs;
 use eframe::egui::ThemePreference;
 use serde::{Deserialize, Serialize};
 
@@ -458,9 +457,7 @@ setting_value!(BackgroundSourceValue, AppBackgroundSource, None, {
 });
 
 pub fn settings_dir() -> PathBuf {
-    BaseDirs::new()
-        .map(|dirs| dirs.config_dir().join("ESCOM"))
-        .unwrap_or_else(|| PathBuf::from("."))
+    escom_core::storage::settings_dir()
 }
 
 pub fn settings_path() -> PathBuf {

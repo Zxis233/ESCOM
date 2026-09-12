@@ -1,6 +1,9 @@
 ESCOM TUI - 有界内存串口查看器
 
 用法：escom-tui [--config 文件] [选项]
+  --config 文件         使用其他配置文件（同样自动保存）
+  --config-path         输出当前配置路径后退出
+  --connect             使用已保存的串口启动连接
   --lang en|zh-CN         界面语言（默认：en）
   --port COM3            启动时连接（Linux：/dev/ttyUSB0）
   --baud 115200          波特率；其他参数可通过配置文件或 :命令 设置
@@ -25,5 +28,7 @@ F8 直接输入，s 编辑发送，/ 搜索，: 命令，Space 暂停或恢复�
 方向键和 PgUp/PgDn 滚动，End 跟随，c 清空，? 帮助，q 退出。
 搜索在 Enter 后扫描暂停的格式化历史；n/N 在命中行之间跳转。
 暂停时接收和记录继续。Ctrl+Q 可在任何模式退出。
-用 :lang en 或 :lang zh-CN 切换语言；本次切换不自动保存。
-
+用 :lang en 或 :lang zh-CN 切换语言，设置会自动保存。
+默认使用与 GUI 共用的数据目录下的 ESCOM/tui.toml。
+修改后约 750 毫秒保存，退出时再次保存。已保存串口默认不自动连接。
+使用 --port 或 --connect 可启动连接；演示模式和记录路径不保存。

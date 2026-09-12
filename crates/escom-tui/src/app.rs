@@ -59,6 +59,7 @@ pub struct App {
 
 impl App {
     pub fn new(mut config: Config) -> Result<Self, Message> {
+        let send_mode = config.send_mode()?;
         let backend: Arc<dyn SerialBackend> = if config.demo {
             config.port = "DEMO".into();
             Arc::new(DemoBackend)
@@ -92,7 +93,7 @@ impl App {
             page_rows: 20,
             input_mode: InputMode::View,
             input: String::new(),
-            send_mode: SendMode::Text,
+            send_mode,
             search_regex: false,
             matches: Vec::new(),
             selected_match: 0,
@@ -114,7 +115,7 @@ impl App {
             app.start_capture(&path)?;
         }
         app.worker.refresh_ports()?;
-        if !app.config.port.is_empty() {
+        if app.config.demo || app.config.connect_on_start {
             app.toggle_connection()?;
         }
         Ok(app)
@@ -474,7 +475,13 @@ impl App {
                     SendMode::Hex
                 } else {
                     SendMode::Text
+                };
+                self.config.send_mode = if self.send_mode == SendMode::Text {
+                    "text"
+                } else {
+                    "hex"
                 }
+                .into();
             }
             KeyCode::F(8) => {
                 if !self.connected {
@@ -654,6 +661,23 @@ mod tests {
     use escom_core::model::TextEncoding;
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn saved_send_mode_loads_and_toggle_updates_config_without_auto_connecting() {
+        let mut app = App::new(Config {
+            port: "COM42".into(),
+            send_mode: "hex".into(),
+            ..Config::default()
+        })
+        .unwrap();
+        assert_eq!(app.send_mode, SendMode::Hex);
+        assert!(!app.connecting);
+        assert!(!app.connected);
+        app.handle_event(key(KeyCode::F(7)));
+        assert_eq!(app.send_mode, SendMode::Text);
+        assert_eq!(app.config.send_mode, "text");
+        app.shutdown().unwrap();
     }
 
     #[test]

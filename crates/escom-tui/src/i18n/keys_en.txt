@@ -13,7 +13,7 @@ Home     Oldest displayed row      t        Toggle timestamps
 c        Clear memory history      q        Quit (Ctrl+Q from any mode)
 Ctrl+U   Clear editor              :        Command editor
 
-COMMANDS (type : then a command; changes last for this run)
+COMMANDS (type : then a command; preferences are saved automatically)
 port COM3    baud 115200    data 8    stop 1    parity none|odd|even
 flow none|software|hardware    dtr on|off    rts on|off
 mode text|hex|terminal    encoding utf8|gbk    eol none|cr|lf|crlf

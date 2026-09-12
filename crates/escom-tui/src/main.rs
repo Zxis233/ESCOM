@@ -3,6 +3,7 @@ mod config;
 mod demo;
 mod display;
 mod i18n;
+mod persistence;
 mod ui;
 
 use app::App;
@@ -24,9 +25,14 @@ fn main() {
 }
 
 fn run() -> io::Result<()> {
-    let (config, action) = Config::parse(std::env::args().skip(1)).map_err(io::Error::other)?;
+    let (config, action, mut persistence) =
+        Config::parse(std::env::args().skip(1)).map_err(io::Error::other)?;
     let language = config.language;
     match action {
+        Action::ConfigPath => {
+            println!("{}", persistence.path.display());
+            return Ok(());
+        }
         Action::Help => {
             print!("{}", language.text(Key::CliHelp));
             return Ok(());
@@ -59,6 +65,9 @@ fn run() -> io::Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(io::Error::other(language.text(Key::NeedTerminal)));
     }
+    persistence
+        .save(&config)
+        .map_err(|e| io::Error::other(e.render(language).into_owned()))?;
     let mut app =
         App::new(config).map_err(|e| io::Error::other(e.render(language).into_owned()))?;
     let result = (|| {
@@ -70,6 +79,10 @@ fn run() -> io::Result<()> {
         loop {
             if Instant::now() >= next_tick {
                 dirty |= app.tick();
+                if let Err(error) = persistence.save_if_due(&app.config, Instant::now()) {
+                    app.notice = error;
+                    dirty = true;
+                }
                 next_tick = Instant::now() + Duration::from_millis(50);
             }
             if dirty {
@@ -90,11 +103,15 @@ fn run() -> io::Result<()> {
     let shutdown = app
         .shutdown()
         .map_err(|e| io::Error::other(e.render(language).into_owned()));
+    let saved = persistence
+        .save(&app.config)
+        .map_err(|e| io::Error::other(e.render(language).into_owned()));
     result
         .map_err(|e: io::Error| {
             io::Error::other(msg!(RuntimeError, e).render(language).into_owned())
         })
         .and(shutdown)
+        .and(saved)
 }
 
 struct RestoreTerminal;

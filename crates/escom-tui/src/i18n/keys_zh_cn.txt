@@ -13,7 +13,7 @@ Home     最早显示行                t        显示 / 隐藏时间戳
 c        清空内存历史              q        退出（任何模式可用 Ctrl+Q）
 Ctrl+U   清空编辑内容              :        命令编辑器
 
-命令（先按 :，修改仅在本次运行生效）
+命令（先按 :，设置自动保存；记录路径仅本次有效）
 port COM3    baud 115200    data 8    stop 1    parity none|odd|even
 flow none|software|hardware    dtr on|off    rts on|off
 mode text|hex|terminal    encoding utf8|gbk    eol none|cr|lf|crlf

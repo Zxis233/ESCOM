@@ -5,5 +5,6 @@ pub mod formatting;
 pub mod model;
 pub mod search;
 pub mod serial_worker;
+pub mod storage;
 pub mod store;
 mod terminal;
