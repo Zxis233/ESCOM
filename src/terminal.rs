@@ -6,7 +6,7 @@ use unicode_width::UnicodeWidthChar;
 use vte::{Params, Parser, Perform};
 
 use crate::model::TextEncoding;
-use crate::store::RxChunk;
+use crate::store::{ReceiveBoundary, ReceiveRecord, RxChunk};
 
 const TERMINAL_DECODE_INPUT_BYTES: usize = 64 * 1024;
 const MAX_TERMINAL_ROWS: usize = 100_000;
@@ -32,6 +32,7 @@ pub(crate) struct TerminalUpdate {
 }
 
 pub(crate) struct IncrementalTerminalFormatter {
+    encoding: TextEncoding,
     decoder: encoding_rs::Decoder,
     parser: Parser,
     screen: TerminalScreen,
@@ -46,6 +47,7 @@ impl IncrementalTerminalFormatter {
             TextEncoding::Gbk => GBK,
         };
         Self {
+            encoding,
             decoder: selected_encoding.new_decoder_without_bom_handling(),
             parser: Parser::new(),
             screen: TerminalScreen::default(),
@@ -54,9 +56,9 @@ impl IncrementalTerminalFormatter {
         }
     }
 
-    pub(crate) fn apply_chunks(
+    pub(crate) fn apply_records(
         &mut self,
-        chunks: &[RxChunk],
+        records: &[ReceiveRecord],
         max_rows: usize,
         max_text_bytes: usize,
         max_line_bytes: usize,
@@ -66,8 +68,15 @@ impl IncrementalTerminalFormatter {
         let max_line_bytes = max_line_bytes.clamp(16, MAX_TERMINAL_COLUMNS);
         self.screen
             .begin_update(max_rows, max_text_bytes, max_line_bytes);
-        for chunk in chunks {
-            self.push_chunk(chunk, max_rows, max_text_bytes, max_line_bytes);
+        for record in records {
+            match record {
+                ReceiveRecord::Data(chunk) => {
+                    self.push_chunk(chunk, max_rows, max_text_bytes, max_line_bytes)
+                }
+                ReceiveRecord::Boundary(boundary) => {
+                    self.finish_session(boundary, max_rows, max_text_bytes, max_line_bytes)
+                }
+            }
         }
         self.limited |= self
             .screen
@@ -116,22 +125,46 @@ impl IncrementalTerminalFormatter {
         self.screen.received_at = chunk.received_at;
 
         for piece in chunk.bytes.chunks(TERMINAL_DECODE_INPUT_BYTES) {
-            let mut input = piece;
-            loop {
-                let capacity = input.len().saturating_mul(3).max(32);
-                let mut decoded = String::with_capacity(capacity);
-                let (result, read, _) = self.decoder.decode_to_string(input, &mut decoded, false);
-                self.parser.advance(&mut self.screen, decoded.as_bytes());
-                input = &input[read..];
-                match result {
-                    CoderResult::InputEmpty => break,
-                    CoderResult::OutputFull => continue,
-                }
-            }
+            self.decode_bytes(piece, false);
             self.limited |= self
                 .screen
                 .enforce_limits(max_rows, max_text_bytes, max_line_bytes);
         }
+    }
+
+    fn decode_bytes(&mut self, mut input: &[u8], last: bool) {
+        loop {
+            let capacity = input.len().saturating_mul(3).max(32);
+            let mut decoded = String::with_capacity(capacity);
+            let (result, read, _) = self.decoder.decode_to_string(input, &mut decoded, last);
+            self.parser.advance(&mut self.screen, decoded.as_bytes());
+            input = &input[read..];
+            match result {
+                CoderResult::InputEmpty => break,
+                CoderResult::OutputFull => continue,
+            }
+        }
+    }
+
+    fn finish_session(
+        &mut self,
+        boundary: &ReceiveBoundary,
+        max_rows: usize,
+        max_text_bytes: usize,
+        max_line_bytes: usize,
+    ) {
+        self.screen.received_at = boundary.received_at;
+        self.decode_bytes(&[], true);
+        self.parser = Parser::new();
+        let selected_encoding = match self.encoding {
+            TextEncoding::Utf8 => UTF_8,
+            TextEncoding::Gbk => GBK,
+        };
+        self.decoder = selected_encoding.new_decoder_without_bom_handling();
+        self.screen.finish_session();
+        self.limited |= self
+            .screen
+            .enforce_limits(max_rows, max_text_bytes, max_line_bytes);
     }
 }
 
@@ -158,6 +191,7 @@ impl TerminalLine {
 
 struct TerminalScreen {
     lines: VecDeque<TerminalLine>,
+    session_origin: usize,
     cursor_row: usize,
     cursor_col: usize,
     saved_cursor: Option<(usize, usize)>,
@@ -177,6 +211,7 @@ impl Default for TerminalScreen {
     fn default() -> Self {
         Self {
             lines: VecDeque::new(),
+            session_origin: 0,
             cursor_row: 0,
             cursor_col: 0,
             saved_cursor: None,
@@ -307,6 +342,35 @@ impl TerminalScreen {
         self.line_feed();
     }
 
+    fn finish_session(&mut self) {
+        self.saved_cursor = None;
+        self.cursor_col = 0;
+        let Some(last_index) = self.lines.len().checked_sub(1) else {
+            self.session_origin = 0;
+            self.cursor_row = 0;
+            return;
+        };
+
+        let reuse_trailing_line =
+            self.lines[last_index].cells.is_empty() && !self.lines[last_index].completed;
+        if reuse_trailing_line {
+            for line in self.lines.iter_mut().take(last_index) {
+                line.completed = true;
+            }
+            self.cursor_row = last_index;
+        } else {
+            for line in &mut self.lines {
+                line.completed = true;
+            }
+            self.cursor_row = self.lines.len();
+            self.ensure_line(self.cursor_row);
+        }
+        while self.cursor_row >= self.max_rows {
+            self.remove_front();
+        }
+        self.session_origin = self.cursor_row;
+    }
+
     fn backspace(&mut self) {
         self.cursor_col = self.cursor_col.saturating_sub(1);
     }
@@ -319,12 +383,15 @@ impl TerminalScreen {
     }
 
     fn move_up(&mut self, count: usize) {
-        self.cursor_row = self.cursor_row.saturating_sub(count);
+        self.cursor_row = self
+            .cursor_row
+            .saturating_sub(count)
+            .max(self.session_origin);
     }
 
     fn move_down(&mut self, count: usize) {
         let row = self.cursor_row.saturating_add(count);
-        self.set_csi_row(row);
+        self.set_csi_absolute_row(row);
     }
 
     fn move_forward(&mut self, count: usize) {
@@ -348,6 +415,10 @@ impl TerminalScreen {
     }
 
     fn set_csi_row(&mut self, row: usize) {
+        self.set_csi_absolute_row(self.session_origin.saturating_add(row));
+    }
+
+    fn set_csi_absolute_row(&mut self, row: usize) {
         let allocation_limit = self
             .lines
             .len()
@@ -446,14 +517,14 @@ impl TerminalScreen {
         match mode {
             1 => {
                 self.ensure_line(self.cursor_row);
-                self.mark_dirty(0);
-                for row in 0..self.cursor_row {
+                self.mark_dirty(self.session_origin);
+                for row in self.session_origin..self.cursor_row {
                     self.lines[row].cells.clear();
                     self.lines[row].received_at = None;
                 }
                 self.erase_line(1);
             }
-            2 | 3 => self.clear(),
+            2 | 3 => self.clear_session(),
             _ => {
                 self.ensure_line(self.cursor_row);
                 self.mark_dirty(self.cursor_row);
@@ -585,22 +656,45 @@ impl TerminalScreen {
     }
 
     fn scroll_up(&mut self, count: usize) {
-        let count = self.limit_csi_line_count(count).min(self.lines.len());
+        let count = self
+            .limit_csi_line_count(count)
+            .min(self.lines.len().saturating_sub(self.session_origin));
         if count != 0 && self.claim_csi_line_work(count) {
-            self.remove_front_lines(count);
+            if self.session_origin == 0 {
+                self.remove_front_lines(count);
+            } else {
+                self.mark_dirty(self.session_origin);
+                let end = self.session_origin.saturating_add(count);
+                let removed_bytes = self
+                    .lines
+                    .drain(self.session_origin..end)
+                    .map(|line| line.byte_len)
+                    .sum();
+                self.text_bytes = self.text_bytes.saturating_sub(removed_bytes);
+                self.cursor_row = self
+                    .cursor_row
+                    .saturating_sub(count)
+                    .max(self.session_origin);
+                if let Some((row, col)) = self.saved_cursor {
+                    self.saved_cursor =
+                        Some((row.saturating_sub(count).max(self.session_origin), col));
+                }
+            }
         }
         self.ensure_line(self.cursor_row);
     }
 
     fn scroll_down(&mut self, count: usize) {
         let limited_count = self.limit_csi_line_count(count);
-        let count = limited_count.min(self.max_rows);
+        let available_rows = self.max_rows.saturating_sub(self.session_origin);
+        let count = limited_count.min(available_rows);
         self.csi_limited |= count != limited_count;
         if count == 0 {
             return;
         }
 
-        let retained_len = self.lines.len().min(self.max_rows.saturating_sub(count));
+        let session_len = self.lines.len().saturating_sub(self.session_origin);
+        let retained_len = session_len.min(available_rows.saturating_sub(count));
         let rows_to_relocate = self
             .lines
             .len()
@@ -610,37 +704,38 @@ impl TerminalScreen {
             return;
         }
 
-        self.mark_dirty(0);
-        if self.truncate_lines(retained_len) {
+        self.mark_dirty(self.session_origin);
+        if self.truncate_lines(self.session_origin.saturating_add(retained_len)) {
             self.csi_limited = true;
         }
         let old_len = self.lines.len();
         self.lines
             .resize_with(old_len.saturating_add(count), TerminalLine::default);
-        if old_len != 0 {
-            self.lines.rotate_right(count);
+        if old_len > self.session_origin {
+            self.lines.make_contiguous()[self.session_origin..].rotate_right(count);
         }
         self.cursor_row = self.cursor_row.saturating_add(count).min(self.max_rows - 1);
     }
 
     fn reverse_index(&mut self) {
-        if self.cursor_row == 0 {
-            self.lines.push_front(TerminalLine::default());
-            self.mark_dirty(0);
+        if self.cursor_row == self.session_origin {
+            self.lines
+                .insert(self.session_origin, TerminalLine::default());
+            self.mark_dirty(self.session_origin);
         } else {
             self.cursor_row -= 1;
         }
     }
 
-    fn clear(&mut self) {
-        self.lines.clear();
-        self.text_bytes = 0;
-        self.cursor_row = 0;
+    fn clear_session(&mut self) {
+        let origin = self.session_origin.min(self.lines.len());
+        let removed_bytes = self.lines.drain(origin..).map(|line| line.byte_len).sum();
+        self.text_bytes = self.text_bytes.saturating_sub(removed_bytes);
+        self.cursor_row = origin;
         self.cursor_col = 0;
         self.saved_cursor = None;
-        self.dirty_from = Some(0);
-        self.byte_dirty_from = Some(0);
-        self.full_replace = true;
+        self.mark_dirty(origin);
+        self.full_replace |= origin == 0;
     }
 
     fn save_cursor(&mut self) {
@@ -667,6 +762,7 @@ impl TerminalScreen {
         let removed_bytes = self.lines.drain(..count).map(|line| line.byte_len).sum();
         self.text_bytes = self.text_bytes.saturating_sub(removed_bytes);
         self.removed_front = self.removed_front.saturating_add(rendered_removed);
+        self.session_origin = self.session_origin.saturating_sub(count);
         self.cursor_row = self.cursor_row.saturating_sub(count);
         if let Some((row, col)) = self.saved_cursor {
             self.saved_cursor = Some((row.saturating_sub(count), col));
@@ -835,7 +931,7 @@ impl Perform for TerminalScreen {
             b'D' => self.line_feed(),
             b'E' => self.next_line(),
             b'M' => self.reverse_index(),
-            b'c' => self.clear(),
+            b'c' => self.clear_session(),
             _ => {}
         }
     }
@@ -854,16 +950,27 @@ mod tests {
             .unwrap()
     }
 
-    fn chunk(sequence: u64, second: u32, bytes: &[u8]) -> RxChunk {
-        RxChunk {
+    fn chunk(sequence: u64, second: u32, bytes: &[u8]) -> ReceiveRecord {
+        ReceiveRecord::Data(RxChunk {
             sequence,
             received_at: timestamp(second),
+            session_offset: 0,
             bytes: bytes.to_vec().into(),
-        }
+        })
     }
 
-    fn apply(formatter: &mut IncrementalTerminalFormatter, chunks: &[RxChunk]) -> TerminalUpdate {
-        formatter.apply_chunks(chunks, 100, 4096, 1024)
+    fn boundary(sequence: u64, second: u32) -> ReceiveRecord {
+        ReceiveRecord::Boundary(ReceiveBoundary {
+            sequence,
+            received_at: timestamp(second),
+        })
+    }
+
+    fn apply(
+        formatter: &mut IncrementalTerminalFormatter,
+        records: &[ReceiveRecord],
+    ) -> TerminalUpdate {
+        formatter.apply_records(records, 100, 4096, 1024)
     }
 
     fn terminal_line(text: &str) -> TerminalLine {
@@ -927,6 +1034,69 @@ mod tests {
     }
 
     #[test]
+    fn stream_boundary_resets_parser_and_starts_a_new_history_row() {
+        let mut formatter = IncrementalTerminalFormatter::new(TextEncoding::Utf8);
+        let update = apply(
+            &mut formatter,
+            &[
+                chunk(0, 1, b"old\x1b["),
+                boundary(1, 2),
+                chunk(2, 3, b"2Jnew"),
+            ],
+        );
+
+        assert_eq!(
+            update
+                .rows
+                .iter()
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>(),
+            ["old", "2Jnew"]
+        );
+        assert_eq!(formatter.cursor(), Some((1, 5)));
+    }
+
+    #[test]
+    fn stream_boundary_reuses_the_hidden_line_after_a_completed_newline() {
+        let mut formatter = IncrementalTerminalFormatter::new(TextEncoding::Utf8);
+        let update = apply(
+            &mut formatter,
+            &[chunk(0, 1, b"old\r\n"), boundary(1, 2), chunk(2, 3, b"new")],
+        );
+
+        assert_eq!(
+            update
+                .rows
+                .iter()
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>(),
+            ["old", "new"]
+        );
+    }
+
+    #[test]
+    fn new_session_clear_and_home_sequences_cannot_modify_archived_rows() {
+        let mut formatter = IncrementalTerminalFormatter::new(TextEncoding::Utf8);
+        let update = apply(
+            &mut formatter,
+            &[
+                chunk(0, 1, b"archived"),
+                boundary(1, 2),
+                chunk(2, 3, b"first\r\nsecond\x1b[2Jnew\x1b[Hhome"),
+            ],
+        );
+
+        assert_eq!(
+            update
+                .rows
+                .iter()
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>(),
+            ["archived", "home"]
+        );
+    }
+
+    #[test]
     fn cursor_movement_overwrites_instead_of_inserting() {
         let mut formatter = IncrementalTerminalFormatter::new(TextEncoding::Utf8);
         let update = apply(&mut formatter, &[chunk(0, 1, b"abcd\x08\x08X")]);
@@ -984,7 +1154,7 @@ mod tests {
         assert!(screen.csi_limited);
 
         let mut formatter = IncrementalTerminalFormatter::new(TextEncoding::Utf8);
-        formatter.apply_chunks(&[chunk(0, 1, b"\x1b[65535;65535HX")], 10, 64, 64);
+        formatter.apply_records(&[chunk(0, 1, b"\x1b[65535;65535HX")], 10, 64, 64);
         assert!(formatter.is_limited());
     }
 
@@ -1110,14 +1280,14 @@ mod tests {
     fn row_limit_prunes_the_prefix_and_keeps_incremental_updates_valid() {
         let mut formatter = IncrementalTerminalFormatter::new(TextEncoding::Utf8);
         let mut rows = Vec::new();
-        let first = formatter.apply_chunks(&[chunk(0, 1, b"a\r\nb\r\nc\r\nd")], 3, 4096, 1024);
+        let first = formatter.apply_records(&[chunk(0, 1, b"a\r\nb\r\nc\r\nd")], 3, 4096, 1024);
         rows.extend(first.rows);
         assert_eq!(
             rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
             ["b", "c", "d"]
         );
 
-        let second = formatter.apply_chunks(&[chunk(1, 2, b"\r\ne")], 3, 4096, 1024);
+        let second = formatter.apply_records(&[chunk(1, 2, b"\r\ne")], 3, 4096, 1024);
         assert_eq!(second.remove_prefix, 1);
         assert_eq!(second.replace_tail, 0);
         rows.drain(..second.remove_prefix);

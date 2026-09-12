@@ -9,7 +9,9 @@ use encoding_rs::{CoderResult, GBK, UTF_8};
 use tempfile::Builder as TempFileBuilder;
 
 use crate::model::{LineEnding, ReceiveMode, SendMode, TextEncoding};
-use crate::store::{ReceiveCursor, ReceiveDelta, ReceiveSnapshot, RxChunk};
+use crate::store::{
+    ReceiveBoundary, ReceiveCursor, ReceiveDelta, ReceiveRecord, ReceiveSnapshot, RxChunk,
+};
 use crate::terminal::IncrementalTerminalFormatter;
 
 pub const MAX_DISPLAY_ROWS: usize = 100_000;
@@ -24,10 +26,11 @@ const EXPORT_DECODE_INPUT_BYTES: usize = 64 * 1024;
 const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
 
-fn hex_skipped_bytes_modulo(snapshot: &ReceiveSnapshot) -> usize {
-    ((snapshot.dropped_bytes % HEX_BYTES_PER_ROW as u64) as usize
-        + snapshot.omitted_bytes % HEX_BYTES_PER_ROW)
-        % HEX_BYTES_PER_ROW
+fn hex_initial_offset_modulo(snapshot: &ReceiveSnapshot) -> usize {
+    match snapshot.records.first() {
+        Some(ReceiveRecord::Data(chunk)) => chunk.session_offset as usize % HEX_BYTES_PER_ROW,
+        Some(ReceiveRecord::Boundary(_)) | None => 0,
+    }
 }
 
 fn hex_first_row_capacity(skipped_bytes_modulo: usize) -> usize {
@@ -97,6 +100,7 @@ enum DisplayFormatterState {
 }
 
 struct IncrementalTextFormatter {
+    encoding: TextEncoding,
     decoder: encoding_rs::Decoder,
     current: String,
     line_started_at: Option<DateTime<Local>>,
@@ -139,7 +143,7 @@ impl DisplayFormatter {
                 IncrementalTerminalFormatter::new(encoding),
             )),
             ReceiveMode::Hex => DisplayFormatterState::Hex(IncrementalHexFormatter::new(
-                hex_skipped_bytes_modulo(snapshot),
+                hex_initial_offset_modulo(snapshot),
             )),
         };
         let mut formatter = Self {
@@ -161,7 +165,7 @@ impl DisplayFormatter {
             stream_id: snapshot.stream_id,
             first_sequence: snapshot.first_sequence,
             next_sequence: snapshot.next_sequence,
-            chunks: snapshot.chunks.clone(),
+            records: snapshot.records.clone(),
             reset_or_gap: false,
         };
         let update = formatter
@@ -227,7 +231,7 @@ impl DisplayFormatter {
             remove_prefix += 1;
         }
 
-        let replace_tail = usize::from(partial_visible && !delta.chunks.is_empty());
+        let replace_tail = usize::from(partial_visible && !delta.records.is_empty());
         if replace_tail != 0 {
             self.row_end_sequences.pop_back();
             if let Some(bytes) = self.row_text_bytes.pop_back() {
@@ -244,7 +248,7 @@ impl DisplayFormatter {
         let mut cap_removed_existing = 0;
         let mut removed_new_rows = 0;
         let mut rows = Vec::new();
-        if !delta.chunks.is_empty() {
+        if !delta.records.is_empty() {
             let Self {
                 state,
                 row_end_sequences,
@@ -256,9 +260,9 @@ impl DisplayFormatter {
             } = self;
             match state {
                 DisplayFormatterState::Text(state) => {
-                    for chunk in &delta.chunks {
+                    for record in &delta.records {
                         let new_rows_start = rows.len();
-                        state.push_chunk(chunk, &mut rows, row_end_sequences);
+                        state.push_record(record, &mut rows, row_end_sequences);
                         *limited |= state.line_limited;
                         register_new_rows(&rows[new_rows_start..], row_text_bytes, text_bytes);
                         enforce_display_limits(
@@ -287,9 +291,9 @@ impl DisplayFormatter {
                     );
                 }
                 DisplayFormatterState::Hex(state) => {
-                    for chunk in &delta.chunks {
+                    for record in &delta.records {
                         let new_rows_start = rows.len();
-                        state.push_chunk(chunk, &mut rows, row_end_sequences);
+                        state.push_record(record, &mut rows, row_end_sequences);
                         register_new_rows(&rows[new_rows_start..], row_text_bytes, text_bytes);
                         enforce_display_limits(
                             &mut retained_existing,
@@ -346,8 +350,8 @@ impl DisplayFormatter {
         let DisplayFormatterState::Terminal(state) = &mut self.state else {
             unreachable!("terminal update requires terminal formatter state");
         };
-        let update = state.apply_chunks(
-            &delta.chunks,
+        let update = state.apply_records(
+            &delta.records,
             self.limits.max_rows,
             self.limits.max_text_bytes,
             self.limits.max_line_bytes,
@@ -420,6 +424,7 @@ impl IncrementalTextFormatter {
             TextEncoding::Gbk => GBK,
         };
         Self {
+            encoding,
             decoder: selected_encoding.new_decoder_without_bom_handling(),
             current: String::new(),
             line_started_at: None,
@@ -428,6 +433,20 @@ impl IncrementalTextFormatter {
             partial_visible: false,
             max_line_bytes: max_line_bytes.max(16),
             line_limited: false,
+        }
+    }
+
+    fn push_record(
+        &mut self,
+        record: &ReceiveRecord,
+        rows: &mut Vec<FormattedRow>,
+        row_end_sequences: &mut VecDeque<u64>,
+    ) {
+        match record {
+            ReceiveRecord::Data(chunk) => self.push_chunk(chunk, rows, row_end_sequences),
+            ReceiveRecord::Boundary(boundary) => {
+                self.finish_session(boundary, rows, row_end_sequences)
+            }
         }
     }
 
@@ -441,24 +460,69 @@ impl IncrementalTextFormatter {
             self.line_started_at = Some(chunk.received_at);
         }
 
-        let mut input = &*chunk.bytes;
+        self.decode_bytes(
+            &chunk.bytes,
+            false,
+            chunk.received_at,
+            chunk.sequence,
+            rows,
+            row_end_sequences,
+        );
+    }
+
+    fn decode_bytes(
+        &mut self,
+        mut input: &[u8],
+        last: bool,
+        received_at: DateTime<Local>,
+        sequence: u64,
+        rows: &mut Vec<FormattedRow>,
+        row_end_sequences: &mut VecDeque<u64>,
+    ) {
         loop {
             let capacity = input.len().saturating_mul(3).max(32);
             let mut decoded = String::with_capacity(capacity);
-            let (result, read, _) = self.decoder.decode_to_string(input, &mut decoded, false);
-            self.push_decoded(
-                &decoded,
-                chunk.received_at,
-                chunk.sequence,
-                rows,
-                row_end_sequences,
-            );
+            let (result, read, _) = self.decoder.decode_to_string(input, &mut decoded, last);
+            self.push_decoded(&decoded, received_at, sequence, rows, row_end_sequences);
             input = &input[read..];
             match result {
                 CoderResult::InputEmpty => break,
                 CoderResult::OutputFull => continue,
             }
         }
+    }
+
+    fn finish_session(
+        &mut self,
+        boundary: &ReceiveBoundary,
+        rows: &mut Vec<FormattedRow>,
+        row_end_sequences: &mut VecDeque<u64>,
+    ) {
+        self.decode_bytes(
+            &[],
+            true,
+            boundary.received_at,
+            boundary.sequence,
+            rows,
+            row_end_sequences,
+        );
+        if !self.current.is_empty() {
+            self.push_completed_row(
+                boundary.received_at,
+                boundary.sequence,
+                rows,
+                row_end_sequences,
+            );
+        }
+        self.line_started_at = None;
+        self.current_end_sequence = None;
+        self.skip_lf_after_cr = false;
+        self.partial_visible = false;
+        let selected_encoding = match self.encoding {
+            TextEncoding::Utf8 => UTF_8,
+            TextEncoding::Gbk => GBK,
+        };
+        self.decoder = selected_encoding.new_decoder_without_bom_handling();
     }
 
     fn push_decoded(
@@ -560,6 +624,20 @@ impl IncrementalHexFormatter {
         }
     }
 
+    fn push_record(
+        &mut self,
+        record: &ReceiveRecord,
+        rows: &mut Vec<FormattedRow>,
+        row_end_sequences: &mut VecDeque<u64>,
+    ) {
+        match record {
+            ReceiveRecord::Data(chunk) => self.push_chunk(chunk, rows, row_end_sequences),
+            ReceiveRecord::Boundary(boundary) => {
+                self.finish_session(boundary, rows, row_end_sequences)
+            }
+        }
+    }
+
     fn push_chunk(
         &mut self,
         chunk: &RxChunk,
@@ -600,6 +678,26 @@ impl IncrementalHexFormatter {
         self.current_capacity = HEX_BYTES_PER_ROW;
         self.line_started_at = None;
         self.current_end_sequence = None;
+    }
+
+    fn finish_session(
+        &mut self,
+        boundary: &ReceiveBoundary,
+        rows: &mut Vec<FormattedRow>,
+        row_end_sequences: &mut VecDeque<u64>,
+    ) {
+        if !self.current.is_empty() {
+            self.push_completed_row(
+                boundary.received_at,
+                boundary.sequence,
+                rows,
+                row_end_sequences,
+            );
+        }
+        self.current_capacity = HEX_BYTES_PER_ROW;
+        self.line_started_at = None;
+        self.current_end_sequence = None;
+        self.partial_visible = false;
     }
 
     fn push_partial_row(
@@ -809,11 +907,11 @@ pub fn display_text(row: &FormattedRow, timestamps: bool, timestamp_format: &str
 }
 
 fn format_hex(snapshot: &ReceiveSnapshot) -> Vec<FormattedRow> {
-    let mut state = IncrementalHexFormatter::new(hex_skipped_bytes_modulo(snapshot));
+    let mut state = IncrementalHexFormatter::new(hex_initial_offset_modulo(snapshot));
     let mut rows = Vec::new();
     let mut row_end_sequences = VecDeque::new();
-    for chunk in &snapshot.chunks {
-        state.push_chunk(chunk, &mut rows, &mut row_end_sequences);
+    for record in &snapshot.records {
+        state.push_record(record, &mut rows, &mut row_end_sequences);
     }
     state.push_partial_row(&mut rows, &mut row_end_sequences);
     rows
@@ -827,24 +925,32 @@ fn format_text(snapshot: &ReceiveSnapshot, encoding: TextEncoding) -> Vec<Format
     let mut decoder = selected_encoding.new_decoder_without_bom_handling();
     let mut builder = TextRowsBuilder::default();
 
-    for chunk in &snapshot.chunks {
-        if !chunk.bytes.is_empty() && builder.line_started_at.is_none() && !builder.skip_lf_after_cr
-        {
-            builder.line_started_at = Some(chunk.received_at);
+    for record in &snapshot.records {
+        match record {
+            ReceiveRecord::Data(chunk) => {
+                if builder.line_started_at.is_none() && !builder.skip_lf_after_cr {
+                    builder.line_started_at = Some(chunk.received_at);
+                }
+                decode_piece(
+                    &mut decoder,
+                    &chunk.bytes,
+                    false,
+                    chunk.received_at,
+                    &mut builder,
+                );
+            }
+            ReceiveRecord::Boundary(boundary) => {
+                decode_piece(&mut decoder, &[], true, boundary.received_at, &mut builder);
+                builder.finish_session(boundary.received_at);
+                decoder = selected_encoding.new_decoder_without_bom_handling();
+            }
         }
-        decode_piece(
-            &mut decoder,
-            &chunk.bytes,
-            false,
-            chunk.received_at,
-            &mut builder,
-        );
     }
 
     let flush_time = snapshot
-        .chunks
+        .records
         .last()
-        .map(|chunk| chunk.received_at)
+        .map(ReceiveRecord::received_at)
         .unwrap_or_else(Local::now);
     decode_piece(&mut decoder, &[], true, flush_time, &mut builder);
     builder.finish()
@@ -866,23 +972,37 @@ fn write_text_export<W: io::Write + ?Sized>(
     let mut exporter = StreamingTextExporter::new(writer, timestamps, timestamp_format);
 
     let flush_time = snapshot
-        .chunks
+        .records
         .last()
-        .map(|chunk| chunk.received_at)
+        .map(ReceiveRecord::received_at)
         .unwrap_or_else(Local::now);
-    for chunk in snapshot.chunks {
-        if !chunk.bytes.is_empty() {
-            exporter.note_input(chunk.received_at);
-        }
-        for input in chunk.bytes.chunks(EXPORT_DECODE_INPUT_BYTES) {
-            decode_export_piece(
-                &mut decoder,
-                input,
-                false,
-                chunk.received_at,
-                &mut decoded,
-                &mut exporter,
-            )?;
+    for record in snapshot.records {
+        match record {
+            ReceiveRecord::Data(chunk) => {
+                exporter.note_input(chunk.received_at);
+                for input in chunk.bytes.chunks(EXPORT_DECODE_INPUT_BYTES) {
+                    decode_export_piece(
+                        &mut decoder,
+                        input,
+                        false,
+                        chunk.received_at,
+                        &mut decoded,
+                        &mut exporter,
+                    )?;
+                }
+            }
+            ReceiveRecord::Boundary(boundary) => {
+                decode_export_piece(
+                    &mut decoder,
+                    &[],
+                    true,
+                    boundary.received_at,
+                    &mut decoded,
+                    &mut exporter,
+                )?;
+                exporter.finish_session(boundary.received_at)?;
+                decoder = selected_encoding.new_decoder_without_bom_handling();
+            }
         }
     }
 
@@ -1035,6 +1155,15 @@ impl<'a, W: io::Write + ?Sized> StreamingTextExporter<'a, W> {
         Ok(())
     }
 
+    fn finish_session(&mut self, received_at: DateTime<Local>) -> io::Result<()> {
+        if self.line_open {
+            self.finish_row(received_at)?;
+        }
+        self.line_started_at = None;
+        self.skip_lf_after_cr = false;
+        Ok(())
+    }
+
     fn finish(mut self) -> io::Result<()> {
         if self.line_open {
             self.writer.write_all(b"\r\n")?;
@@ -1050,29 +1179,47 @@ fn write_hex_export<W: io::Write + ?Sized>(
     timestamps: bool,
     timestamp_format: &str,
 ) -> io::Result<()> {
-    let mut row_capacity = hex_first_row_capacity(hex_skipped_bytes_modulo(&snapshot));
+    let mut row_capacity = hex_first_row_capacity(hex_initial_offset_modulo(&snapshot));
     let mut row = [0_u8; HEX_BYTES_PER_ROW];
     let mut row_len = 0;
     let mut row_started_at = None;
 
-    for chunk in snapshot.chunks {
-        for byte in chunk.bytes.iter().copied() {
-            if row_len == 0 {
-                row_started_at = Some(chunk.received_at);
-            }
-            row[row_len] = byte;
-            row_len += 1;
-            if row_len == row_capacity {
-                write_hex_export_row(
-                    writer,
-                    &row[..row_len],
-                    row_started_at.unwrap_or(chunk.received_at),
-                    timestamps,
-                    timestamp_format,
-                )?;
-                row_len = 0;
+    for record in snapshot.records {
+        match record {
+            ReceiveRecord::Boundary(boundary) => {
+                if row_len != 0 {
+                    write_hex_export_row(
+                        writer,
+                        &row[..row_len],
+                        row_started_at.unwrap_or(boundary.received_at),
+                        timestamps,
+                        timestamp_format,
+                    )?;
+                    row_len = 0;
+                    row_started_at = None;
+                }
                 row_capacity = HEX_BYTES_PER_ROW;
-                row_started_at = None;
+            }
+            ReceiveRecord::Data(chunk) => {
+                for byte in chunk.bytes.iter().copied() {
+                    if row_len == 0 {
+                        row_started_at = Some(chunk.received_at);
+                    }
+                    row[row_len] = byte;
+                    row_len += 1;
+                    if row_len == row_capacity {
+                        write_hex_export_row(
+                            writer,
+                            &row[..row_len],
+                            row_started_at.unwrap_or(chunk.received_at),
+                            timestamps,
+                            timestamp_format,
+                        )?;
+                        row_len = 0;
+                        row_capacity = HEX_BYTES_PER_ROW;
+                        row_started_at = None;
+                    }
+                }
             }
         }
     }
@@ -1180,6 +1327,14 @@ impl TextRowsBuilder {
             text: std::mem::take(&mut self.current),
         });
         self.line_started_at = None;
+    }
+
+    fn finish_session(&mut self, fallback_time: DateTime<Local>) {
+        if !self.current.is_empty() {
+            self.push_row(fallback_time);
+        }
+        self.line_started_at = None;
+        self.skip_lf_after_cr = false;
     }
 
     fn finish(mut self) -> Vec<FormattedRow> {
@@ -1495,6 +1650,86 @@ mod tests {
     }
 
     #[test]
+    fn text_boundary_completes_partial_rows_without_joining_sessions() {
+        let mut store = ReceiveStore::new(1024);
+        let (mut formatter, mut rows) =
+            DisplayFormatter::rebuild(&store.snapshot(), ReceiveMode::Text, TextEncoding::Utf8);
+
+        store.append(timestamp(1), b"old".to_vec());
+        apply_display_update(
+            &mut rows,
+            formatter
+                .apply_delta(&store.delta_since(formatter.cursor()))
+                .unwrap(),
+        );
+        assert_eq!(rows[0].text, "old");
+
+        store.mark_stream_boundary(timestamp(2));
+        let boundary_update = formatter
+            .apply_delta(&store.delta_since(formatter.cursor()))
+            .unwrap();
+        assert_eq!(boundary_update.replace_tail, 1);
+        apply_display_update(&mut rows, boundary_update);
+
+        store.append(timestamp(3), b"new".to_vec());
+        apply_display_update(
+            &mut rows,
+            formatter
+                .apply_delta(&store.delta_since(formatter.cursor()))
+                .unwrap(),
+        );
+
+        assert_eq!(
+            rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+            ["old", "new"]
+        );
+        assert_eq!(
+            rows,
+            format_snapshot(&store.snapshot(), ReceiveMode::Text, TextEncoding::Utf8)
+        );
+    }
+
+    #[test]
+    fn text_boundary_flushes_an_incomplete_character_and_resets_crlf_state() {
+        let utf8 = "中".as_bytes();
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), utf8[..1].to_vec());
+        store.mark_stream_boundary(timestamp(2));
+        store.append(timestamp(3), utf8[1..].to_vec());
+        let rows = format_snapshot(&store.snapshot(), ReceiveMode::Text, TextEncoding::Utf8);
+        assert!(!rows.iter().any(|row| row.text.contains('中')));
+        assert!(rows.len() >= 2);
+
+        let mut crlf_store = ReceiveStore::new(1024);
+        crlf_store.append(timestamp(1), b"old\r".to_vec());
+        crlf_store.mark_stream_boundary(timestamp(2));
+        crlf_store.append(timestamp(3), b"\nnew".to_vec());
+        let rows = format_snapshot(
+            &crlf_store.snapshot(),
+            ReceiveMode::Text,
+            TextEncoding::Utf8,
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+            ["old", "", "new"]
+        );
+    }
+
+    #[test]
+    fn hex_boundary_finishes_the_partial_row_and_restarts_alignment() {
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), (0..5).collect());
+        store.mark_stream_boundary(timestamp(2));
+        store.append(timestamp(3), (5..16).collect());
+
+        let rows = format_snapshot(&store.snapshot(), ReceiveMode::Hex, TextEncoding::Utf8);
+        assert_eq!(
+            rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+            ["00 01 02 03 04", "05 06 07 08 09 0A 0B 0C 0D 0E 0F",]
+        );
+    }
+
+    #[test]
     fn display_formatter_limits_rows_during_rebuild() {
         let mut store = ReceiveStore::new(1024);
         for (index, row) in [b"a\n", b"b\n", b"c\n", b"d\n"].into_iter().enumerate() {
@@ -1680,6 +1915,30 @@ mod tests {
     }
 
     #[test]
+    fn streaming_text_export_keeps_sessions_on_separate_rows() {
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), b"old".to_vec());
+        store.mark_stream_boundary(timestamp(2));
+        store.append(timestamp(3), b"new".to_vec());
+        let mut output = Vec::new();
+
+        write_export(
+            &mut output,
+            store.snapshot(),
+            ReceiveMode::Text,
+            TextEncoding::Utf8,
+            false,
+            DEFAULT_TIMESTAMP_FORMAT,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::str::from_utf8(&output[UTF8_BOM.len()..]).unwrap(),
+            "old\r\nnew\r\n"
+        );
+    }
+
+    #[test]
     fn streaming_text_export_timestamps_a_split_character_from_its_first_byte() {
         let mut store = ReceiveStore::new(1024);
         let input = "中".as_bytes();
@@ -1811,6 +2070,54 @@ mod tests {
     }
 
     #[test]
+    fn terminal_export_does_not_continue_escape_sequences_across_sessions() {
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), b"old\x1b[".to_vec());
+        store.mark_stream_boundary(timestamp(2));
+        store.append(timestamp(3), b"2Jnew".to_vec());
+        let mut output = Vec::new();
+
+        write_export(
+            &mut output,
+            store.snapshot(),
+            ReceiveMode::Terminal,
+            TextEncoding::Utf8,
+            false,
+            DEFAULT_TIMESTAMP_FORMAT,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::str::from_utf8(&output[UTF8_BOM.len()..]).unwrap(),
+            "old\r\n2Jnew\r\n"
+        );
+    }
+
+    #[test]
+    fn terminal_export_preserves_archived_sessions_when_the_new_session_clears() {
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), b"old".to_vec());
+        store.mark_stream_boundary(timestamp(2));
+        store.append(timestamp(3), b"\x1b[2Jnew".to_vec());
+        let mut output = Vec::new();
+
+        write_export(
+            &mut output,
+            store.snapshot(),
+            ReceiveMode::Terminal,
+            TextEncoding::Utf8,
+            false,
+            DEFAULT_TIMESTAMP_FORMAT,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::str::from_utf8(&output[UTF8_BOM.len()..]).unwrap(),
+            "old\r\nnew\r\n"
+        );
+    }
+
+    #[test]
     fn terminal_export_uses_rendered_row_timestamps() {
         let mut store = ReceiveStore::new(1024);
         store.append(timestamp(1), b"first\r\n".to_vec());
@@ -1853,6 +2160,30 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(&output[UTF8_BOM.len()..]).unwrap(),
             "[12:00:01] 00 01 AB FF\r\n"
+        );
+    }
+
+    #[test]
+    fn streaming_hex_export_restarts_rows_at_session_boundaries() {
+        let mut store = ReceiveStore::new(1024);
+        store.append(timestamp(1), (0..5).collect());
+        store.mark_stream_boundary(timestamp(2));
+        store.append(timestamp(3), (5..16).collect());
+        let mut output = Vec::new();
+
+        write_export(
+            &mut output,
+            store.snapshot(),
+            ReceiveMode::Hex,
+            TextEncoding::Utf8,
+            false,
+            DEFAULT_TIMESTAMP_FORMAT,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::str::from_utf8(&output[UTF8_BOM.len()..]).unwrap(),
+            concat!("00 01 02 03 04\r\n", "05 06 07 08 09 0A 0B 0C 0D 0E 0F\r\n")
         );
     }
 
@@ -1971,17 +2302,19 @@ mod tests {
             stream_id: 0,
             first_sequence: 0,
             next_sequence: 2,
-            chunks: vec![
-                RxChunk {
+            records: vec![
+                ReceiveRecord::Data(RxChunk {
                     sequence: 0,
                     received_at: timestamp(1),
+                    session_offset: 0,
                     bytes: first_bytes,
-                },
-                RxChunk {
+                }),
+                ReceiveRecord::Data(RxChunk {
                     sequence: 1,
                     received_at: timestamp(2),
+                    session_offset: 1,
                     bytes: vec![0xBB].into(),
-                },
+                }),
             ],
             bytes_len: 2,
             omitted_bytes: 0,

@@ -8,7 +8,7 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, 
 use escom::formatting::{DisplayFormatter, FormattedRow, write_export};
 use escom::model::{ReceiveMode, TextEncoding};
 use escom::search::{SearchDisplayOptions, search_rows};
-use escom::store::{ReceiveDelta, ReceiveSnapshot, RxChunk};
+use escom::store::{ReceiveDelta, ReceiveRecord, ReceiveSnapshot, RxChunk};
 
 const MIB: usize = 1024 * 1024;
 const CHUNK_BYTES: usize = 64 * 1024;
@@ -38,7 +38,7 @@ fn snapshot(mebibytes: usize) -> ReceiveSnapshot {
     let payload = payload();
     let received_at = Local::now();
     let chunk_count = bytes_len.div_ceil(payload.len());
-    let mut chunks = Vec::with_capacity(chunk_count);
+    let mut records = Vec::with_capacity(chunk_count);
 
     for index in 0..chunk_count {
         let offset = index * payload.len();
@@ -48,19 +48,20 @@ fn snapshot(mebibytes: usize) -> ReceiveSnapshot {
         } else {
             Arc::from(&payload[..remaining])
         };
-        chunks.push(RxChunk {
+        records.push(ReceiveRecord::Data(RxChunk {
             sequence: index as u64,
             received_at,
+            session_offset: offset as u64,
             bytes,
-        });
+        }));
     }
 
     ReceiveSnapshot {
         generation: 1,
         stream_id: 1,
         first_sequence: 0,
-        next_sequence: chunks.len() as u64,
-        chunks,
+        next_sequence: records.len() as u64,
+        records,
         bytes_len,
         omitted_bytes: 0,
         dropped_bytes: 0,
@@ -71,25 +72,26 @@ fn appended_delta(base: &ReceiveSnapshot, bytes_len: usize) -> ReceiveDelta {
     let payload = payload();
     let received_at = Local::now();
     let chunk_count = bytes_len.div_ceil(payload.len());
-    let mut chunks = Vec::with_capacity(chunk_count);
+    let mut records = Vec::with_capacity(chunk_count);
     for index in 0..chunk_count {
         let remaining = bytes_len - index * payload.len();
-        chunks.push(RxChunk {
+        records.push(ReceiveRecord::Data(RxChunk {
             sequence: base.next_sequence + index as u64,
             received_at,
+            session_offset: (base.bytes_len + index * payload.len()) as u64,
             bytes: if remaining >= payload.len() {
                 Arc::clone(&payload)
             } else {
                 Arc::from(&payload[..remaining])
             },
-        });
+        }));
     }
     ReceiveDelta {
         generation: base.generation + 1,
         stream_id: base.stream_id,
         first_sequence: base.first_sequence,
-        next_sequence: base.next_sequence + chunks.len() as u64,
-        chunks,
+        next_sequence: base.next_sequence + records.len() as u64,
+        records,
         reset_or_gap: false,
     }
 }

@@ -297,21 +297,20 @@ fn worker_loop(
     let mut port: Option<Box<dyn PortIo>> = None;
     let mut pending_write: Option<PendingWrite> = None;
     let mut read_buffer = vec![0_u8; 8192];
+    let command_context = CommandContext {
+        backend: backend.as_ref(),
+        events: &events,
+        stats: stats.as_ref(),
+        store: &store,
+        write_requests: &write_requests,
+    };
 
-    loop {
+    'worker: loop {
         if port.is_none() {
             reject_queued_writes(&write_requests, &events, "串口尚未连接");
             match commands.recv_timeout(DISCONNECTED_POLL_INTERVAL) {
                 Ok(command) => {
-                    if handle_command(
-                        command,
-                        &backend,
-                        &events,
-                        &stats,
-                        &mut port,
-                        &mut pending_write,
-                        &write_requests,
-                    ) {
+                    if handle_command(command, &command_context, &mut port, &mut pending_write) {
                         break;
                     }
                 }
@@ -324,20 +323,12 @@ fn worker_loop(
         loop {
             match commands.try_recv() {
                 Ok(command) => {
-                    if handle_command(
-                        command,
-                        &backend,
-                        &events,
-                        &stats,
-                        &mut port,
-                        &mut pending_write,
-                        &write_requests,
-                    ) {
-                        return;
+                    if handle_command(command, &command_context, &mut port, &mut pending_write) {
+                        break 'worker;
                     }
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => return,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break 'worker,
             }
         }
 
@@ -361,6 +352,7 @@ fn worker_loop(
         {
             log::error!(target: "escom::serial", "serial write failed: {error}");
             port = None;
+            mark_receive_boundary(&store);
             discard_writes(&mut pending_write, &write_requests);
             events.emit(WorkerEvent::Closed {
                 error: Some(format!("串口写入失败：{error}")),
@@ -394,6 +386,7 @@ fn worker_loop(
             Err(error) => {
                 log::error!(target: "escom::serial", "serial read failed: {error}");
                 port = None;
+                mark_receive_boundary(&store);
                 discard_writes(&mut pending_write, &write_requests);
                 events.emit(WorkerEvent::Closed {
                     error: Some(format!("串口读取失败：{error}")),
@@ -401,25 +394,34 @@ fn worker_loop(
             }
         }
     }
+
+    if port.take().is_some() {
+        mark_receive_boundary(&store);
+    }
+}
+
+struct CommandContext<'a> {
+    backend: &'a dyn SerialBackend,
+    events: &'a WorkerNotifier,
+    stats: &'a SerialStats,
+    store: &'a Arc<Mutex<ReceiveStore>>,
+    write_requests: &'a Receiver<WriteRequest>,
 }
 
 fn handle_command(
     command: WorkerCommand,
-    backend: &Arc<dyn SerialBackend>,
-    events: &WorkerNotifier,
-    stats: &Arc<SerialStats>,
+    context: &CommandContext<'_>,
     port: &mut Option<Box<dyn PortIo>>,
     pending_write: &mut Option<PendingWrite>,
-    write_requests: &Receiver<WriteRequest>,
 ) -> bool {
     match command {
-        WorkerCommand::RefreshPorts => match backend.list_ports() {
+        WorkerCommand::RefreshPorts => match context.backend.list_ports() {
             Ok(ports) => {
-                events.emit(WorkerEvent::Ports(ports));
+                context.events.emit(WorkerEvent::Ports(ports));
             }
             Err(error) => {
                 log::warn!(target: "escom::serial", "port enumeration failed: {error}");
-                events.emit(WorkerEvent::ControlError(error));
+                context.events.emit(WorkerEvent::ControlError(error));
             }
         },
         WorkerCommand::Open(config) => {
@@ -429,27 +431,32 @@ fn handle_command(
                 config.port_name,
                 config.baud_rate
             );
-            discard_writes(pending_write, write_requests);
-            *port = None;
-            match backend.open(&config) {
+            discard_writes(pending_write, context.write_requests);
+            if port.take().is_some() {
+                mark_receive_boundary(context.store);
+            }
+            match context.backend.open(&config) {
                 Ok(opened_port) => {
-                    stats.reset();
+                    context.stats.reset();
                     *port = Some(opened_port);
                     log::info!(target: "escom::serial", "port opened: {}", config.port_name);
-                    events.emit(WorkerEvent::Opened(config.port_name));
+                    context.events.emit(WorkerEvent::Opened(config.port_name));
                 }
                 Err(error) => {
                     log::error!(target: "escom::serial", "port open failed: {error}");
-                    events.emit(WorkerEvent::Closed { error: Some(error) });
+                    context
+                        .events
+                        .emit(WorkerEvent::Closed { error: Some(error) });
                 }
             }
         }
         WorkerCommand::Close => {
-            discard_writes(pending_write, write_requests);
+            discard_writes(pending_write, context.write_requests);
             let was_open = port.take().is_some();
             if was_open {
+                mark_receive_boundary(context.store);
                 log::info!(target: "escom::serial", "port closed by user");
-                events.emit(WorkerEvent::Closed { error: None });
+                context.events.emit(WorkerEvent::Closed { error: None });
             }
         }
         WorkerCommand::SetDtr(level) => {
@@ -457,7 +464,7 @@ fn handle_command(
                 && let Err(error) = active_port.set_dtr(level)
             {
                 log::warn!(target: "escom::serial", "DTR update failed: {error}");
-                events.emit(WorkerEvent::ControlError(error));
+                context.events.emit(WorkerEvent::ControlError(error));
             }
         }
         WorkerCommand::SetRts(level) => {
@@ -465,12 +472,23 @@ fn handle_command(
                 && let Err(error) = active_port.set_rts(level)
             {
                 log::warn!(target: "escom::serial", "RTS update failed: {error}");
-                events.emit(WorkerEvent::ControlError(error));
+                context.events.emit(WorkerEvent::ControlError(error));
             }
         }
         WorkerCommand::Shutdown => return true,
     }
     false
+}
+
+fn mark_receive_boundary(store: &Arc<Mutex<ReceiveStore>>) {
+    match store.lock() {
+        Ok(mut receive_store) => {
+            receive_store.mark_stream_boundary(Local::now());
+        }
+        Err(_) => {
+            log::error!(target: "escom::serial", "receive store lock poisoned while marking a stream boundary");
+        }
+    }
 }
 
 fn write_next_slice(
@@ -564,6 +582,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::store::ReceiveRecord;
 
     struct MockBackend {
         opened: AtomicBool,
@@ -762,6 +781,56 @@ mod tests {
     }
 
     #[test]
+    fn close_and_reopen_insert_an_ordered_receive_boundary() {
+        let (read_tx, read_rx) = unbounded();
+        let backend = Arc::new(MockBackend {
+            opened: AtomicBool::new(false),
+            reads: read_rx,
+            writes: Arc::new(Mutex::new(Vec::new())),
+        });
+        let store = Arc::new(Mutex::new(ReceiveStore::new(1024)));
+        let mut worker = WorkerHandle::spawn_with_backend(Arc::clone(&store), backend);
+        let config = SerialConfig {
+            port_name: "COM3".into(),
+            ..Default::default()
+        };
+
+        worker.open(config.clone()).unwrap();
+        wait_for_event(&worker.events, |event| {
+            matches!(event, WorkerEvent::Opened(_))
+        });
+        read_tx.send(b"old".to_vec()).unwrap();
+        wait_for_store_bytes(&store, 3);
+
+        worker.close().unwrap();
+        wait_for_event(&worker.events, |event| {
+            matches!(event, WorkerEvent::Closed { error: None })
+        });
+        let closed_snapshot = store.lock().unwrap().snapshot();
+        assert_eq!(closed_snapshot.records.len(), 2);
+        assert!(matches!(
+            closed_snapshot.records[1],
+            ReceiveRecord::Boundary(_)
+        ));
+
+        worker.open(config).unwrap();
+        wait_for_event(&worker.events, |event| {
+            matches!(event, WorkerEvent::Opened(_))
+        });
+        read_tx.send(b"new".to_vec()).unwrap();
+        wait_for_store_bytes(&store, 6);
+
+        let snapshot = store.lock().unwrap().snapshot();
+        assert_eq!(snapshot.records.len(), 3);
+        let ReceiveRecord::Data(new_chunk) = &snapshot.records[2] else {
+            panic!("new session data record expected");
+        };
+        assert_eq!(&*new_chunk.bytes, b"new");
+        assert_eq!(new_chunk.session_offset, 0);
+        worker.shutdown();
+    }
+
+    #[test]
     fn open_failure_is_reported_by_one_error_close_event() {
         let store = Arc::new(Mutex::new(ReceiveStore::new(1024)));
         let mut worker = WorkerHandle::spawn_with_backend(store, Arc::new(FailingOpenBackend));
@@ -942,5 +1011,13 @@ mod tests {
             thread::yield_now();
         }
         assert!(counter.load(Ordering::SeqCst) > previous);
+    }
+
+    fn wait_for_store_bytes(store: &Arc<Mutex<ReceiveStore>>, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while store.lock().unwrap().bytes_len() < expected && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(store.lock().unwrap().bytes_len(), expected);
     }
 }
