@@ -1,4 +1,4 @@
-ESCOM TUI / 按键说明
+ESCOM TUI / 键盘与鼠标
 
 F2       轮换检测到的串口           F3       连接 / 断开
 F4       文本 / HEX / 终端          F5       UTF-8 / GBK
@@ -26,4 +26,7 @@ ports    connect    disconnect    record 路径.bin    stop-record
 记录保存原始 RX 字节，不覆盖已有文件；队列或磁盘失败会明确报错。
 直接输入：Enter 发送 CR，Ctrl+C 发送 0x03；Esc 返回，Ctrl+Q 退出。
 
-按任意键关闭帮助。
+鼠标：点击工具栏按钮；串口 / 模式按钮打开选择列表。
+滚轮滚动接收区 / 列表；点击列表外或按 Esc 关闭列表。
+点击 TX 区编辑，点击发送提交。部分终端可用 Shift+拖动选择文字。
+按任意键或单击鼠标左键关闭帮助。

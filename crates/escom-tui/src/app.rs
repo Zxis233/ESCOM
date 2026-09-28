@@ -2,7 +2,9 @@ use crate::i18n::{Key, Language, Message};
 use crate::msg;
 use crate::{config::Config, demo::DemoBackend, display::Display};
 use chrono::Local;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use escom_core::{
     capture::CaptureHandle,
     formatting::{encode_text_typed, parse_send_input_typed},
@@ -11,6 +13,7 @@ use escom_core::{
     serial_worker::{ProductionBackend, SerialBackend, WorkerEvent, WorkerHandle, WorkerOptions},
     store::ReceiveStore,
 };
+use ratatui::layout::{Position, Rect};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -22,6 +25,23 @@ pub enum InputMode {
     Search,
     Command,
     Direct,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Picker {
+    Port,
+    Mode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClickAction {
+    OpenPicker(Picker),
+    Port(String),
+    Mode(&'static str),
+    Shortcut(KeyCode),
+    Editor,
+    Cancel,
+    ClosePicker,
 }
 
 pub struct App {
@@ -46,6 +66,13 @@ pub struct App {
     pub notice: Message,
     pub last_tx: Message,
     pub help: bool,
+    pub click_targets: Vec<(Rect, ClickAction)>,
+    pub receive_area: Rect,
+    pub picker: Option<Picker>,
+    pub picker_area: Rect,
+    pub picker_index: usize,
+    pub picker_offset: usize,
+    pub picker_rows: usize,
     pub capture: Option<CaptureHandle>,
     pub capture_path: Option<PathBuf>,
     pub capture_result: Message,
@@ -101,6 +128,13 @@ impl App {
             notice: Key::Startup.into(),
             last_tx: Key::Empty.into(),
             help: false,
+            click_targets: Vec::new(),
+            receive_area: Rect::default(),
+            picker: None,
+            picker_area: Rect::default(),
+            picker_index: 0,
+            picker_offset: 0,
+            picker_rows: 1,
             capture: None,
             capture_path: None,
             capture_result: Key::RecordingOff.into(),
@@ -334,12 +368,21 @@ impl App {
 
     pub fn handle_event(&mut self, event: Event) -> bool {
         let result = match event {
+            Event::Mouse(mouse) => self.handle_mouse(mouse),
+            Event::Resize(_, _) => {
+                // The next draw establishes fresh hit regions for the new size.
+                self.click_targets.clear();
+                self.receive_area = Rect::default();
+                self.picker_area = Rect::default();
+                Ok(false)
+            }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
                     return true;
                 }
                 self.handle_key(key)
             }
+            Event::Paste(_) if self.help || self.picker.is_some() => Ok(false),
             Event::Paste(text)
                 if matches!(
                     self.input_mode,
@@ -376,6 +419,32 @@ impl App {
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool, Message> {
         if self.help {
             self.help = false;
+            return Ok(false);
+        }
+        if self.picker.is_some() {
+            match key.code {
+                KeyCode::Esc => self.close_picker(),
+                KeyCode::Up => self.move_picker(false),
+                KeyCode::Down => self.move_picker(true),
+                KeyCode::Enter => {
+                    let action = match self.picker {
+                        Some(Picker::Port) => self
+                            .ports
+                            .get(self.picker_index)
+                            .cloned()
+                            .map(ClickAction::Port),
+                        Some(Picker::Mode) => ["text", "hex", "terminal"]
+                            .get(self.picker_index)
+                            .copied()
+                            .map(ClickAction::Mode),
+                        None => None,
+                    };
+                    if let Some(action) = action {
+                        self.activate_click(action)?;
+                    }
+                }
+                _ => {}
+            }
             return Ok(false);
         }
         if self.input_mode == InputMode::Direct {
@@ -435,7 +504,11 @@ impl App {
             }
             return Ok(false);
         }
-        match key.code {
+        self.handle_view_key(key.code)
+    }
+
+    fn handle_view_key(&mut self, code: KeyCode) -> Result<bool, Message> {
+        match code {
             KeyCode::Char('q') => return Ok(true),
             KeyCode::Char('?') | KeyCode::F(1) => self.help = true,
             KeyCode::F(2) => self.choose_port()?,
@@ -505,7 +578,7 @@ impl App {
             }
             KeyCode::Up | KeyCode::PageUp => {
                 self.paused = true;
-                self.offset = self.offset.saturating_sub(if key.code == KeyCode::Up {
+                self.offset = self.offset.saturating_sub(if code == KeyCode::Up {
                     1
                 } else {
                     self.page_rows
@@ -514,7 +587,7 @@ impl App {
             KeyCode::Down | KeyCode::PageDown => {
                 self.paused = true;
                 self.offset = (self.offset
-                    + if key.code == KeyCode::Down {
+                    + if code == KeyCode::Down {
                         1
                     } else {
                         self.page_rows
@@ -530,7 +603,7 @@ impl App {
             KeyCode::End => self.resume(),
             KeyCode::Char('n' | 'N') if !self.matches.is_empty() => {
                 let count = self.matches.len();
-                self.selected_match = if key.code == KeyCode::Char('N') {
+                self.selected_match = if code == KeyCode::Char('N') {
                     (self.selected_match + count - 1) % count
                 } else {
                     (self.selected_match + 1) % count
@@ -547,6 +620,147 @@ impl App {
                 self.notice = Key::HistoryCleared.into();
             }
             _ => {}
+        }
+        Ok(false)
+    }
+
+    fn close_picker(&mut self) {
+        self.picker = None;
+        self.click_targets.clear();
+    }
+
+    fn move_picker(&mut self, down: bool) {
+        let count = match self.picker {
+            Some(Picker::Port) => self.ports.len(),
+            Some(Picker::Mode) => 3,
+            None => return,
+        };
+        self.picker_index = if down {
+            self.picker_index
+                .saturating_add(1)
+                .min(count.saturating_sub(1))
+        } else {
+            self.picker_index.saturating_sub(1)
+        };
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<bool, Message> {
+        let position = Position::new(mouse.column, mouse.row);
+        if self.help {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.help = false;
+                self.click_targets.clear();
+            }
+            return Ok(false);
+        }
+        if self.picker.is_some() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    if self.picker_area.contains(position) =>
+                {
+                    self.move_picker(mouse.kind == MouseEventKind::ScrollDown);
+                    return Ok(false);
+                }
+                MouseEventKind::Down(MouseButton::Left) if !self.picker_area.contains(position) => {
+                    self.close_picker();
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        } else if self.receive_area.contains(position) {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.paused = true;
+                    self.offset = self.offset.saturating_sub(3);
+                    return Ok(false);
+                }
+                MouseEventKind::ScrollDown => {
+                    self.paused = true;
+                    self.offset = self
+                        .offset
+                        .saturating_add(3)
+                        .min(self.display.rows.len().saturating_sub(1));
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return Ok(false);
+        }
+        if let Some(action) = self
+            .click_targets
+            .iter()
+            .rev()
+            .find(|(rect, _)| rect.contains(position))
+            .map(|(_, action)| action.clone())
+        {
+            return self.activate_click(action);
+        }
+        Ok(false)
+    }
+
+    fn activate_click(&mut self, action: ClickAction) -> Result<bool, Message> {
+        match action {
+            ClickAction::OpenPicker(picker) => {
+                if picker == Picker::Port {
+                    if self.connected || self.connecting {
+                        return Err(Key::DisconnectPort.into());
+                    }
+                    self.worker.refresh_ports()?;
+                    self.cycle_port_on_refresh = false;
+                }
+                self.picker_index = match picker {
+                    Picker::Port => self
+                        .ports
+                        .iter()
+                        .position(|port| port == &self.config.port)
+                        .unwrap_or(0),
+                    Picker::Mode => ["text", "hex", "terminal"]
+                        .iter()
+                        .position(|mode| *mode == self.config.mode)
+                        .unwrap_or(0),
+                };
+                self.picker_offset = 0;
+                self.picker = Some(picker);
+                self.click_targets.clear();
+            }
+            ClickAction::Port(port) => {
+                if self.connected || self.connecting {
+                    return Err(Key::DisconnectPort.into());
+                }
+                self.config.port = port;
+                self.notice = msg!(PortSelected, self.config.port);
+                self.close_picker();
+            }
+            ClickAction::Mode(mode) => {
+                self.config.mode = mode.into();
+                self.display.invalidate();
+                self.resume();
+                self.close_picker();
+            }
+            ClickAction::ClosePicker => self.close_picker(),
+            ClickAction::Cancel => {
+                self.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?;
+            }
+            ClickAction::Editor => {
+                if self.input_mode == InputMode::View {
+                    self.begin_input(InputMode::Send);
+                }
+            }
+            ClickAction::Shortcut(code) => {
+                match (code, self.input_mode) {
+                    (KeyCode::Char('s'), InputMode::Send) => {
+                        self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+                    }
+                    // Clicking the active editor's mode must not erase its draft.
+                    (KeyCode::Char('/'), InputMode::Search)
+                    | (KeyCode::Char(':'), InputMode::Command) => {}
+                    _ => {
+                        return self.handle_view_key(code);
+                    }
+                }
+            }
         }
         Ok(false)
     }

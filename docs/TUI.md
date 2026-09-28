@@ -20,7 +20,7 @@ cargo build --release -p escom-tui
 .\target\release\escom-tui.exe --config escom-tui.example.toml --port COM3 --record session.bin
 ```
 
-请在支持交互终端的 Windows Terminal / PowerShell 中运行。TUI 最小窗口为 48×12，完整帮助建议 100×34。TUI 也使用跨平台终端和串口库，但本次以 Windows 为验证平台。
+请在支持交互终端的 Windows Terminal / PowerShell 中运行。TUI 最小窗口为 48×12，完整帮助建议 100×38。TUI 也使用跨平台终端和串口库，但本次以 Windows 为验证平台。
 
 `--help` 列出参数；`--print-config` 输出生效的 TOML；`--config-path` 输出当前配置文件的绝对路径。
 
@@ -74,6 +74,18 @@ TUI 默认自动读取与 GUI 共用的数据目录中的 `tui.toml`，Windows �
 命令示例：`:port COM4`、`:baud 921600`、`:data 8`、`:stop 1`、`:parity even`、`:flow hardware`、`:dtr on`、`:rts off`、`:eol crlf`、`:mode terminal`、`:encoding gbk`、`:record D:\captures\session.bin`、`:stop-record`、`:ports`。端口、波特率、数据位、停止位、校验和流控修改前需断开连接。硬件流控时不手动修改 RTS。
 
 终端模式复用现有 ANSI 屏幕解析器，是面向串口 Shell 的有限终端解释器；不是完整的终端模拟器。串口控制字符不会直接传给宿主终端。窗口尺寸不会通过串口自动协商。直接输入模式下 Esc 为本地返回键，Ctrl+Q 为本地退出键；要发送这些字节可通过 HEX 发送。
+
+### 鼠标操作
+
+工具栏中带方括号的按钮可以用鼠标左键点击，原有键盘快捷键继续有效。
+
+- 点击“串口”刷新并打开串口列表，点击条目选择；连接中或已连接时需先断开才能更换串口。
+- 点击“模式”选择文本、HEX 或终端显示；连接／断开、清空、暂停／恢复、编码、记录、发送模式、直输和帮助按钮直接执行对应操作。
+- 点击 TX 区或“编辑发送”进入发送编辑器，输入后点击“发送”或按 Enter 提交；“返回”取消编辑。搜索和命令按钮打开对应编辑器，按 Enter 提交。
+- 接收区滚轮每次滚动三行并暂停跟随；点击“恢复”或按 End 回到最新数据。
+- 选择列表支持滚轮、上下键和 Enter；点击 `[x]`、列表外部或按 Esc 关闭，不会触发背后的按钮。
+
+按钮会随窗口宽度换行；窗口高度不足时优先显示串口、连接、模式和清空，其余操作仍可使用快捷键。启用鼠标后，部分终端需按住 Shift 拖动才能使用终端原生文字选择。退出时会关闭鼠标捕获。
 
 ## 历史与内存预算
 

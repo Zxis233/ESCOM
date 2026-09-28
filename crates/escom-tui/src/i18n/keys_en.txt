@@ -1,4 +1,4 @@
-ESCOM TUI / KEYBOARD
+ESCOM TUI / KEYBOARD + MOUSE
 
 F2       Cycle detected ports       F3       Connect / disconnect
 F4       Text / HEX / Terminal      F5       UTF-8 / GBK
@@ -26,4 +26,7 @@ Long lines are clipped: scroll horizontally. History eviction is shown below.
 Recording: exact RX bytes, new file only; queue/disk failure marks it incomplete.
 Direct mode: Enter sends CR, Ctrl+C sends 0x03; Esc returns, Ctrl+Q exits.
 
-Press any key to close help.
+Mouse: click toolbar buttons; Port / Mode open a selection list.
+Wheel scrolls RX / lists; click outside a list or Esc closes it.
+Click TX to compose; click Send to submit. Shift+drag may select terminal text.
+Press any key or left-click to close help.

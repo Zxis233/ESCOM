@@ -9,7 +9,9 @@ mod ui;
 use app::App;
 use config::{Action, Config};
 use crossterm::{
-    event::{self, DisableBracketedPaste, EnableBracketedPaste},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    },
     execute,
 };
 use escom_core::serial_worker::{ProductionBackend, SerialBackend};
@@ -73,7 +75,7 @@ fn run() -> io::Result<()> {
     let result = (|| {
         let mut terminal = ratatui::try_init()?;
         let _restore = RestoreTerminal;
-        execute!(io::stdout(), EnableBracketedPaste)?;
+        execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture)?;
         let mut next_tick = Instant::now();
         let mut dirty = true;
         loop {
@@ -117,7 +119,7 @@ fn run() -> io::Result<()> {
 struct RestoreTerminal;
 impl Drop for RestoreTerminal {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableBracketedPaste);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
         ratatui::restore();
     }
 }
