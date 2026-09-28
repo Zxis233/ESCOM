@@ -2,6 +2,7 @@
 name = "escom-tui"
 version = "0.3.1"
 edition = "2024"
+build = "build.rs"
 license = "MIT"
 description = "A bounded-memory terminal serial-port viewer"
 
@@ -16,3 +17,12 @@ toml = "1.1.4"
 unicode-width = "0.2.2"
 
 tempfile = "3.27.0"
+
+[build-dependencies]
+winresource = "0.1.31"
+
+[package.metadata.winresource]
+FileDescription = "ESCOM 终端串口查看器"
+ProductName = "ESCOM TUI"
+OriginalFilename = "escom-tui.exe"
+LegalCopyright = "Copyright (c) 2026 ESCOM contributors"

@@ -1481,6 +1481,7 @@ dependencies = [
  "tempfile",
  "toml",
  "unicode-width",
+ "winresource",
 ]
 
 [[package]]
