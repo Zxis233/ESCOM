@@ -417,6 +417,13 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool, Message> {
+        // Theme switching is local in every mode, including direct serial input and overlays.
+        if key.code == KeyCode::F(10) && key.modifiers.is_empty() {
+            if key.kind == KeyEventKind::Press {
+                self.cycle_theme();
+            }
+            return Ok(false);
+        }
         if self.help {
             self.help = false;
             return Ok(false);
@@ -509,6 +516,7 @@ impl App {
 
     fn handle_view_key(&mut self, code: KeyCode) -> Result<bool, Message> {
         match code {
+            KeyCode::F(10) => self.cycle_theme(),
             KeyCode::Char('q') => return Ok(true),
             KeyCode::Char('?') | KeyCode::F(1) => self.help = true,
             KeyCode::F(2) => self.choose_port()?,
@@ -622,6 +630,14 @@ impl App {
             _ => {}
         }
         Ok(false)
+    }
+
+    fn cycle_theme(&mut self) {
+        self.config.theme.preset = self.config.theme.preset.next();
+        self.notice = Message::Context(
+            Key::ThemeChanged,
+            Box::new(self.config.theme.preset.label().into()),
+        );
     }
 
     fn close_picker(&mut self) {
@@ -875,6 +891,71 @@ mod tests {
     use escom_core::model::TextEncoding;
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn f10_cycles_themes_in_every_mode_without_changing_session_or_drafts() {
+        use crate::theme::Preset;
+        let mut app = App::new(Config::default()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        app.start_capture(&dir.path().join("theme.bin")).unwrap();
+        app.store
+            .lock()
+            .unwrap()
+            .append(Local::now(), b"keep history\n".to_vec());
+        app.paused = true;
+        app.offset = 7;
+        app.matches = vec![1, 3];
+        app.input = "AT+草稿".into();
+        for mode in [
+            InputMode::View,
+            InputMode::Send,
+            InputMode::Search,
+            InputMode::Command,
+            InputMode::Direct,
+        ] {
+            app.input_mode = mode;
+            let original_config = app.config.clone();
+            let initial_preset = app.config.theme.preset;
+            for expected in [
+                initial_preset.next(),
+                initial_preset.next().next(),
+                initial_preset.next().next().next(),
+                initial_preset,
+            ] {
+                assert!(!app.handle_event(key(KeyCode::F(10))));
+                assert_eq!(app.config.theme.preset, expected);
+                assert_eq!(app.input_mode, mode);
+                assert_eq!(app.input, "AT+草稿");
+                assert!(app.paused);
+                assert_eq!(app.offset, 7);
+                assert_eq!(app.matches, vec![1, 3]);
+                assert!(app.capture.is_some());
+                assert_eq!(app.store.lock().unwrap().bytes_len(), 13);
+                assert_eq!(app.worker.stats.tx_bytes(), 0);
+            }
+            assert_eq!(app.config, original_config);
+        }
+        app.help = true;
+        app.handle_event(key(KeyCode::F(10)));
+        assert!(app.help);
+        assert_eq!(app.config.theme.preset, Preset::Pink);
+        app.help = false;
+        app.picker = Some(Picker::Mode);
+        app.picker_index = 2;
+        app.handle_event(key(KeyCode::F(10)));
+        assert_eq!(app.picker, Some(Picker::Mode));
+        assert_eq!(app.picker_index, 2);
+        assert_eq!(app.config.theme.preset, Preset::Midnight);
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            app.handle_event(Event::Key(KeyEvent::new_with_kind(
+                KeyCode::F(10),
+                KeyModifiers::NONE,
+                kind,
+            )));
+            assert_eq!(app.config.theme.preset, Preset::Midnight);
+        }
+        app.shutdown().unwrap();
     }
 
     #[test]

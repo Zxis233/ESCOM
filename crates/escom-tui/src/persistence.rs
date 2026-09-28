@@ -315,4 +315,36 @@ mod tests {
         persistence.save(&config).unwrap();
         assert_eq!(read_config(&path).unwrap().unwrap().0.mode, "hex");
     }
+
+    #[test]
+    fn theme_shortcut_and_custom_colors_survive_autosave_and_reload() {
+        use crate::{app::App, theme::Preset};
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::style::Color;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tui.toml");
+        fs::write(
+            &path,
+            "[theme]\npreset = 'midnight'\n[theme.colors]\naccent = '#123456'\n",
+        )
+        .unwrap();
+        let (config, _, mut persistence) = Config::parse_at(Vec::<String>::new(), &path).unwrap();
+        let mut app = App::new(config).unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::F(10),
+            KeyModifiers::NONE,
+        )));
+        let now = Instant::now();
+        assert!(!persistence.save_if_due(&app.config, now).unwrap());
+        assert!(
+            persistence
+                .save_if_due(&app.config, now + SAVE_DELAY)
+                .unwrap()
+        );
+        let (loaded, _, _) = Config::parse_at(Vec::<String>::new(), &path).unwrap();
+        assert_eq!(loaded.theme.preset, Preset::Custom);
+        assert_eq!(loaded.theme.palette().accent, Color::Rgb(0x12, 0x34, 0x56));
+        assert_eq!(loaded.theme.colors, app.config.theme.colors);
+        app.shutdown().unwrap();
+    }
 }

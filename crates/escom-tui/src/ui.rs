@@ -6,14 +6,12 @@ use escom_core::model::SendMode;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
 use std::borrow::Cow;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-const ACCENT: Color = Color::Cyan;
 
 /// Serial bytes must never be interpreted as host terminal escape sequences.
 pub fn safe_text(text: &str) -> Cow<'_, str> {
@@ -33,12 +31,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.receive_area = Rect::default();
     app.picker_area = Rect::default();
     let language = app.config.language;
+    let palette = app.config.theme.palette();
     let tr = |message: Message| message.render(language).into_owned();
     let send_mode = language.text(match app.send_mode {
         SendMode::Text => Key::Text,
         SendMode::Hex => Key::Hex,
     });
     let area = frame.area();
+    frame.render_widget(Block::default().style(palette.base()), area);
     if area.width < 48 || area.height < 12 {
         frame.render_widget(Paragraph::new(language.text(Key::SmallScreen)), area);
         return;
@@ -85,8 +85,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         )))
         .style(
             Style::default()
-                .fg(Color::Black)
-                .bg(ACCENT)
+                .fg(palette.header_foreground)
+                .bg(palette.accent)
                 .add_modifier(Modifier::BOLD),
         ),
         header,
@@ -97,16 +97,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         let rect = Rect::new(controls.x + rect.x, controls.y + rect.y, rect.width, 1);
         frame.render_widget(
-            Paragraph::new(format!("[{label}]"))
-                .style(Style::default().fg(ACCENT).bg(Color::DarkGray)),
+            Paragraph::new(format!("[{label}]")).style(palette.button()),
             rect,
         );
         app.click_targets.push((rect, action));
     }
     let quit_rect = Rect::new(controls.right() - quit_width, controls.y, quit_width, 1);
     frame.render_widget(
-        Paragraph::new(format!("[{quit_label}]"))
-            .style(Style::default().fg(ACCENT).bg(Color::DarkGray)),
+        Paragraph::new(format!("[{quit_label}]")).style(palette.button()),
         quit_rect,
     );
     app.click_targets
@@ -128,9 +126,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .take(app.page_rows)
         .map(|(index, row)| {
             let style = if Some(index) == selected {
-                Style::default().fg(Color::Black).bg(Color::Yellow)
+                Style::default()
+                    .fg(palette.search_selected_foreground)
+                    .bg(palette.search_selected_background)
             } else if app.matches.binary_search(&index).is_ok() {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(palette.search_foreground)
             } else {
                 Style::default()
             };
@@ -138,7 +138,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             if app.config.timestamps {
                 spans.push(Span::styled(
                     row.received_at.format("%H:%M:%S%.3f ").to_string(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(palette.muted),
                 ));
             }
             spans.push(Span::styled(safe_text(&row.text), style));
@@ -166,7 +166,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(title)
-                .border_style(Style::default().fg(ACCENT)),
+                .border_style(Style::default().fg(palette.border)),
         ),
         body,
     );
@@ -188,7 +188,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             app.worker.queued_write_bytes().div_ceil(1024),
             app.config.tx_kib
         )))
-        .style(Style::default().fg(Color::DarkGray)),
+        .style(Style::default().fg(palette.muted)),
         memory,
     );
     let (record_text, failed) = if let Some(capture) = &app.capture {
@@ -226,15 +226,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
     frame.render_widget(
         Paragraph::new(safe_text(&record_text)).style(Style::default().fg(if failed {
-            Color::Red
+            palette.error
         } else {
-            Color::Green
+            palette.success
         })),
         recording,
     );
     frame.render_widget(
-        Paragraph::new(safe_text(&app.notice.render(language)))
-            .style(Style::default().fg(Color::Yellow)),
+        Paragraph::new(format!(" {}", safe_text(&app.notice.render(language))))
+            .style(Style::default().fg(palette.warning)),
         notice,
     );
     let last_tx = app.last_tx.render(language);
@@ -278,13 +278,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     let tail = &text[tail_start..];
     frame.render_widget(
-        Paragraph::new(tail).block(Block::bordered().title(label).border_style(
-            Style::default().fg(if app.input_mode == InputMode::View {
-                Color::DarkGray
-            } else {
-                ACCENT
-            }),
-        )),
+        Paragraph::new(tail)
+            .style(
+                Style::default()
+                    .fg(palette.foreground)
+                    .bg(palette.editor_background),
+            )
+            .block(
+                Block::bordered()
+                    .title(label)
+                    .border_style(Style::default().fg(if app.input_mode == InputMode::View {
+                        palette.inactive_border
+                    } else {
+                        palette.accent
+                    })),
+            ),
         editor,
     );
     app.click_targets.push((editor, ClickAction::Editor));
@@ -306,11 +314,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
         frame.render_widget(Clear, rect);
         frame.render_widget(
-            Paragraph::new(language.text(Key::KeyboardHelp)).block(
-                Block::bordered()
-                    .title(language.text(Key::HelpTitle))
-                    .border_style(Style::default().fg(ACCENT)),
-            ),
+            Paragraph::new(language.text(Key::KeyboardHelp))
+                .style(palette.popup())
+                .block(
+                    Block::bordered()
+                        .title(language.text(Key::HelpTitle))
+                        .border_style(Style::default().fg(palette.border)),
+                ),
             rect,
         );
     } else if let Some(picker) = app.picker {
@@ -332,31 +342,6 @@ fn toolbar_buttons(app: &App) -> Vec<(&'static str, ClickAction)> {
         ),
         (tr(Key::ButtonMode), ClickAction::OpenPicker(Picker::Mode)),
         (
-            tr(Key::ButtonClear),
-            ClickAction::Shortcut(KeyCode::Char('c')),
-        ),
-    ];
-    if app.input_mode != InputMode::View {
-        buttons.push((tr(Key::ButtonCancel), ClickAction::Cancel));
-    }
-    buttons.extend([
-        (
-            tr(if app.input_mode == InputMode::Send {
-                Key::ButtonSubmitSend
-            } else {
-                Key::ButtonSend
-            }),
-            ClickAction::Shortcut(KeyCode::Char('s')),
-        ),
-        (
-            tr(if app.paused {
-                Key::ButtonResume
-            } else {
-                Key::ButtonPause
-            }),
-            ClickAction::Shortcut(KeyCode::Char(' ')),
-        ),
-        (
             tr(Key::ButtonEncoding),
             ClickAction::Shortcut(KeyCode::F(5)),
         ),
@@ -373,6 +358,27 @@ fn toolbar_buttons(app: &App) -> Vec<(&'static str, ClickAction)> {
             ClickAction::Shortcut(KeyCode::F(7)),
         ),
         (tr(Key::ButtonDirect), ClickAction::Shortcut(KeyCode::F(8))),
+        (tr(Key::ButtonTheme), ClickAction::Shortcut(KeyCode::F(10))),
+        (
+            tr(if app.input_mode == InputMode::Send {
+                Key::ButtonSubmitSend
+            } else {
+                Key::ButtonSend
+            }),
+            ClickAction::Shortcut(KeyCode::Char('s')),
+        ),
+        (
+            tr(Key::ButtonClear),
+            ClickAction::Shortcut(KeyCode::Char('c')),
+        ),
+        (
+            tr(if app.paused {
+                Key::ButtonResume
+            } else {
+                Key::ButtonPause
+            }),
+            ClickAction::Shortcut(KeyCode::Char(' ')),
+        ),
         (
             tr(Key::ButtonSearch),
             ClickAction::Shortcut(KeyCode::Char('/')),
@@ -385,7 +391,10 @@ fn toolbar_buttons(app: &App) -> Vec<(&'static str, ClickAction)> {
             tr(Key::ButtonHelp),
             ClickAction::Shortcut(KeyCode::Char('?')),
         ),
-    ]);
+    ];
+    if app.input_mode != InputMode::View {
+        buttons.push((tr(Key::ButtonCancel), ClickAction::Cancel));
+    }
     buttons
 }
 
@@ -419,6 +428,7 @@ fn layout_buttons(
 
 fn draw_picker(frame: &mut Frame, app: &mut App, picker: Picker) {
     let language = app.config.language;
+    let palette = app.config.theme.palette();
     let count = match picker {
         Picker::Port => app.ports.len(),
         Picker::Mode => 3,
@@ -445,17 +455,18 @@ fn draw_picker(frame: &mut Frame, app: &mut App, picker: Picker) {
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Block::bordered()
+            .style(palette.popup())
             .title(language.text(match picker {
                 Picker::Port => Key::SelectPort,
                 Picker::Mode => Key::SelectMode,
             }))
             .title_bottom(language.text(Key::PickerHint))
-            .border_style(Style::default().fg(ACCENT)),
+            .border_style(Style::default().fg(palette.border)),
         rect,
     );
     let close = Rect::new(rect.right() - 4, rect.y, 3, 1);
     frame.render_widget(
-        Paragraph::new("[x]").style(Style::default().fg(ACCENT)),
+        Paragraph::new("[x]").style(Style::default().fg(palette.accent)),
         close,
     );
     app.click_targets.push((close, ClickAction::ClosePicker));
@@ -491,7 +502,9 @@ fn draw_picker(frame: &mut Frame, app: &mut App, picker: Picker) {
         };
         let row_rect = Rect::new(rect.x + 1, rect.y + 1 + row as u16, width - 2, 1);
         let style = if index == app.picker_index {
-            Style::default().fg(Color::Black).bg(ACCENT)
+            Style::default()
+                .fg(palette.selection_foreground)
+                .bg(palette.selection_background)
         } else {
             Style::default()
         };
@@ -513,6 +526,100 @@ mod tests {
         Event, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn themes_style_entire_frame_editors_popups_and_search_and_reset_cleanly() {
+        use crate::theme::Preset;
+        use ratatui::style::Color;
+        let mut app = App::new(Config {
+            timestamps: false,
+            ..Config::default()
+        })
+        .unwrap();
+        app.store
+            .lock()
+            .unwrap()
+            .append(Local::now(), b"first match\nsecond match\n".to_vec());
+        app.tick();
+        app.paused = true;
+        app.matches = vec![0, 1];
+        app.selected_match = 0;
+        let mut terminal = Terminal::new(TestBackend::new(120, 38)).unwrap();
+        for preset in [
+            Preset::Classic,
+            Preset::Pink,
+            Preset::Midnight,
+            Preset::Custom,
+            Preset::Classic,
+        ] {
+            app.config.theme.preset = preset;
+            app.input_mode = InputMode::Send;
+            app.input = "draft".into();
+            app.help = false;
+            app.picker = None;
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            let palette = app.config.theme.palette();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(0, 0)].bg, palette.accent);
+            assert_eq!(buffer[(0, 0)].fg, palette.header_foreground);
+            let editor = target(&app, &ClickAction::Editor);
+            assert_eq!(
+                buffer[(editor.x + 1, editor.y + 1)].bg,
+                palette.editor_background
+            );
+            assert_eq!(buffer[(editor.x + 1, editor.y + 1)].fg, palette.foreground);
+            let body = app.receive_area;
+            assert_eq!(buffer[(body.x, body.y)].fg, palette.border);
+            assert_eq!(
+                buffer[(body.x + 1, body.y + 1)].bg,
+                palette.search_selected_background
+            );
+            assert_eq!(
+                buffer[(body.x + 1, body.y + 2)].fg,
+                palette.search_foreground
+            );
+            assert_eq!(
+                buffer[(body.x + 1, body.bottom() - 2)].bg,
+                palette.background
+            );
+            let button = target(&app, &ClickAction::Shortcut(KeyCode::F(10)));
+            assert_eq!(buffer[(button.x, button.y)].fg, palette.accent);
+            assert_eq!(buffer[(button.x, button.y)].bg, palette.button_background);
+            app.picker = Some(Picker::Mode);
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            let rect = app.picker_area;
+            let buffer = terminal.backend().buffer();
+            assert_eq!(
+                buffer[(rect.x + 1, rect.y + 1)].bg,
+                palette.selection_background
+            );
+            assert_eq!(
+                buffer[(rect.x + 1, rect.y + 2)].bg,
+                palette.popup_background
+            );
+            app.picker = None;
+            app.help = true;
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            assert_eq!(
+                terminal.backend().buffer()[(2, 2)].bg,
+                palette.popup_background
+            );
+        }
+        app.help = false;
+        app.config.theme.preset = Preset::Custom;
+        app.config.theme.colors.accent = Some("#ff80ac".to_owned().try_into().unwrap());
+        app.config.theme.colors.background = Some("#010203".to_owned().try_into().unwrap());
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(0, 0)].bg,
+            Color::Rgb(255, 128, 172)
+        );
+        click(&mut app, ClickAction::Shortcut(KeyCode::F(10)));
+        assert_eq!(app.config.theme.preset, Preset::Classic);
+        assert_eq!(app.config.theme.palette().background, Color::Reset);
+        assert_eq!(app.config.theme.palette().accent, Color::Cyan);
+        app.shutdown().unwrap();
+    }
 
     fn mouse(app: &mut App, kind: MouseEventKind, x: u16, y: u16) {
         assert!(!app.handle_event(Event::Mouse(MouseEvent {
@@ -559,7 +666,7 @@ mod tests {
     #[test]
     fn mouse_selects_ports_modes_and_clears_in_both_languages_and_compact_layouts() {
         for language in [Language::En, Language::ZhCn] {
-            for (width, height) in [(100, 30), (48, 13)] {
+            for (width, height) in [(100, 30), (48, 17)] {
                 let mut app = App::new(Config {
                     language,
                     ..Config::default()

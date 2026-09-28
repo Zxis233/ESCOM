@@ -4,6 +4,7 @@ mod demo;
 mod display;
 mod i18n;
 mod persistence;
+mod theme;
 mod ui;
 
 use app::App;

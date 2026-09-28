@@ -4,6 +4,7 @@ F2       Cycle detected ports       F3       Connect / disconnect
 F4       Text / HEX / Terminal      F5       UTF-8 / GBK
 F6       Start / stop raw recording F7       Send text / HEX
 F8       Direct terminal input (Esc returns to viewer)
+F10      Cycle Classic / Pink / Midnight / Custom (saved; all modes)
 s        Compose a send            Enter    Submit editor
 /        Search frozen history     Ctrl+R   Toggle regex in search editor
 n / N    Next / previous hit row   Esc      Close editor

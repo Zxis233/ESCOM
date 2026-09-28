@@ -140,11 +140,11 @@ underline = false
 
 ESCOM 的本地文件保存在 `%APPDATA%\ESCOM\`：
 
-| 文件 | 用途 |
-| --- | --- |
-| `settings.toml` | 界面、字体、收发显示和背景偏好 |
-| `highlight.toml` | 接收内容高亮规则 |
-| `window.ron` | 窗口位置与尺寸 |
+| 文件             | 用途                                         |
+| ---------------- | -------------------------------------------- |
+| `settings.toml`  | 界面、字体、收发显示和背景偏好               |
+| `highlight.toml` | 接收内容高亮规则                             |
+| `window.ron`     | 窗口位置与尺寸                               |
 | `logs\escom.log` | 应用生命周期、串口错误和后台任务耗时诊断日志 |
 
 `settings.toml` 按功能分组，首次启动时会自动创建。建议关闭 ESCOM 后再手动修改，重新启动后生效：

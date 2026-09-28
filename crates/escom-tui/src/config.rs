@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub language: Language,
+    pub theme: crate::theme::Theme,
     pub port: String,
     pub baud: u32,
     pub data_bits: u8,
@@ -45,6 +46,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             language: Language::En,
+            theme: crate::theme::Theme::default(),
             port: String::new(),
             baud: 115200,
             data_bits: 8,

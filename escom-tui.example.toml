@@ -29,3 +29,31 @@ record_queue_kib = 256
 # Raw RX capture is create-new only. Paths are relative to working directory.
 # record = "session.bin"
 demo = false
+
+# F10 cycles classic -> pink -> midnight -> custom -> classic and saves the selection.
+[theme]
+preset = "classic"
+
+# Set preset = "custom" above to use these colors; other presets ignore them.
+# Omitted custom colors inherit Pink. Overrides are preserved when switching presets.
+# Use "#RRGGBB", "default" (terminal default), or an ANSI color name.
+# Edit while the TUI is closed, then restart to load changes.
+[theme.colors]
+# background = "#1f1722"
+# foreground = "#f8edf3"
+# muted = "#bca5b5"
+# accent = "#ff80ac"
+# border = "#b86586"
+# inactive_border = "#77576c"
+# button_background = "#382636"
+# header_foreground = "#281521"
+# editor_background = "#281d2b"
+# popup_background = "#302230"
+# selection_background = "#ff80ac"
+# selection_foreground = "#281521"
+# search_foreground = "#ffd580"
+# search_selected_background = "#ffd580"
+# search_selected_foreground = "#281521"
+# success = "#a6d9b4"
+# warning = "#ffd580"
+# error = "#ff8b94"
