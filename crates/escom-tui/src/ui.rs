@@ -51,8 +51,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .last()
         .map_or(1, |rect| rect.y + 1)
         .min(area.height.saturating_sub(11).max(1));
-    // Five text rows plus borders; retain a usable RX area in compact terminals.
-    let editor_height = 5.min(area.height.saturating_sub(toolbar_height + 5));
+    // One fifth of the window, with a minimum of three text rows plus borders.
+    let editor_height = (area.height / 6).max(5);
     let [header, controls, body, memory, recording, notice, editor] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(toolbar_height),
@@ -63,6 +63,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Length(editor_height),
     ])
     .areas(area);
+    let [header_status, header_clock] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(19)]).areas(header);
+    let header_style = Style::default()
+        .fg(palette.header_foreground)
+        .bg(palette.accent)
+        .add_modifier(Modifier::BOLD);
     let connection = if app.connected {
         language.text(Key::Connected)
     } else if app.connecting {
@@ -83,13 +89,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             }),
             app.config.encoding.to_uppercase()
         )))
-        .style(
-            Style::default()
-                .fg(palette.header_foreground)
-                .bg(palette.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        header,
+        .style(header_style),
+        header_status,
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            " {} ",
+            chrono::Local::now().format("%y/%m/%d %H:%M:%S")
+        ))
+        .style(header_style),
+        header_clock,
     );
     for ((label, action), rect) in buttons.into_iter().zip(button_layout) {
         if rect.y >= controls.height {

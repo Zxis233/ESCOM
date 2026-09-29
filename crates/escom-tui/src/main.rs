@@ -79,6 +79,7 @@ fn run() -> io::Result<()> {
         execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture)?;
         let mut next_tick = Instant::now();
         let mut dirty = true;
+        let mut displayed_second = chrono::Local::now().timestamp();
         loop {
             if Instant::now() >= next_tick {
                 dirty |= app.tick();
@@ -88,8 +89,11 @@ fn run() -> io::Result<()> {
                 }
                 next_tick = Instant::now() + Duration::from_millis(50);
             }
+            let current_second = chrono::Local::now().timestamp();
+            dirty |= current_second != displayed_second;
             if dirty {
                 terminal.draw(|frame| ui::draw(frame, &mut app))?;
+                displayed_second = current_second;
                 dirty = false;
             }
             if event::poll(next_tick.saturating_duration_since(Instant::now()))? {
