@@ -48,3 +48,8 @@ LegalCopyright = "Copyright (c) 2026 ESCOM contributors"
 [profile.release]
 lto = "fat"
 strip = "symbols"
+
+[profile.release.package.escom-tui]
+opt-level = "s"
+codegen-units = 1
+strip = "symbols"

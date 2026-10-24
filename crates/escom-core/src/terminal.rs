@@ -177,6 +177,16 @@ struct TerminalLine {
 }
 
 impl TerminalLine {
+    fn compact_cells(&mut self) {
+        if self.cells.is_empty() {
+            self.cells = Vec::new();
+        } else if self.cells.capacity() > self.cells.len().saturating_mul(2).max(64) {
+            // Keep modest growth headroom, but do not retain a large allocation
+            // after clipping or ANSI erase/delete operations shrink the line.
+            self.cells.shrink_to_fit();
+        }
+    }
+
     fn text(&self) -> String {
         let mut end = self.cells.len();
         while end != 0 && self.cells[end - 1] == ' ' {
@@ -279,8 +289,22 @@ impl TerminalScreen {
         self.mark_dirty(self.cursor_row);
 
         let width = UnicodeWidthChar::width(character).unwrap_or(1).max(1);
+        let line_len = self.lines[self.cursor_row].cells.len();
+        if self.cursor_col > line_len {
+            // Tabs and restored cursors may point far beyond the stored line.
+            // Bound the implicit blank run before allocating it, leaving room
+            // for both cells of a wide character. Existing text is not clipped
+            // here; ordinary long lines still use the tail-preserving limit.
+            let max_col = line_len.max(self.max_line_cells.saturating_sub(width));
+            if self.cursor_col > max_col {
+                self.cursor_col = max_col;
+                self.csi_limited = true;
+            }
+        }
         let line = &mut self.lines[self.cursor_row];
         if self.cursor_col > line.cells.len() {
+            line.cells
+                .reserve_exact(self.cursor_col + width - line.cells.len());
             line.cells.resize(self.cursor_col, ' ');
         }
 
@@ -781,6 +805,7 @@ impl TerminalScreen {
         let dirty_from = self.byte_dirty_from.unwrap_or(self.lines.len());
         for row in dirty_from..self.lines.len() {
             self.refresh_line_byte_count(row);
+            self.lines[row].compact_cells();
         }
         for row in dirty_from..self.lines.len() {
             let line_bytes = self.lines[row].byte_len;
@@ -801,6 +826,7 @@ impl TerminalScreen {
             }
             self.lines[row].cells.drain(..retain_from);
             self.lines[row].cells.insert(0, '…');
+            self.lines[row].compact_cells();
             self.refresh_line_byte_count(row);
             if self.cursor_row == row {
                 self.cursor_col = self
@@ -1114,6 +1140,115 @@ mod tests {
         );
 
         assert_eq!(update.rows[0].text, "normal red text");
+    }
+
+    #[test]
+    fn tab_gap_allocation_is_bounded_before_enforcing_limits() {
+        for text in ["X", "界"] {
+            let mut parser = Parser::new();
+            let mut screen = TerminalScreen::default();
+            let max_line_cells = 8 * 1024;
+            let tabs = vec![b'\t'; 8192];
+            for _ in 0..8 {
+                screen.begin_update(2000, 512 * 1024, max_line_cells);
+                parser.advance(&mut screen, &tabs);
+                screen.enforce_limits(2000, 512 * 1024, max_line_cells);
+            }
+            assert_eq!(screen.cursor_col, MAX_TERMINAL_COLUMNS);
+
+            // Check the allocation before the usual end-of-chunk trimming runs.
+            parser.advance(&mut screen, text.as_bytes());
+            assert!(screen.lines[0].cells.len() <= max_line_cells);
+            assert!(screen.lines[0].cells.capacity() <= 2 * max_line_cells);
+            assert!(screen.lines[0].text().ends_with(text));
+            assert!(screen.csi_limited);
+        }
+    }
+
+    #[test]
+    fn repeated_tab_expansion_does_not_retain_oversized_history_allocations() {
+        let mut formatter = IncrementalTerminalFormatter::new(TextEncoding::Utf8);
+        let text_budget = 512 * 1024;
+        let line_budget = 8 * 1024;
+        let tabs = vec![b'\t'; 8192];
+        let mut sequence = 0;
+        for _ in 0..127 {
+            for _ in 0..8 {
+                formatter.apply_records(
+                    &[chunk(sequence, 1, &tabs)],
+                    2000,
+                    text_budget,
+                    line_budget,
+                );
+                sequence += 1;
+            }
+            formatter.apply_records(
+                &[chunk(sequence, 1, b"X\r\n")],
+                2000,
+                text_budget,
+                line_budget,
+            );
+            sequence += 1;
+            let allocated_cells: usize = formatter
+                .screen
+                .lines
+                .iter()
+                .map(|line| line.cells.capacity())
+                .sum();
+            assert!(formatter.screen.text_bytes <= text_budget);
+            assert!(allocated_cells <= 2 * text_budget);
+        }
+        assert!(formatter.is_limited());
+    }
+
+    #[test]
+    fn clipped_lines_release_capacity_and_preserve_the_tail_and_saved_cursor() {
+        let mut formatter = IncrementalTerminalFormatter::new(TextEncoding::Utf8);
+        let mut bytes = vec![b'a'; 32 * 1024];
+        bytes.extend_from_slice(b"tail\x1b7");
+        let update = apply(&mut formatter, &[chunk(0, 1, &bytes)]);
+        assert!(update.rows[0].text.starts_with('…'));
+        assert!(update.rows[0].text.ends_with("tail"));
+        assert!(update.rows[0].text.len() <= 1024);
+        let line = &formatter.screen.lines[0];
+        assert!(line.cells.capacity() <= 2 * line.cells.len());
+        assert_eq!(formatter.screen.saved_cursor, formatter.cursor());
+
+        let update = apply(&mut formatter, &[chunk(1, 2, b"\r\x1b8Z")]);
+        assert!(update.rows[0].text.ends_with("tailZ"));
+    }
+
+    #[test]
+    fn erased_and_shortened_lines_release_excess_capacity() {
+        for (edit, expected) in [
+            (b"\r\x1b[K".as_slice(), ""),
+            (b"\x1b[2K\r".as_slice(), ""),
+            (b"\r\x1b[4095P".as_slice(), "a"),
+            (b"\x1b[H\x1b[J".as_slice(), ""),
+        ] {
+            let mut formatter = IncrementalTerminalFormatter::new(TextEncoding::Utf8);
+            formatter.apply_records(&[chunk(0, 1, &vec![b'a'; 4096])], 100, 8192, 8192);
+            formatter.apply_records(&[chunk(1, 2, edit)], 100, 8192, 8192);
+            let line = &formatter.screen.lines[0];
+            assert_eq!(line.text(), expected);
+            assert!(line.cells.capacity() <= 64);
+            assert_eq!(formatter.screen.text_bytes, expected.len());
+            if expected.is_empty() {
+                assert_eq!(line.cells.capacity(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_tabs_wide_characters_and_cursor_restore_keep_their_positions() {
+        let mut formatter = IncrementalTerminalFormatter::new(TextEncoding::Utf8);
+        let update = apply(
+            &mut formatter,
+            &[chunk(0, 1, "A\t界\x1b7\rZ\x1b8!".as_bytes())],
+        );
+        assert_eq!(update.rows[0].text, "Z       界!");
+        assert_eq!(formatter.cursor(), Some((0, 11)));
+        assert!(!formatter.is_limited());
     }
 
     #[test]
