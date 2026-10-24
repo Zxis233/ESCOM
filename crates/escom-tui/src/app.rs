@@ -57,6 +57,7 @@ pub struct App {
     pub horizontal: u16,
     pub page_rows: usize,
     pub input_mode: InputMode,
+    pub input_focused: bool,
     pub input: String,
     pub send_mode: SendMode,
     pub search_regex: bool,
@@ -119,6 +120,7 @@ impl App {
             horizontal: 0,
             page_rows: 20,
             input_mode: InputMode::View,
+            input_focused: false,
             input: String::new(),
             send_mode,
             search_regex: false,
@@ -344,6 +346,11 @@ impl App {
     }
 
     fn begin_input(&mut self, mode: InputMode) {
+        self.input_focused = true;
+        // Refocusing the same editor must keep its draft and search pause state.
+        if self.input_mode == mode {
+            return;
+        }
         self.input.clear();
         self.input_mode = mode;
         if mode == InputMode::Search {
@@ -384,15 +391,16 @@ impl App {
             }
             Event::Paste(_) if self.help || self.picker.is_some() => Ok(false),
             Event::Paste(text)
-                if matches!(
-                    self.input_mode,
-                    InputMode::Send | InputMode::Search | InputMode::Command
-                ) =>
+                if self.input_focused
+                    && matches!(
+                        self.input_mode,
+                        InputMode::Send | InputMode::Search | InputMode::Command
+                    ) =>
             {
                 self.append_input(&text);
                 Ok(false)
             }
-            Event::Paste(text) if self.input_mode == InputMode::Direct => {
+            Event::Paste(text) if self.input_focused && self.input_mode == InputMode::Direct => {
                 if text.len() > self.config.send_kib * 1024 {
                     Err(Key::PasteLimit.into())
                 } else {
@@ -454,9 +462,13 @@ impl App {
             }
             return Ok(false);
         }
+        if !self.input_focused && key.code != KeyCode::Esc {
+            return self.handle_view_key(key.code);
+        }
         if self.input_mode == InputMode::Direct {
             if key.code == KeyCode::Esc {
                 self.input_mode = InputMode::View;
+                self.input_focused = false;
                 return Ok(false);
             }
             if let Some(bytes) = direct_key(key, self.config.text_encoding()?)? {
@@ -471,6 +483,7 @@ impl App {
                         self.resume();
                     }
                     self.input_mode = InputMode::View;
+                    self.input_focused = false;
                     self.input.clear();
                 }
                 KeyCode::Enter => {
@@ -486,6 +499,7 @@ impl App {
                         _ => {}
                     }
                     self.input_mode = InputMode::View;
+                    self.input_focused = false;
                     self.input.clear();
                 }
                 KeyCode::Backspace => {
@@ -572,6 +586,7 @@ impl App {
                 self.display.invalidate();
                 self.resume();
                 self.input_mode = InputMode::Direct;
+                self.input_focused = true;
             }
             KeyCode::Char('s') => self.begin_input(InputMode::Send),
             KeyCode::Char('/') => self.begin_input(InputMode::Search),
@@ -662,6 +677,22 @@ impl App {
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<bool, Message> {
         let position = Position::new(mouse.column, mouse.row);
+        let action = if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            self.click_targets
+                .iter()
+                .rev()
+                .find(|(rect, _)| rect.contains(position))
+                .map(|(_, action)| action.clone())
+        } else {
+            None
+        };
+        // Blur before handling outside clicks, including modal dismissal and errors.
+        // Editor-opening actions explicitly restore focus below.
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            && (self.help || self.picker.is_some() || action != Some(ClickAction::Editor))
+        {
+            self.input_focused = false;
+        }
         if self.help {
             if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
                 self.help = false;
@@ -704,13 +735,7 @@ impl App {
         if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
             return Ok(false);
         }
-        if let Some(action) = self
-            .click_targets
-            .iter()
-            .rev()
-            .find(|(rect, _)| rect.contains(position))
-            .map(|(_, action)| action.clone())
-        {
+        if let Some(action) = action {
             return self.activate_click(action);
         }
         Ok(false)
@@ -762,16 +787,19 @@ impl App {
             ClickAction::Editor => {
                 if self.input_mode == InputMode::View {
                     self.begin_input(InputMode::Send);
+                } else {
+                    self.input_focused = true;
                 }
             }
             ClickAction::Shortcut(code) => {
                 match (code, self.input_mode) {
                     (KeyCode::Char('s'), InputMode::Send) => {
+                        self.input_focused = true;
                         self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
                     }
                     // Clicking the active editor's mode must not erase its draft.
                     (KeyCode::Char('/'), InputMode::Search)
-                    | (KeyCode::Char(':'), InputMode::Command) => {}
+                    | (KeyCode::Char(':'), InputMode::Command) => self.input_focused = true,
                     _ => {
                         return self.handle_view_key(code);
                     }

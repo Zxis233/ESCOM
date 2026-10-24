@@ -30,4 +30,5 @@ Direct mode: Enter sends CR, Ctrl+C sends 0x03; Esc returns, Ctrl+Q exits.
 Mouse: click toolbar buttons; Port / Mode open a selection list.
 Wheel scrolls RX / lists; click outside a list or Esc closes it.
 Click TX to compose; click Send to submit. Shift+drag may select terminal text.
+Click outside TX to unfocus; click TX to resume the draft or direct input.
 Press any key or left-click to close help.

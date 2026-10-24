@@ -286,6 +286,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         tail_start = index;
     }
     let tail = &text[tail_start..];
+    let editor_focused = app.input_focused && !app.help && app.picker.is_none();
     frame.render_widget(
         Paragraph::new(tail)
             .style(
@@ -296,10 +297,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .block(
                 Block::bordered()
                     .title(label)
-                    .border_style(Style::default().fg(if app.input_mode == InputMode::View {
-                        palette.inactive_border
-                    } else {
+                    .border_style(Style::default().fg(if editor_focused {
                         palette.accent
+                    } else {
+                        palette.inactive_border
                     })),
             ),
         editor,
@@ -308,8 +309,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if matches!(
         app.input_mode,
         InputMode::Send | InputMode::Search | InputMode::Command
-    ) && !app.help
-        && app.picker.is_none()
+    ) && editor_focused
     {
         frame.set_cursor_position((editor.x + 1 + tail_width as u16, editor.y + 1));
     }
@@ -563,6 +563,7 @@ mod tests {
         ] {
             app.config.theme.preset = preset;
             app.input_mode = InputMode::Send;
+            app.input_focused = true;
             app.input = "draft".into();
             app.help = false;
             app.picker = None;
@@ -673,6 +674,142 @@ mod tests {
     }
 
     #[test]
+    fn outside_clicks_blur_editors_without_losing_drafts_and_clicking_editor_refocuses() {
+        for language in [Language::En, Language::ZhCn] {
+            for (width, height) in [(120, 30), (48, 17)] {
+                let mut app = App::new(Config {
+                    language,
+                    ..Config::default()
+                })
+                .unwrap();
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                for (shortcut, mode) in [
+                    ('s', InputMode::Send),
+                    ('/', InputMode::Search),
+                    (':', InputMode::Command),
+                ] {
+                    app.handle_event(Event::Key(KeyEvent::new(
+                        KeyCode::Char(shortcut),
+                        KeyModifiers::NONE,
+                    )));
+                    app.handle_event(Event::Paste("AT+草稿".into()));
+                    terminal.draw(|f| draw(f, &mut app)).unwrap();
+                    let editor = target(&app, &ClickAction::Editor);
+                    let body = app.receive_area;
+                    for kind in [
+                        MouseEventKind::Up(MouseButton::Left),
+                        MouseEventKind::Down(MouseButton::Right),
+                        MouseEventKind::Drag(MouseButton::Left),
+                        MouseEventKind::Moved,
+                        MouseEventKind::ScrollUp,
+                        MouseEventKind::ScrollDown,
+                    ] {
+                        mouse(&mut app, kind, body.x + 1, body.y + 1);
+                        assert!(app.input_focused);
+                    }
+                    click(&mut app, ClickAction::Editor);
+                    assert_eq!(app.input, "AT+草稿");
+                    for (x, y) in [(body.x + 1, body.y + 1), (0, 0), (0, editor.y - 1)] {
+                        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+                        assert!(!app.input_focused);
+                        assert_eq!(app.input_mode, mode);
+                        for code in [KeyCode::Char('x'), KeyCode::Backspace, KeyCode::Enter] {
+                            assert!(
+                                !app.handle_event(Event::Key(KeyEvent::new(
+                                    code,
+                                    KeyModifiers::NONE,
+                                )))
+                            );
+                        }
+                        app.handle_event(Event::Paste("unfocused paste".into()));
+                        assert_eq!(app.input, "AT+草稿");
+                        assert_eq!(app.input_mode, mode);
+                        terminal.draw(|f| draw(f, &mut app)).unwrap();
+                        let palette = app.config.theme.palette();
+                        assert_eq!(
+                            terminal.backend().buffer()[(editor.x, editor.bottom() - 1)].fg,
+                            palette.inactive_border
+                        );
+                        click(&mut app, ClickAction::Editor);
+                        assert!(app.input_focused);
+                        terminal.draw(|f| draw(f, &mut app)).unwrap();
+                        assert_eq!(
+                            terminal.backend().buffer()[(editor.x, editor.bottom() - 1)].fg,
+                            palette.accent
+                        );
+                    }
+                    // The mode's keyboard shortcut also restores focus without clearing text.
+                    mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+                    app.handle_event(Event::Key(KeyEvent::new(
+                        KeyCode::Char(shortcut),
+                        KeyModifiers::NONE,
+                    )));
+                    assert!(app.input_focused);
+                    assert_eq!(app.input, "AT+草稿");
+                    if shortcut != 's' {
+                        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+                        click(&mut app, ClickAction::Shortcut(KeyCode::Char(shortcut)));
+                        assert!(app.input_focused);
+                        assert_eq!(app.input, "AT+草稿");
+                    }
+                    app.handle_event(Event::Paste("!".into()));
+                    assert_eq!(app.input, "AT+草稿!");
+                    mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+                    click(&mut app, ClickAction::Cancel);
+                    assert_eq!(app.input_mode, InputMode::View);
+                    assert!(!app.input_focused);
+                    assert!(app.input.is_empty());
+                }
+                app.shutdown().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn outside_clicks_suspend_direct_serial_input_until_editor_is_refocused() {
+        let mut app = App::new(Config {
+            demo: true,
+            ..Config::default()
+        })
+        .unwrap();
+        wait_for(&mut app, |app| app.connected);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        click(&mut app, ClickAction::Shortcut(KeyCode::F(8)));
+        assert!(app.input_focused);
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let body = app.receive_area;
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            body.x + 1,
+            body.y + 1,
+        );
+        assert!(!app.input_focused);
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        app.handle_event(Event::Paste("unfocused paste".into()));
+        assert_eq!(app.worker.queued_write_bytes(), 0);
+        assert_eq!(app.worker.stats.tx_bytes(), 0);
+        click(&mut app, ClickAction::Editor);
+        assert_eq!(app.input_mode, InputMode::Direct);
+        assert!(app.input_focused);
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        app.handle_event(Event::Paste("yz".into()));
+        wait_for(&mut app, |app| app.worker.stats.tx_bytes() == 3);
+        app.shutdown().unwrap();
+    }
+
+    #[test]
     fn mouse_selects_ports_modes_and_clears_in_both_languages_and_compact_layouts() {
         for language in [Language::En, Language::ZhCn] {
             for (width, height) in [(100, 30), (48, 17)] {
@@ -732,6 +869,7 @@ mod tests {
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 for mode in [InputMode::View, InputMode::Send, InputMode::Direct] {
                     app.input_mode = mode;
+                    app.input_focused = mode != InputMode::View;
                     terminal.draw(|f| draw(f, &mut app)).unwrap();
                     let quit = target(&app, &ClickAction::Shortcut(KeyCode::Char('q')));
                     assert_eq!(quit.right(), width);
@@ -765,6 +903,11 @@ mod tests {
     #[test]
     fn overlays_resize_and_non_left_clicks_never_activate_background_buttons() {
         let mut app = App::new(Config::default()).unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::NONE,
+        )));
+        app.input = "keep draft".into();
         app.store
             .lock()
             .unwrap()
@@ -779,8 +922,10 @@ mod tests {
             MouseEventKind::Moved,
         ] {
             mouse(&mut app, kind, clear.x, clear.y);
+            assert!(app.input_focused);
         }
         click(&mut app, ClickAction::OpenPicker(Picker::Mode));
+        assert!(!app.input_focused);
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         mouse(
             &mut app,
@@ -789,7 +934,11 @@ mod tests {
             clear.y,
         );
         assert_eq!(app.picker, None);
+        assert!(!app.input_focused);
         assert!(app.store.lock().unwrap().bytes_len() > 0);
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        click(&mut app, ClickAction::Editor);
+        assert!(app.input_focused);
         app.help = true;
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         mouse(
@@ -799,8 +948,11 @@ mod tests {
             clear.y,
         );
         assert!(!app.help);
+        assert!(!app.input_focused);
+        assert_eq!(app.input, "keep draft");
         assert!(app.store.lock().unwrap().bytes_len() > 0);
         terminal.draw(|f| draw(f, &mut app)).unwrap();
+        click(&mut app, ClickAction::Editor);
         app.handle_event(Event::Resize(20, 5));
         mouse(
             &mut app,
@@ -808,6 +960,7 @@ mod tests {
             clear.x,
             clear.y,
         );
+        assert!(!app.input_focused);
         let mut tiny = Terminal::new(TestBackend::new(20, 5)).unwrap();
         tiny.draw(|f| draw(f, &mut app)).unwrap();
         assert!(app.click_targets.is_empty());
@@ -821,7 +974,10 @@ mod tests {
         let mut app = App::new(Config::default()).unwrap();
         app.ports = (1..=30).map(|i| format!("COM{i}")).collect();
         app.config.port = "COM30".into();
-        app.input_mode = InputMode::Send;
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::NONE,
+        )));
         app.input = "AT+串口".into();
         let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -839,6 +995,11 @@ mod tests {
         assert_eq!(app.config.port, "COM28");
         assert_eq!(app.input, "AT+串口");
         assert_eq!(app.input_mode, InputMode::Send);
+        assert!(!app.input_focused);
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        click(&mut app, ClickAction::Editor);
+        assert!(app.input_focused);
+        assert_eq!(app.input, "AT+串口");
         app.shutdown().unwrap();
     }
 
@@ -857,10 +1018,12 @@ mod tests {
         assert!(app.notice.render(Language::En).contains("Disconnect"));
         click(&mut app, ClickAction::Shortcut(KeyCode::F(8)));
         assert_eq!(app.input_mode, InputMode::Direct);
+        assert!(app.input_focused);
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         click(&mut app, ClickAction::Shortcut(KeyCode::Char('c')));
         assert_eq!(app.worker.stats.tx_bytes(), 0);
         assert_eq!(app.input_mode, InputMode::Direct);
+        assert!(!app.input_focused);
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         click(&mut app, ClickAction::Cancel);
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -869,9 +1032,11 @@ mod tests {
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         click(&mut app, ClickAction::Shortcut(KeyCode::F(5)));
         assert_eq!(app.input, "AT");
+        assert!(!app.input_focused);
         click(&mut app, ClickAction::Shortcut(KeyCode::Char('s')));
         wait_for(&mut app, |app| app.worker.stats.tx_bytes() == 4);
         assert_eq!(app.input_mode, InputMode::View);
+        assert!(!app.input_focused);
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         click(&mut app, ClickAction::Shortcut(KeyCode::F(3)));
         wait_for(&mut app, |app| !app.connected && !app.connecting);
@@ -997,6 +1162,7 @@ mod tests {
         assert!(screen.contains("PAUSED"));
         assert_eq!(app.matches.len(), 1);
         app.input_mode = InputMode::Send;
+        app.input_focused = true;
         app.input = "AT+GMR".into();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let screen: String = terminal
