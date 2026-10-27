@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod demo;
 mod display;
+mod editor;
 mod i18n;
 mod persistence;
 mod theme;

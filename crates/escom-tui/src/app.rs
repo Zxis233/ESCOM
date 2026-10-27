@@ -1,3 +1,4 @@
+use crate::editor::{LineEditor, SendHistory};
 use crate::i18n::{Key, Language, Message};
 use crate::msg;
 use crate::{config::Config, demo::DemoBackend, display::Display};
@@ -58,7 +59,9 @@ pub struct App {
     pub page_rows: usize,
     pub input_mode: InputMode,
     pub input_focused: bool,
-    pub input: String,
+    pub input: LineEditor,
+    send_draft: LineEditor,
+    send_history: SendHistory,
     pub send_mode: SendMode,
     pub search_regex: bool,
     pub matches: Vec<usize>,
@@ -121,7 +124,9 @@ impl App {
             page_rows: 20,
             input_mode: InputMode::View,
             input_focused: false,
-            input: String::new(),
+            input: LineEditor::default(),
+            send_draft: LineEditor::default(),
+            send_history: SendHistory::default(),
             send_mode,
             search_regex: false,
             matches: Vec::new(),
@@ -309,7 +314,7 @@ impl App {
         self.selected_match = 0;
         self.search_truncated = false;
         if let Some(matcher) = SearchMatcher::new_with_limits_typed(
-            &self.input,
+            self.input.text(),
             false,
             self.search_regex,
             1024 * 1024,
@@ -351,7 +356,15 @@ impl App {
         if self.input_mode == mode {
             return;
         }
-        self.input.clear();
+        if self.input_mode == InputMode::Send {
+            self.send_history.reset_navigation();
+            self.send_draft = std::mem::take(&mut self.input);
+        } else {
+            self.input.clear();
+        }
+        if mode == InputMode::Send {
+            self.input = std::mem::take(&mut self.send_draft);
+        }
         self.input_mode = mode;
         if mode == InputMode::Search {
             self.search_was_paused = self.paused;
@@ -359,18 +372,18 @@ impl App {
         }
     }
 
-    pub fn append_input(&mut self, text: &str) {
+    pub fn insert_input(&mut self, text: &str) {
         let limit = if self.input_mode == InputMode::Send {
             self.config.send_kib * 1024
         } else {
             1024
         };
         // Reject the whole paste rather than silently sending a truncated command.
-        if text.len() > limit.saturating_sub(self.input.len()) {
+        if !self.input.insert(text, limit) {
             self.notice = msg!(InputLimit, limit);
             return;
         }
-        self.input.push_str(text);
+        self.send_history.reset_navigation();
     }
 
     pub fn handle_event(&mut self, event: Event) -> bool {
@@ -397,7 +410,7 @@ impl App {
                         InputMode::Send | InputMode::Search | InputMode::Command
                     ) =>
             {
-                self.append_input(&text);
+                self.insert_input(&text);
                 Ok(false)
             }
             Event::Paste(text) if self.input_focused && self.input_mode == InputMode::Direct => {
@@ -485,15 +498,19 @@ impl App {
                     self.input_mode = InputMode::View;
                     self.input_focused = false;
                     self.input.clear();
+                    self.send_history.reset_navigation();
                 }
                 KeyCode::Enter => {
                     match self.input_mode {
-                        InputMode::Send => self.send_bytes(parse_send_input_typed(
-                            &self.input,
-                            self.send_mode,
-                            self.config.text_encoding()?,
-                            self.config.ending()?,
-                        )?)?,
+                        InputMode::Send => {
+                            self.send_bytes(parse_send_input_typed(
+                                self.input.text(),
+                                self.send_mode,
+                                self.config.text_encoding()?,
+                                self.config.ending()?,
+                            )?)?;
+                            self.send_history.record(self.input.text(), self.send_mode);
+                        }
                         InputMode::Search => self.search()?,
                         InputMode::Command => self.command()?,
                         _ => {}
@@ -503,10 +520,41 @@ impl App {
                     self.input.clear();
                 }
                 KeyCode::Backspace => {
-                    self.input.pop();
+                    if self.input.backspace() {
+                        self.send_history.reset_navigation();
+                    }
+                }
+                KeyCode::Delete => {
+                    if self.input.delete() {
+                        self.send_history.reset_navigation();
+                    }
+                }
+                KeyCode::Left => self.input.left(),
+                KeyCode::Right => self.input.right(),
+                KeyCode::Home => self.input.home(),
+                KeyCode::End => self.input.end(),
+                KeyCode::Up | KeyCode::Down if self.input_mode == InputMode::Send => {
+                    self.send_history.navigate(
+                        key.code == KeyCode::Up,
+                        self.send_mode,
+                        &mut self.input,
+                        self.config.send_kib * 1024,
+                    );
+                }
+                KeyCode::Tab if self.input_mode == InputMode::Command => {
+                    let choices = self
+                        .input
+                        .complete_command(1024)
+                        .map_err(|()| msg!(InputLimit, 1024))?;
+                    self.notice = if choices.is_empty() {
+                        Key::NoCompletion.into()
+                    } else {
+                        msg!(CompletionChoices, choices.join(" | "))
+                    };
                 }
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.input.clear()
+                    self.input.clear();
+                    self.send_history.reset_navigation();
                 }
                 KeyCode::Char('r')
                     if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -519,7 +567,7 @@ impl App {
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
-                    self.append_input(&ch.to_string())
+                    self.insert_input(&ch.to_string())
                 }
                 _ => {}
             }
@@ -566,6 +614,7 @@ impl App {
                 }
             }
             KeyCode::F(7) => {
+                self.send_history.reset_navigation();
                 self.send_mode = if self.send_mode == SendMode::Text {
                     SendMode::Hex
                 } else {
@@ -585,8 +634,7 @@ impl App {
                 self.config.mode = "terminal".into();
                 self.display.invalidate();
                 self.resume();
-                self.input_mode = InputMode::Direct;
-                self.input_focused = true;
+                self.begin_input(InputMode::Direct);
             }
             KeyCode::Char('s') => self.begin_input(InputMode::Send),
             KeyCode::Char('/') => self.begin_input(InputMode::Search),
@@ -810,7 +858,7 @@ impl App {
     }
 
     fn command(&mut self) -> Result<(), Message> {
-        let input = self.input.clone();
+        let input = self.input.text().to_owned();
         let (name, value) = input.trim().split_once(' ').unwrap_or((input.trim(), ""));
         let value = value.trim();
         match name {
@@ -922,6 +970,95 @@ mod tests {
     }
 
     #[test]
+    fn editor_inserts_at_cursor_and_preserves_send_draft_across_other_modes() {
+        let mut app = App::new(Config::default()).unwrap();
+        app.handle_event(key(KeyCode::Char('s')));
+        app.handle_event(Event::Paste("A中B".into()));
+        app.handle_event(key(KeyCode::Left));
+        app.activate_click(ClickAction::Shortcut(KeyCode::Char(':')))
+            .unwrap();
+        app.insert_input("enc");
+        app.handle_event(key(KeyCode::Tab));
+        assert_eq!(app.input.text(), "encoding ");
+        app.handle_event(key(KeyCode::Esc));
+        app.handle_event(key(KeyCode::Char('s')));
+        app.handle_event(Event::Paste("X".into()));
+        assert_eq!(app.input.text(), "A中XB");
+        app.handle_event(key(KeyCode::Home));
+        app.handle_event(key(KeyCode::Delete));
+        assert_eq!(app.input.text(), "中XB");
+        app.handle_event(key(KeyCode::End));
+        app.handle_event(key(KeyCode::Backspace));
+        assert_eq!(app.input.text(), "中X");
+        app.activate_click(ClickAction::Shortcut(KeyCode::Char('/')))
+            .unwrap();
+        app.insert_input("query");
+        app.handle_event(key(KeyCode::Esc));
+        app.handle_event(key(KeyCode::Char('s')));
+        assert_eq!(app.input.text(), "中X");
+        app.handle_event(key(KeyCode::Esc));
+        app.handle_event(key(KeyCode::Char('s')));
+        assert!(app.input.text().is_empty());
+        app.shutdown().unwrap();
+    }
+
+    #[test]
+    fn failed_submission_preserves_edit_position_and_does_not_add_history() {
+        let mut app = App::new(Config::default()).unwrap();
+        app.handle_event(key(KeyCode::Char('s')));
+        app.insert_input("AT");
+        app.handle_event(key(KeyCode::Home));
+        app.handle_event(key(KeyCode::Enter));
+        assert_eq!(app.input_mode, InputMode::Send);
+        assert!(app.input_focused);
+        app.insert_input("X");
+        assert_eq!(app.input.text(), "XAT");
+        app.handle_event(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "XAT");
+        app.shutdown().unwrap();
+    }
+
+    #[test]
+    fn accepted_sends_enter_history_and_browsing_does_not_send_or_scroll_rx() {
+        let mut app = App::new(Config {
+            demo: true,
+            ..Config::default()
+        })
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !app.connected {
+            app.tick();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        app.handle_event(key(KeyCode::Char('s')));
+        app.insert_input("AT");
+        app.handle_event(key(KeyCode::Enter));
+        assert_eq!(app.input_mode, InputMode::View);
+        let next_id = app.next_id;
+        app.handle_event(key(KeyCode::Char('s')));
+        app.insert_input("draft");
+        app.handle_event(key(KeyCode::Home));
+        app.offset = 7;
+        app.handle_event(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "AT");
+        assert_eq!(app.offset, 7);
+        assert!(!app.paused);
+        assert_eq!(app.next_id, next_id);
+        app.handle_event(key(KeyCode::Down));
+        app.insert_input("original ");
+        assert_eq!(app.input.text(), "original draft");
+        app.handle_event(key(KeyCode::Up));
+        app.insert_input("+GMR");
+        assert_eq!(app.input.text(), "AT+GMR");
+        app.handle_event(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "AT");
+        app.handle_event(key(KeyCode::Down));
+        assert_eq!(app.input.text(), "AT+GMR");
+        app.shutdown().unwrap();
+    }
+
+    #[test]
     fn f10_cycles_themes_in_every_mode_without_changing_session_or_drafts() {
         use crate::theme::Preset;
         let mut app = App::new(Config::default()).unwrap();
@@ -954,7 +1091,7 @@ mod tests {
                 assert!(!app.handle_event(key(KeyCode::F(10))));
                 assert_eq!(app.config.theme.preset, expected);
                 assert_eq!(app.input_mode, mode);
-                assert_eq!(app.input, "AT+草稿");
+                assert_eq!(app.input.text(), "AT+草稿");
                 assert!(app.paused);
                 assert_eq!(app.offset, 7);
                 assert_eq!(app.matches, vec![1, 3]);
@@ -1022,7 +1159,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         app.start_capture(&dir.path().join("rx.bin")).unwrap();
         app.handle_event(key(KeyCode::Char(':')));
-        app.append_input("lang zh-CN");
+        app.insert_input("lang zh-CN");
         app.handle_event(key(KeyCode::Enter));
         assert_eq!(app.config.language, Language::ZhCn);
         assert_eq!(app.config.encoding, "gbk");
@@ -1035,7 +1172,7 @@ mod tests {
             "已选择 设备{0} | F3 连接"
         );
         app.handle_event(key(KeyCode::Char(':')));
-        app.append_input("lang fr");
+        app.insert_input("lang fr");
         app.handle_event(key(KeyCode::Enter));
         assert_eq!(app.config.language, Language::ZhCn);
         assert!(
@@ -1055,7 +1192,7 @@ mod tests {
             .append(Local::now(), b"WARN row\n".repeat(1500));
         app.tick();
         app.handle_event(key(KeyCode::Char('/')));
-        app.append_input("warn");
+        app.insert_input("warn");
         assert!(app.matches.is_empty());
         let generation = app.display.generation;
         app.store
@@ -1078,11 +1215,11 @@ mod tests {
     fn oversized_paste_is_rejected_whole_and_unicode_editing_is_safe() {
         let mut app = App::new(Config::default()).unwrap();
         app.handle_event(key(KeyCode::Char('s')));
-        app.append_input("串口");
-        app.append_input(&"x".repeat(app.config.send_kib * 1024));
-        assert_eq!(app.input, "串口");
+        app.insert_input("串口");
+        app.insert_input(&"x".repeat(app.config.send_kib * 1024));
+        assert_eq!(app.input.text(), "串口");
         app.handle_event(key(KeyCode::Backspace));
-        assert_eq!(app.input, "串");
+        assert_eq!(app.input.text(), "串");
         app.shutdown().unwrap();
     }
 

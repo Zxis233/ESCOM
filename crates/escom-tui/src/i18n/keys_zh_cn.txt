@@ -21,6 +21,10 @@ mode text|hex|terminal    encoding utf8|gbk    eol none|cr|lf|crlf
 lang en|zh-CN    （仅切换界面语言，串口编码不变）
 ports    connect    disconnect    record 路径.bin    stop-record
 
+编辑：左右、Home/End 移动；Backspace/Delete 删除；粘贴插入光标位置。
+发送：↑↓ 回忆当前发送模式的历史；越过最新一条返回原草稿。
+命令：Tab 补全名称和固定参数。切换编辑模式保留发送草稿。
+
 搜索不区分大小写，仅覆盖格式化历史，不建立后台索引。
 暂停只冻结显示，接收和记录继续；恢复后清除搜索结果。
 长行会裁剪，可左右滚动；状态栏显示历史淘汰字节数。

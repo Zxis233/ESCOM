@@ -21,6 +21,10 @@ mode text|hex|terminal    encoding utf8|gbk    eol none|cr|lf|crlf
 lang en|zh-CN    (switch interface language without changing serial encoding)
 ports    connect    disconnect    record path with spaces.bin    stop-record
 
+Editors: Left/Right, Home/End move; Backspace/Delete edit; paste inserts at cursor.
+Send: Up/Down recall this mode's history; Down past newest restores the draft.
+Command: Tab completes names/fixed values. Switching editors keeps the send draft.
+
 Search: case-insensitive, current formatted history only; no background index.
 Pausing freezes the view, not reception or recording. Resume clears search hits.
 Long lines are clipped: scroll horizontally. History eviction is shown below.

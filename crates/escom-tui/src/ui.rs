@@ -247,12 +247,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         notice,
     );
     let last_tx = app.last_tx.render(language);
+    let editing = matches!(
+        app.input_mode,
+        InputMode::Send | InputMode::Search | InputMode::Command
+    );
+    let width = editor.width.saturating_sub(2) as usize;
+    let viewport = app.input.viewport(width);
     let (label, text) = match app.input_mode {
         InputMode::View => (
             tr(msg!(TxTitle, send_mode, app.config.line_ending)),
             safe_text(&last_tx),
         ),
-        InputMode::Send => (tr(msg!(SendTitle, send_mode)), safe_text(&app.input)),
+        InputMode::Send => (
+            tr(msg!(SendTitle, send_mode)),
+            safe_text(&app.input.text()[viewport.range.clone()]),
+        ),
         InputMode::Search => (
             tr(msg!(
                 SearchTitle,
@@ -262,28 +271,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     Key::Literal
                 })
             )),
-            safe_text(&app.input),
+            safe_text(&app.input.text()[viewport.range.clone()]),
         ),
         InputMode::Command => (
             language.text(Key::CommandTitle).into(),
-            safe_text(&app.input),
+            safe_text(&app.input.text()[viewport.range.clone()]),
         ),
         InputMode::Direct => (
             language.text(Key::DirectTitle).into(),
             Cow::Borrowed(language.text(Key::DirectHint)),
         ),
     };
-    let width = editor.width.saturating_sub(2) as usize;
-    // Show only the tail of a long editor, avoiding a large per-frame layout.
-    let mut tail_start = text.len();
+    // Editors already provide a bounded visible slice; status messages retain their tail view.
+    let mut tail_start = if editing { 0 } else { text.len() };
     let mut tail_width = 0;
-    for (index, ch) in text.char_indices().rev() {
-        let cells = ch.width().unwrap_or(0);
-        if tail_width + cells > width.saturating_sub(1) {
-            break;
+    if !editing {
+        for (index, ch) in text.char_indices().rev() {
+            let cells = ch.width().unwrap_or(0);
+            if tail_width + cells > width.saturating_sub(1) {
+                break;
+            }
+            tail_width += cells;
+            tail_start = index;
         }
-        tail_width += cells;
-        tail_start = index;
     }
     let tail = &text[tail_start..];
     let editor_focused = app.input_focused && !app.help && app.picker.is_none();
@@ -311,7 +321,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         InputMode::Send | InputMode::Search | InputMode::Command
     ) && editor_focused
     {
-        frame.set_cursor_position((editor.x + 1 + tail_width as u16, editor.y + 1));
+        frame.set_cursor_position((editor.x + 1 + viewport.cursor_column as u16, editor.y + 1));
     }
     if app.help {
         app.click_targets.clear();
@@ -537,6 +547,65 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
+    fn editor_viewport_follows_cursor_at_multiple_sizes_without_changing_payload() {
+        let mut app = App::new(Config::default()).unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::NONE,
+        )));
+        let payload = format!("{}中e\u{301}👩‍💻\tTAIL", "start-".repeat(30));
+        app.handle_event(Event::Paste(payload.clone()));
+        for (width, height) in [(100, 30), (48, 17), (48, 12), (80, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            app.handle_event(Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)));
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            assert!(screen_text(&terminal).contains("·TAIL"));
+            let editor = target(&app, &ClickAction::Editor);
+            let cursor = terminal.get_cursor_position().unwrap();
+            assert!(cursor.x > editor.x && cursor.x < editor.right() - 1);
+            assert_eq!(cursor.y, editor.y + 1);
+            app.handle_event(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)));
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            assert!(screen_text(&terminal).contains("start-start-"));
+            assert_eq!(terminal.get_cursor_position().unwrap().x, editor.x + 1);
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::NONE,
+            )));
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            assert_eq!(terminal.get_cursor_position().unwrap().x, editor.x + 2);
+            assert_eq!(app.input.text(), payload);
+        }
+        app.shutdown().unwrap();
+    }
+
+    #[test]
+    fn switching_editors_with_mouse_preserves_send_cursor_and_draft() {
+        let mut app = App::new(Config::default()).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        click(&mut app, ClickAction::Editor);
+        app.insert_input("AT+中");
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        click(&mut app, ClickAction::Shortcut(KeyCode::Char(':')));
+        app.insert_input("mode te");
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        click(&mut app, ClickAction::Shortcut(KeyCode::Char('s')));
+        assert_eq!(app.input.text(), "AT+中");
+        app.insert_input("X");
+        assert_eq!(app.input.text(), "XAT+中");
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        click(&mut app, ClickAction::Editor);
+        app.insert_input("Y");
+        assert_eq!(app.input.text(), "XYAT+中");
+        assert_eq!(app.worker.stats.tx_bytes(), 0);
+        app.shutdown().unwrap();
+    }
+
+    #[test]
     fn themes_style_entire_frame_editors_popups_and_search_and_reset_cleanly() {
         use crate::theme::Preset;
         use ratatui::style::Color;
@@ -708,7 +777,7 @@ mod tests {
                         assert!(app.input_focused);
                     }
                     click(&mut app, ClickAction::Editor);
-                    assert_eq!(app.input, "AT+草稿");
+                    assert_eq!(app.input.text(), "AT+草稿");
                     for (x, y) in [(body.x + 1, body.y + 1), (0, 0), (0, editor.y - 1)] {
                         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
                         assert!(!app.input_focused);
@@ -722,7 +791,7 @@ mod tests {
                             );
                         }
                         app.handle_event(Event::Paste("unfocused paste".into()));
-                        assert_eq!(app.input, "AT+草稿");
+                        assert_eq!(app.input.text(), "AT+草稿");
                         assert_eq!(app.input_mode, mode);
                         terminal.draw(|f| draw(f, &mut app)).unwrap();
                         let palette = app.config.theme.palette();
@@ -745,20 +814,20 @@ mod tests {
                         KeyModifiers::NONE,
                     )));
                     assert!(app.input_focused);
-                    assert_eq!(app.input, "AT+草稿");
+                    assert_eq!(app.input.text(), "AT+草稿");
                     if shortcut != 's' {
                         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
                         click(&mut app, ClickAction::Shortcut(KeyCode::Char(shortcut)));
                         assert!(app.input_focused);
-                        assert_eq!(app.input, "AT+草稿");
+                        assert_eq!(app.input.text(), "AT+草稿");
                     }
                     app.handle_event(Event::Paste("!".into()));
-                    assert_eq!(app.input, "AT+草稿!");
+                    assert_eq!(app.input.text(), "AT+草稿!");
                     mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
                     click(&mut app, ClickAction::Cancel);
                     assert_eq!(app.input_mode, InputMode::View);
                     assert!(!app.input_focused);
-                    assert!(app.input.is_empty());
+                    assert!(app.input.text().is_empty());
                 }
                 app.shutdown().unwrap();
             }
@@ -949,7 +1018,7 @@ mod tests {
         );
         assert!(!app.help);
         assert!(!app.input_focused);
-        assert_eq!(app.input, "keep draft");
+        assert_eq!(app.input.text(), "keep draft");
         assert!(app.store.lock().unwrap().bytes_len() > 0);
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         click(&mut app, ClickAction::Editor);
@@ -993,13 +1062,13 @@ mod tests {
             KeyModifiers::NONE,
         )));
         assert_eq!(app.config.port, "COM28");
-        assert_eq!(app.input, "AT+串口");
+        assert_eq!(app.input.text(), "AT+串口");
         assert_eq!(app.input_mode, InputMode::Send);
         assert!(!app.input_focused);
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         click(&mut app, ClickAction::Editor);
         assert!(app.input_focused);
-        assert_eq!(app.input, "AT+串口");
+        assert_eq!(app.input.text(), "AT+串口");
         app.shutdown().unwrap();
     }
 
@@ -1028,10 +1097,10 @@ mod tests {
         click(&mut app, ClickAction::Cancel);
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         click(&mut app, ClickAction::Editor);
-        app.append_input("AT");
+        app.insert_input("AT");
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         click(&mut app, ClickAction::Shortcut(KeyCode::F(5)));
-        assert_eq!(app.input, "AT");
+        assert_eq!(app.input.text(), "AT");
         assert!(!app.input_focused);
         click(&mut app, ClickAction::Shortcut(KeyCode::Char('s')));
         wait_for(&mut app, |app| app.worker.stats.tx_bytes() == 4);
