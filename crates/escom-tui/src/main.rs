@@ -1,4 +1,5 @@
 mod app;
+mod clipboard;
 mod config;
 mod demo;
 mod display;
@@ -78,6 +79,7 @@ fn run() -> io::Result<()> {
         let mut terminal = ratatui::try_init()?;
         let _restore = RestoreTerminal;
         execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture)?;
+        let mut clipboard = clipboard::Clipboard::default();
         let mut next_tick = Instant::now();
         let mut dirty = true;
         let mut displayed_second = chrono::Local::now().timestamp();
@@ -100,6 +102,12 @@ fn run() -> io::Result<()> {
             if event::poll(next_tick.saturating_duration_since(Instant::now()))? {
                 if app.handle_event(event::read()?) {
                     break;
+                }
+                if let Some(text) = app.take_clipboard_text() {
+                    app.notice = match clipboard.set_text(text) {
+                        Ok(()) => Key::VisibleCopied.into(),
+                        Err(error) => error,
+                    };
                 }
                 dirty = true;
             }

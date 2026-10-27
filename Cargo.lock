@@ -1472,6 +1472,7 @@ dependencies = [
 name = "escom-tui"
 version = "0.3.1"
 dependencies = [
+ "arboard",
  "chrono",
  "crossterm",
  "escom-core",

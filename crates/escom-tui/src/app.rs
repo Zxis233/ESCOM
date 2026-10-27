@@ -72,6 +72,8 @@ pub struct App {
     pub help: bool,
     pub click_targets: Vec<(Rect, ClickAction)>,
     pub receive_area: Rect,
+    /// Text from the last rendered RX viewport, without borders or overlays.
+    pub visible_receive: Option<String>,
     pub picker: Option<Picker>,
     pub picker_area: Rect,
     pub picker_index: usize,
@@ -86,6 +88,7 @@ pub struct App {
     search_was_paused: bool,
     observed_rx: u64,
     observed_capture: (u64, usize, bool),
+    pending_clipboard: Option<String>,
 }
 
 impl App {
@@ -137,6 +140,7 @@ impl App {
             help: false,
             click_targets: Vec::new(),
             receive_area: Rect::default(),
+            visible_receive: None,
             picker: None,
             picker_area: Rect::default(),
             picker_index: 0,
@@ -151,6 +155,7 @@ impl App {
             search_was_paused: false,
             observed_rx: 0,
             observed_capture: (0, 0, false),
+            pending_clipboard: None,
         };
         if let Some(path) = app.config.record.clone() {
             app.start_capture(&path)?;
@@ -393,6 +398,7 @@ impl App {
                 // The next draw establishes fresh hit regions for the new size.
                 self.click_targets.clear();
                 self.receive_area = Rect::default();
+                self.visible_receive = None;
                 self.picker_area = Rect::default();
                 Ok(false)
             }
@@ -472,6 +478,21 @@ impl App {
                     }
                 }
                 _ => {}
+            }
+            return Ok(false);
+        }
+        if matches!(key.code, KeyCode::Char('f' | 'F'))
+            && (!self.input_focused || self.input_mode == InputMode::View)
+        {
+            // Keep modifiers here: handle_view_key receives only the key code.
+            if key.kind == KeyEventKind::Press && KeyModifiers::SHIFT.contains(key.modifiers) {
+                self.pending_clipboard = Some(
+                    self.visible_receive
+                        .as_ref()
+                        .filter(|text| !text.is_empty())
+                        .ok_or(Key::NothingVisibleToCopy)?
+                        .clone(),
+                );
             }
             return Ok(false);
         }
@@ -574,6 +595,11 @@ impl App {
             return Ok(false);
         }
         self.handle_view_key(key.code)
+    }
+
+    /// Drain immediately after handling input, before the next tick or draw.
+    pub fn take_clipboard_text(&mut self) -> Option<String> {
+        self.pending_clipboard.take()
     }
 
     fn handle_view_key(&mut self, code: KeyCode) -> Result<bool, Message> {
@@ -967,6 +993,75 @@ mod tests {
     use escom_core::model::TextEncoding;
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn copy_shortcut_requires_a_press_with_only_optional_shift() {
+        let mut app = App::new(Config::default()).unwrap();
+        app.visible_receive = Some("last frame".into());
+        for code in [KeyCode::Char('f'), KeyCode::Char('F')] {
+            for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+                app.handle_event(Event::Key(KeyEvent::new(code, modifiers)));
+                assert_eq!(app.take_clipboard_text().as_deref(), Some("last frame"));
+            }
+            for modifiers in [
+                KeyModifiers::CONTROL,
+                KeyModifiers::ALT,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ] {
+                app.handle_event(Event::Key(KeyEvent::new(code, modifiers)));
+                assert!(app.take_clipboard_text().is_none());
+            }
+            for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+                app.handle_event(Event::Key(KeyEvent::new_with_kind(
+                    code,
+                    KeyModifiers::NONE,
+                    kind,
+                )));
+                assert!(app.take_clipboard_text().is_none());
+            }
+        }
+        app.shutdown().unwrap();
+    }
+
+    #[test]
+    fn copy_shortcut_does_not_intercept_focused_editors_or_direct_input() {
+        let mut app = App::new(Config {
+            demo: true,
+            ..Config::default()
+        })
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !app.connected {
+            app.tick();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        app.visible_receive = Some("visible RX".into());
+        for mode in [InputMode::Send, InputMode::Search, InputMode::Command] {
+            app.begin_input(mode);
+            app.input.clear();
+            app.handle_event(key(KeyCode::Char('f')));
+            app.handle_event(key(KeyCode::Char('F')));
+            assert_eq!(app.input.text(), "fF");
+            assert!(app.take_clipboard_text().is_none());
+            app.input_focused = false;
+            app.handle_event(key(KeyCode::Char('f')));
+            assert_eq!(app.take_clipboard_text().as_deref(), Some("visible RX"));
+            assert_eq!(app.input.text(), "fF");
+        }
+        app.begin_input(InputMode::Direct);
+        app.handle_event(key(KeyCode::Char('f')));
+        app.handle_event(key(KeyCode::Char('F')));
+        assert!(app.take_clipboard_text().is_none());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while app.worker.stats.tx_bytes() < 2 {
+            app.tick();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.worker.stats.tx_bytes(), 2);
+        app.shutdown().unwrap();
     }
 
     #[test]

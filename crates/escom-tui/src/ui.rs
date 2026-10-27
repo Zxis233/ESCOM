@@ -5,6 +5,7 @@ use crossterm::event::KeyCode;
 use escom_core::model::SendMode;
 use ratatui::{
     Frame,
+    buffer::{Buffer, CellWidth},
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
@@ -29,6 +30,7 @@ pub fn safe_text(text: &str) -> Cow<'_, str> {
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.click_targets.clear();
     app.receive_area = Rect::default();
+    app.visible_receive = None;
     app.picker_area = Rect::default();
     let language = app.config.language;
     let palette = app.config.theme.palette();
@@ -170,15 +172,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ""
         }
     ));
+    let receive_block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(palette.border));
+    let mut visible_area = receive_block.inner(body);
+    visible_area.height = visible_area.height.min(rows.len() as u16);
     frame.render_widget(
-        Paragraph::new(rows).scroll((0, app.horizontal)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .border_style(Style::default().fg(palette.border)),
-        ),
+        Paragraph::new(rows)
+            .scroll((0, app.horizontal))
+            .block(receive_block),
         body,
     );
+    if !visible_area.is_empty() && !app.help && app.picker.is_none() {
+        app.visible_receive = Some(receive_text(frame.buffer_mut(), visible_area));
+    }
 
     let (raw, records, dropped) = app
         .store
@@ -345,6 +353,31 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else if let Some(picker) = app.picker {
         draw_picker(frame, app, picker);
     }
+}
+
+/// Read the already clipped cells, skipping continuation cells of wide graphemes.
+fn receive_text(buffer: &Buffer, area: Rect) -> String {
+    let mut text = String::new();
+    for y in area.top()..area.bottom() {
+        if y > area.top() {
+            text.push('\n');
+        }
+        let start = text.len();
+        let mut continuation = 0;
+        for x in area.left()..area.right() {
+            if continuation > 0 {
+                continuation -= 1;
+                continue;
+            }
+            let cell = &buffer[(x, y)];
+            text.push_str(cell.symbol());
+            continuation = cell.cell_width().saturating_sub(1);
+        }
+        // Discard right-hand screen padding, preserving indentation and blank rows.
+        let end = start + text[start..].trim_end_matches(' ').len();
+        text.truncate(end);
+    }
+    text
 }
 
 fn toolbar_buttons(app: &App) -> Vec<(&'static str, ClickAction)> {
@@ -545,6 +578,167 @@ mod tests {
         Event, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn copy_contains_only_the_scrolled_rx_viewport_at_multiple_sizes() {
+        for (width, height) in [(48, 17), (80, 24), (100, 30)] {
+            let mut app = App::new(Config {
+                timestamps: false,
+                ..Config::default()
+            })
+            .unwrap();
+            app.display.rows = (0..80)
+                .map(|index| escom_core::formatting::FormattedRow {
+                    received_at: Local::now(),
+                    text: format!("head-{index:03}:{}", "0123456789".repeat(20)),
+                })
+                .collect();
+            app.paused = true;
+            app.offset = 9;
+            app.horizontal = 5;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let expected = (9..9 + app.page_rows)
+                .map(|index| {
+                    format!("head-{index:03}:{}", "0123456789".repeat(20))
+                        .chars()
+                        .skip(5)
+                        .take(usize::from(width - 2))
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('F'),
+                KeyModifiers::SHIFT,
+            )));
+            assert_eq!(
+                app.take_clipboard_text().as_deref(),
+                Some(expected.as_str())
+            );
+            assert!(app.paused);
+            assert_eq!(app.offset, 9);
+            assert_eq!(app.horizontal, 5);
+            assert!(app.take_clipboard_text().is_none());
+            app.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn copy_preserves_visible_graphemes_indentation_and_blank_rows() {
+        let mut app = App::new(Config {
+            timestamps: false,
+            ..Config::default()
+        })
+        .unwrap();
+        app.display.rows = [
+            "  中e\u{301}👩‍💻\t尾  ".to_owned(),
+            String::new(),
+            format!("{}中hidden", "x".repeat(45)),
+        ]
+        .into_iter()
+        .map(|text| escom_core::formatting::FormattedRow {
+            received_at: Local::now(),
+            text,
+        })
+        .collect();
+        app.paused = true;
+        let mut terminal = Terminal::new(TestBackend::new(48, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.take_clipboard_text().unwrap(),
+            format!("  中e\u{301}👩‍💻·尾\n\n{}", "x".repeat(45))
+        );
+        // A scroll offset inside a wide character must match the rendered cells.
+        app.display.rows.truncate(1);
+        app.display.rows[0].text = "中ab".into();
+        app.horizontal = 1;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.take_clipboard_text().as_deref(), Some("中ab"));
+        app.shutdown().unwrap();
+    }
+
+    #[test]
+    fn copy_uses_the_last_frame_including_its_timestamp_setting() {
+        let mut app = App::new(Config {
+            timestamps: true,
+            ..Config::default()
+        })
+        .unwrap();
+        let received_at = Local::now();
+        app.display.rows.push(escom_core::formatting::FormattedRow {
+            received_at,
+            text: "first frame".into(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.display.rows[0].text = "unrendered arrival".into();
+        app.config.timestamps = false;
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.take_clipboard_text().unwrap(),
+            format!("{}first frame", received_at.format("%H:%M:%S%.3f "))
+        );
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.take_clipboard_text().as_deref(),
+            Some("unrendered arrival")
+        );
+        assert!(!app.paused);
+        app.shutdown().unwrap();
+    }
+
+    #[test]
+    fn copy_rejects_empty_covered_and_invalidated_viewports() {
+        let mut app = App::new(Config::default()).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let copy = || Event::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.handle_event(copy());
+        assert!(app.take_clipboard_text().is_none());
+        assert_eq!(
+            app.notice.render(Language::ZhCn),
+            "没有可复制的可见接收内容"
+        );
+        app.display.rows.push(escom_core::formatting::FormattedRow {
+            received_at: Local::now(),
+            text: "visible before overlay".into(),
+        });
+        for picker in [false, true] {
+            app.help = !picker;
+            app.picker = picker.then_some(Picker::Mode);
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            assert!(app.visible_receive.is_none());
+            app.handle_event(copy());
+            assert!(app.take_clipboard_text().is_none());
+        }
+        app.picker = None;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.visible_receive.is_some());
+        app.handle_event(Event::Resize(20, 5));
+        app.handle_event(copy());
+        assert!(app.take_clipboard_text().is_none());
+        let mut tiny = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        tiny.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.handle_event(copy());
+        assert!(app.take_clipboard_text().is_none());
+        app.shutdown().unwrap();
+    }
 
     #[test]
     fn editor_viewport_follows_cursor_at_multiple_sizes_without_changing_payload() {

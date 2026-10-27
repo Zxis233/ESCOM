@@ -11,6 +11,7 @@ n / N    Next / previous hit row   Esc      Close editor
 Space    Pause / resume display    End      Follow live output
 Arrows   Scroll rows / columns     PgUp/Dn  Scroll a page
 Home     Oldest displayed row      t        Toggle timestamps
+f / F    Copy visible RX text to clipboard (viewer shortcuts only)
 c        Clear memory history      q        Quit (Ctrl+Q from any mode)
 Ctrl+U   Clear editor              :        Command editor
 
